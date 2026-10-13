@@ -1,9 +1,9 @@
 [package]
 name = "xavieros"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
-description = "A tiny freestanding Rust kernel for XavierOS"
+description = "An experimental x86_64 no_std hobby OS kernel for XavierOS"
 
 [[bin]]
 name = "xavieros"

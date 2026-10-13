@@ -38,14 +38,14 @@ Each 64-byte entry contains:
 | `12` | 4 | Allocated sector count (`u32`, files only) |
 | `16` | 48 | Name bytes, printable ASCII, unused bytes zero |
 
-Record `0` is the root directory. Directory entries refer to their parent record. Files use one contiguous extent; allocation scans existing extents for the first gap large enough. Replacing a file writes new data before changing its metadata entry, but this does not provide transactional recovery or a write-ahead log.
+Record `0` is the root directory. Directory entries refer to their parent record. Files use one contiguous extent; allocation scans existing extents for the first gap large enough. A replacement keeps the old extent reserved while writing new data, then updates the metadata entry. This requires enough spare contiguous space for the replacement and does not provide transactional recovery or a write-ahead log.
 
 ## Current limitations
 
 - Fixed table with 128 total records, including the root directory.
 - One contiguous extent per file; a fragmented disk can report “disk full or too fragmented” even when some space remains.
 - Names are 1–48 printable ASCII bytes; path depth is limited to 16.
-- No permissions, timestamps, links, journal, checksums for payload sectors, or recovery from power loss.
+- No permissions, timestamps, links, journal, checksums for metadata records/payload sectors, or recovery from power loss.
 - All I/O is synchronous and uses polling on legacy primary-master ATA LBA28.
 - `CAT` uses a 4 KiB console buffer. The current command shell can write only short text payloads in a single command.
 - `FORMAT DISK` is destructive. `python run.py --reset-disk` also erases and recreates the entire disk image.

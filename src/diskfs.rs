@@ -82,10 +82,19 @@ pub struct EntryInfo {
 }
 
 pub fn initialize() -> Result<DiskInfo, &'static str> {
+    // Initialization can be retried after a device error. Fail closed so stale
+    // in-memory metadata is never advertised as mounted during a retry.
+    unsafe {
+        (*STATE.get()).mounted = false;
+        (*STATE.get()).last_error = "INITIALIZING";
+    }
     let drive = match ata::initialize() {
         Ok(drive) => drive,
         Err(error) => {
-            unsafe { (*STATE.get()).last_error = error; }
+            unsafe {
+                (*STATE.get()).mounted = false;
+                (*STATE.get()).last_error = error;
+            }
             return Err(error);
         }
     };
@@ -191,6 +200,7 @@ fn format_with_capacity(total_sectors: u32) -> Result<(), &'static str> {
 }
 
 fn mount(device_sectors: u32) -> Result<(), &'static str> {
+    unsafe { (*STATE.get()).mounted = false; }
     let mut superblock = [0u8; SECTOR_SIZE];
     ata::read_sector(0, &mut superblock)?;
     if superblock.get(0..8) != Some(MAGIC.as_slice()) {
@@ -235,6 +245,18 @@ fn mount(device_sectors: u32) -> Result<(), &'static str> {
 }
 
 fn validate_entries(state: &State) -> Result<(), &'static str> {
+    let root = &state.entries[0];
+    if root.kind != KIND_DIR
+        || root.name_len != 1
+        || root.name[0] != b'/'
+        || root.parent != 0
+        || root.size != 0
+        || root.start_lba != 0
+        || root.sectors != 0
+    {
+        return Err("XVDISKFS ROOT METADATA IS INVALID");
+    }
+
     for (index, entry) in state.entries.iter().enumerate() {
         match entry.kind {
             KIND_FREE => continue,
@@ -255,11 +277,17 @@ fn validate_entries(state: &State) -> Result<(), &'static str> {
         if entry.kind == KIND_FILE {
             let end = entry.start_lba.checked_add(entry.sectors).ok_or("FILE EXTENT OVERFLOW")?;
             if entry.sectors == 0 {
-                if entry.size != 0 { return Err("EMPTY FILE HAS NONZERO SIZE"); }
-            } else if entry.start_lba < DATA_START || end > state.total_sectors || entry.size > entry.sectors.saturating_mul(SECTOR_SIZE as u32) {
+                if entry.size != 0 || entry.start_lba != 0 {
+                    return Err("EMPTY FILE HAS INVALID STORAGE METADATA");
+                }
+            } else if entry.size == 0
+                || entry.start_lba < DATA_START
+                || end > state.total_sectors
+                || entry.size > entry.sectors.saturating_mul(SECTOR_SIZE as u32)
+            {
                 return Err("FILE EXTENT IS OUT OF RANGE");
             }
-        } else if entry.size != 0 || entry.sectors != 0 {
+        } else if entry.size != 0 || entry.start_lba != 0 || entry.sectors != 0 {
             return Err("DIRECTORY HAS FILE DATA");
         }
         for other in index + 1..MAX_ENTRIES {
@@ -269,6 +297,29 @@ fn validate_entries(state: &State) -> Result<(), &'static str> {
             }
         }
     }
+    // Every allocated entry must reach the root through directory parents. This
+    // rejects self-parenting entries and cycles in damaged on-disk metadata.
+    for index in 1..MAX_ENTRIES {
+        if state.entries[index].kind == KIND_FREE {
+            continue;
+        }
+        let mut parent = state.entries[index].parent as usize;
+        let mut depth = 0usize;
+        while parent != 0 {
+            if parent >= MAX_ENTRIES || state.entries[parent].kind != KIND_DIR {
+                return Err("DISK ENTRY HAS AN INVALID PARENT CHAIN");
+            }
+            if parent == index {
+                return Err("DISK ENTRY REFERENCES ITSELF AS PARENT");
+            }
+            depth += 1;
+            if depth > MAX_PATH_DEPTH {
+                return Err("DISK DIRECTORY TREE CONTAINS A CYCLE OR IS TOO DEEP");
+            }
+            parent = state.entries[parent].parent as usize;
+        }
+    }
+
     // Extents belonging to distinct files must not overlap.
     for i in 0..MAX_ENTRIES {
         let a = &state.entries[i];
@@ -346,9 +397,11 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
         free_entry(state).ok_or("DISK DIRECTORY TABLE IS FULL")?
     };
     let sectors_needed = ((data.len() + SECTOR_SIZE - 1) / SECTOR_SIZE) as u32;
-    // When replacing an existing file, keep its old extent reserved until all new data
-    // and metadata have been committed. If space is insufficient, fail without damaging it.
-    let start_lba = if sectors_needed == 0 { 0 } else { find_extent(state, sectors_needed, existing)? };
+    // Keep every currently referenced extent reserved while writing a replacement.
+    // Reusing the old file's sectors here could overwrite its contents before the new
+    // metadata is committed, so an interrupted/failed write would destroy the old file.
+    // Replacement therefore requires enough free contiguous space for the new extent.
+    let start_lba = if sectors_needed == 0 { 0 } else { find_extent(state, sectors_needed)? };
     let mut source_offset = 0usize;
     for sector_index in 0..sectors_needed {
         let mut sector = [0u8; SECTOR_SIZE];
@@ -472,29 +525,51 @@ fn free_entry(state: &State) -> Option<usize> {
     (1..MAX_ENTRIES).find(|index| state.entries[*index].kind == KIND_FREE)
 }
 
-fn find_extent(state: &State, needed: u32, replacing: Option<usize>) -> Result<u32, &'static str> {
+fn find_extent(state: &State, needed: u32) -> Result<u32, &'static str> {
     if needed == 0 { return Ok(0); }
     let mut candidate = DATA_START;
     loop {
+        if candidate >= state.total_sectors {
+            return Err("DISK IS FULL OR TOO FRAGMENTED");
+        }
+
+        // First move the candidate past any extent that currently covers it. Restart
+        // the scan after moving so an unsorted metadata table cannot leave a stale
+        // `next_start` behind and make the allocator move backwards.
+        let mut covering_end = candidate;
+        for entry in state.entries.iter() {
+            if entry.kind != KIND_FILE || entry.sectors == 0 { continue; }
+            let end = entry.start_lba.checked_add(entry.sectors).ok_or("FILE EXTENT OVERFLOW")?;
+            if entry.start_lba <= candidate && end > candidate {
+                covering_end = covering_end.max(end);
+            }
+        }
+        if covering_end > candidate {
+            candidate = covering_end;
+            continue;
+        }
+
         let mut next_start = state.total_sectors;
         let mut next_end = state.total_sectors;
-        for (index, entry) in state.entries.iter().enumerate() {
-            if Some(index) == replacing || entry.kind != KIND_FILE || entry.sectors == 0 { continue; }
+        for entry in state.entries.iter() {
+            if entry.kind != KIND_FILE || entry.sectors == 0 { continue; }
             let end = entry.start_lba.checked_add(entry.sectors).ok_or("FILE EXTENT OVERFLOW")?;
-            if entry.start_lba < candidate && end > candidate { candidate = end; }
             if entry.start_lba >= candidate && entry.start_lba < next_start {
                 next_start = entry.start_lba;
                 next_end = end;
             }
         }
-        if candidate.checked_add(needed).ok_or("FILE SIZE OVERFLOW")? <= next_start {
+        let allocation_end = candidate.checked_add(needed).ok_or("FILE SIZE OVERFLOW")?;
+        if allocation_end <= next_start {
             return Ok(candidate);
         }
-        if next_start >= state.total_sectors { return Err("DISK IS FULL OR TOO FRAGMENTED"); }
-        candidate = next_end;
-        if candidate.checked_add(needed).ok_or("FILE SIZE OVERFLOW")? > state.total_sectors {
+        if next_start >= state.total_sectors {
             return Err("DISK IS FULL OR TOO FRAGMENTED");
         }
+        if next_end <= candidate {
+            return Err("DISK EXTENT TABLE IS INCONSISTENT");
+        }
+        candidate = next_end;
     }
 }
 

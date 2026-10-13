@@ -99,6 +99,12 @@ pub fn read_sector(lba: u32, out: &mut [u8; SECTOR_SIZE]) -> Result<(), &'static
         pair[0] = word[0];
         pair[1] = word[1];
     }
+    // Do not report success merely because one data phase was available. Confirm
+    // the device completed the command and surfaced no late error afterwards.
+    let status = wait_not_busy()?;
+    if status & STATUS_DRQ != 0 {
+        return Err("ATA READ DID NOT COMPLETE THE DATA PHASE");
+    }
     Ok(())
 }
 
@@ -116,7 +122,10 @@ pub fn write_sector(lba: u32, data: &[u8; SECTOR_SIZE]) -> Result<(), &'static s
     for pair in data.chunks_exact(2) {
         unsafe { outw(DATA, u16::from_le_bytes([pair[0], pair[1]])); }
     }
-    let _ = wait_not_busy()?;
+    let status = wait_not_busy()?;
+    if status & STATUS_DRQ != 0 {
+        return Err("ATA WRITE DID NOT COMPLETE THE DATA PHASE");
+    }
     unsafe { outb(STATUS_COMMAND, 0xE7); } // FLUSH CACHE
     let _ = wait_not_busy()?;
     Ok(())

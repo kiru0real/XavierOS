@@ -1,26 +1,45 @@
 # Changelog
 
-## 0.1.0 — 2026-10-14
+Notable changes to XavierOS are documented here. The GitHub release `v0.1.0` remains immutable; `0.1.1` is the maintenance source snapshot being prepared for validation.
 
-First public release of XavierOS.
+## 0.1.1 — Maintenance update (pending local validation)
 
-- Freestanding Rust `no_std` kernel for x86_64 booted with Limine.
-- Framebuffer text console and interactive built-in shell.
-- Limine memory-map parsing, HHDM, bitmap PMM for usable physical pages below 4 GiB, and a first-fit kernel heap.
-- x86_64 IDT and diagnostic handlers for CPU exceptions.
-- Legacy PIC remapping, PIT timer, and PS/2 keyboard input through IRQs.
-- Read-only XVRFS v1 initramfs generated from `rootfs/` and embedded in the kernel.
-- Legacy ATA PIO sector I/O for the QEMU primary IDE master.
-- Writable XVDISKFS v1 mounted at `/DISK`, with create/read/write/remove operations and data persistence in a virtual disk image between QEMU runs.
-- VFS dispatcher for the embedded root filesystem and writable disk.
-- Cooperative task-context switching prototype and self-test commands.
-- Cross-platform Python helpers for preparing the Rust target, building the ISO, and running QEMU on Windows, macOS, and Linux.
+### Fixed
 
-## Known limitations
+- File replacement no longer lets the extent allocator reuse a file's currently referenced sectors before new data and metadata are committed. Replacement needs spare contiguous space; if there is not enough room, it fails rather than risking the old file's contents.
+- The writable filesystem is unmounted before a new disk initialization/mount attempt, preventing stale metadata from being reported as available after a failed retry.
+- XVDISKFS mount validation now checks root metadata, empty-file and directory storage fields, parent chains, directory depth/cycles, and existing extent bounds/overlap checks.
+- The disk extent allocator restarts its search after moving past an occupied extent, preventing a stale scan result from moving the candidate backwards when metadata entries are not ordered by LBA.
+- ATA reads/writes check command status after the data phase before reporting success.
+- Heap deallocation validates pointer bounds and allocation-header fields, and refuses to reinsert ranges that overlap blocks already present in the free list.
+- Build-tool extraction refuses traversal paths, symbolic/hard links, special files, and duplicate case-insensitive paths in downloaded Limine/xorriso archives.
 
-- Intended for QEMU and learning; physical-hardware support is not established.
-- Disk filesystem is experimental and not crash-safe. Use only disposable virtual disk images.
-- Storage driver currently targets a legacy PC/PIIX IDE setup in QEMU.
-- Task scheduling is cooperative; no timer preemption, user mode, or process isolation.
-- No network stack or desktop environment.
-- PMM handles usable pages below 4 GiB and is not SMP-safe.
+### Added
+
+- Host-side unit tests for safe archive extraction, initramfs format generation, path-collision rejection, and release packaging checksums.
+- GitHub Actions CI for Python syntax/tests, deterministic initramfs generation, and freestanding Rust compilation.
+- `package_release.py`, which copies `build/xavieros.iso` to `dist/xavieros-0.1.1.iso` and generates `dist/SHA256SUMS.txt` for manual upload to GitHub Releases.
+- Architecture, testing, roadmap, contribution, security, and release-update documentation plus issue/PR templates.
+
+### Notes
+
+- This source snapshot still requires a clean local Rust build and QEMU regression test before publication.
+- The filesystem is not crash-safe; the new guards reduce specific failure modes but do not provide journaling or recovery.
+- The scheduler remains cooperative. Preemption, user mode, process isolation, networking, and a desktop are not implemented.
+
+## 0.1.0 — Initial public release
+
+- Freestanding `no_std` Rust kernel targeting `x86_64-unknown-none`, booted through Limine.
+- Framebuffer console and interactive shell.
+- PMM, HHDM, 1 MiB kernel heap, IDT, CPU exception diagnostics, PIC/PIT, and PS/2 keyboard IRQ handling.
+- Read-only XVRFS v1 initramfs embedded into the kernel.
+- ATA PIO driver for the QEMU primary IDE master and writable XVDISKFS v1 mounted under `/DISK`.
+- VFS routing and a cooperative task-context switching prototype.
+- Cross-platform Python tooling for preparing, building, and running XavierOS under QEMU.
+
+## Earlier development foundations
+
+- Limine memory map support and bitmap PMM for usable pages below 4 GiB.
+- HHDM translation and memory allocator diagnostics.
+- Shell commands for system information, disk/filesystem access, task checks, and self-tests.
+- Portable build/run scripts to replace Windows-only PowerShell as the primary documented workflow.

@@ -9,5 +9,6 @@ Try these shell commands:
   CAT /DOCS/FILESYSTEM.TXT
   STAT /README.TXT
   FSINFO
+  SELFTEST
 
-Version: 0.1.0
+Version: 0.1.1

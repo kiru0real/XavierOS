@@ -1,34 +1,28 @@
-# Moving XavierOS development tooling off PowerShell
+# Portable tooling and 0.1.1 source update
 
-This source snapshot replaces `setup.ps1`, `build.ps1`, and `run.ps1` with Python scripts. It does **not** publish a release or modify the existing `v0.1.0` / Beta 1 release assets.
+The project uses Python scripts as its documented build/run interface. Windows remains supported, but PowerShell is not required. macOS and Linux can use the same scripts when Python, Rust, QEMU, xorriso, and the required compiler are installed.
 
-## Local Windows workflow
+## Build interface
 
-1. Back up your current XavierOS project folder.
-2. Extract this archive into the project folder, replacing matching source and documentation files.
-3. Keep `Cargo.toml`, `Cargo.lock`, `.cargo/`, `src/`, `limine.conf`, and `linker.ld` together.
-4. Open a terminal in the project root and run:
+```text
+python setup.py
+python build.py --clean
+python run.py
+```
 
-   ```text
-   python setup.py
-   python build.py --clean
-   python run.py
-   ```
+Create release assets after a verified ISO build:
 
-5. In the XavierOS shell, run `IDT`, `IRQ`, `TIME`, `SELFTEST`, and `DIAG`. Run `TRAP` only last because it is intentionally fatal.
+```text
+python package_release.py
+```
 
-If your Python command is `py`, use `py -3 setup.py`, `py -3 build.py --clean`, and `py -3 run.py` instead.
+## Updating the GitHub repository through the browser
 
-## Removing PowerShell from the GitHub language statistics
+1. Download and extract the full `XavierOS-0.1.1-Source.zip` archive.
+2. In `kiru0real/XavierOS`, open the `main` branch and choose **Add file → Upload files**.
+3. Upload the archive's project files and directories while preserving their paths. Do not upload local `target/`, `build/`, `tools/`, `dist/`, or `data/xavieros-disk.img`.
+4. Delete old `build.ps1`, `run.ps1`, and `setup.ps1` files from `main` in the browser if they are still present. Uploading new files does not remove old files automatically.
+5. Commit the change with a message such as `Prepare 0.1.1 maintenance update`.
+6. Wait for the new CI workflow to run and fix any failures before drafting a release.
 
-The archive no longer contains the old `.ps1` scripts, but uploading files in GitHub's browser does not automatically delete files that were already in the repository. After validating this snapshot, delete these three obsolete files from the current branch in the GitHub web UI:
-
-- `setup.ps1`
-- `build.ps1`
-- `run.ps1`
-
-Open each file, choose **Delete this file**, then commit the deletion. Upload the new `setup.py`, `build.py`, `run.py`, updated source, and docs through **Add file → Upload files**. Do not create a release or move/delete the existing `v0.1.0` tag unless you explicitly decide to.
-
-## Cross-platform notes
-
-The kernel remains x86_64 and still boots through Limine. Python removes PowerShell as the build-system dependency; it does not remove the bootloader, ISO creation, Rust toolchain, or QEMU dependencies. Windows uses the official Limine executable and may download the Windows xorriso bundle. macOS/Linux compile the official Limine host utility from `limine.c` included in Limine's archive, requiring a C compiler.
+The published `v0.1.0` tag/release should not be edited. For the next release, use tag `v0.1.1`, title `XavierOS 0.1.1`, and leave the pre-release checkbox off. Publish only after a clean build and QEMU checklist pass.

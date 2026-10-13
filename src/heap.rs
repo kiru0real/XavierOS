@@ -6,7 +6,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::mem::{align_of, size_of};
 use core::ptr::{null_mut, write_bytes};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const HEAP_BYTES: usize = 1024 * 1024;
 const HEAP_PAGES: usize = HEAP_BYTES / 4096;
@@ -27,6 +27,8 @@ struct AllocationHeader {
 struct KernelHeap {
     lock: AtomicBool,
     initialized: AtomicBool,
+    base: AtomicUsize,
+    end: AtomicUsize,
     head: UnsafeCell<*mut FreeBlock>,
 }
 
@@ -44,6 +46,8 @@ impl KernelHeap {
         Self {
             lock: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
+            base: AtomicUsize::new(0),
+            end: AtomicUsize::new(0),
             head: UnsafeCell::new(null_mut()),
         }
     }
@@ -69,18 +73,28 @@ impl KernelHeap {
     unsafe fn allocate_locked(&self, layout: Layout) -> *mut u8 {
         let header_size = size_of::<AllocationHeader>();
         let required_align = layout.align().max(align_of::<AllocationHeader>());
+        let heap_base = self.base.load(Ordering::Acquire);
+        let heap_end = self.end.load(Ordering::Acquire);
         let mut link = self.head.get();
 
         unsafe {
             while !(*link).is_null() {
                 let block = *link;
                 let start = block as usize;
-                let end = match start.checked_add((*block).size) {
+                let block_header_end = match start.checked_add(size_of::<FreeBlock>()) {
                     Some(value) => value,
-                    None => {
-                        link = &mut (*block).next;
-                        continue;
-                    }
+                    None => return null_mut(),
+                };
+                if start < heap_base
+                    || start % align_of::<FreeBlock>() != 0
+                    || block_header_end > heap_end
+                {
+                    return null_mut();
+                }
+                let block_size = (*block).size;
+                let end = match start.checked_add(block_size) {
+                    Some(value) if block_size >= size_of::<FreeBlock>() && value <= heap_end => value,
+                    _ => return null_mut(),
                 };
                 let payload = match start.checked_add(header_size).and_then(|v| align_up(v, required_align)) {
                     Some(value) => value,
@@ -121,14 +135,54 @@ impl KernelHeap {
         if ptr.is_null() || !self.initialized.load(Ordering::Acquire) {
             return;
         }
-        let _guard = self.lock();
-        let header_ptr = unsafe { (ptr as usize - size_of::<AllocationHeader>()) as *mut AllocationHeader };
-        let header = unsafe { header_ptr.read() };
-        if header.start == 0 || header.size < size_of::<FreeBlock>() {
+        let base = self.base.load(Ordering::Acquire);
+        let end = self.end.load(Ordering::Acquire);
+        let user = ptr as usize;
+        let header_size = size_of::<AllocationHeader>();
+        if base == 0 || end <= base || user < base.saturating_add(header_size) || user >= end {
             return;
         }
-        let start_ptr = header.start as *mut FreeBlock;
+
+        let _guard = self.lock();
+        let header_ptr = (user - header_size) as *const AllocationHeader;
+        let header = unsafe { header_ptr.read() };
+        let Some(allocation_end) = header.start.checked_add(header.size) else { return; };
+        let Some(payload_floor) = header.start.checked_add(header_size) else { return; };
+        if header.start < base
+            || header.start % align_of::<FreeBlock>() != 0
+            || header.size < size_of::<FreeBlock>()
+            || allocation_end > end
+            || payload_floor > user
+            || user >= allocation_end
+        {
+            return;
+        }
+
+        // Do not insert a range already present in the free list. Besides preventing
+        // list corruption, this catches common double-free cases without following a
+        // forged pointer supplied by a damaged allocation header.
         unsafe {
+            let mut scan = *self.head.get();
+            while !scan.is_null() {
+                let free_start = scan as usize;
+                if free_start < base
+                    || free_start % align_of::<FreeBlock>() != 0
+                    || free_start.checked_add(size_of::<FreeBlock>()).map_or(true, |v| v > end)
+                {
+                    return;
+                }
+                let free_size = (*scan).size;
+                let Some(free_end) = free_start.checked_add(free_size) else { return; };
+                if free_size < size_of::<FreeBlock>() || free_end > end {
+                    return;
+                }
+                if free_start < allocation_end && header.start < free_end {
+                    return;
+                }
+                scan = (*scan).next;
+            }
+
+            let start_ptr = header.start as *mut FreeBlock;
             (*start_ptr).size = header.size;
             (*start_ptr).next = null_mut();
 
@@ -146,12 +200,12 @@ impl KernelHeap {
             }
 
             // Merge with the following free block, then with the previous one.
-            if !current.is_null() && header.start.saturating_add(header.size) == current as usize {
+            if !current.is_null() && allocation_end == current as usize {
                 (*start_ptr).size = (*start_ptr).size.saturating_add((*current).size);
                 (*start_ptr).next = (*current).next;
             }
             if !previous.is_null()
-                && (previous as usize).saturating_add((*previous).size) == start_ptr as usize
+                && (previous as usize).checked_add((*previous).size) == Some(start_ptr as usize)
             {
                 (*previous).size = (*previous).size.saturating_add((*start_ptr).size);
                 (*previous).next = (*start_ptr).next;
@@ -165,10 +219,23 @@ impl KernelHeap {
         }
         let _guard = self.lock();
         let mut free_bytes = 0usize;
+        let base = self.base.load(Ordering::Acquire);
+        let end = self.end.load(Ordering::Acquire);
         unsafe {
             let mut block = *self.head.get();
             while !block.is_null() {
-                free_bytes = free_bytes.saturating_add((*block).size);
+                let start = block as usize;
+                if start < base
+                    || start % align_of::<FreeBlock>() != 0
+                    || start.checked_add(size_of::<FreeBlock>()).map_or(true, |v| v > end)
+                {
+                    return None;
+                }
+                let size = (*block).size;
+                if size < size_of::<FreeBlock>() || start.checked_add(size).map_or(true, |v| v > end) {
+                    return None;
+                }
+                free_bytes = free_bytes.checked_add(size)?;
                 block = (*block).next;
             }
         }
@@ -218,6 +285,16 @@ pub fn initialize() -> Result<HeapStats, &'static str> {
         return Err("heap base alignment is invalid");
     }
 
+    let base = virtual_base as usize;
+    let end = match base.checked_add(HEAP_BYTES) {
+        Some(value) => value,
+        None => {
+            for offset in 0..HEAP_PAGES {
+                let _ = crate::memory::free_page(physical + (offset as u64) * 4096);
+            }
+            return Err("heap virtual address range overflowed");
+        }
+    };
     unsafe {
         write_bytes(virtual_base, 0, HEAP_BYTES);
         let initial = virtual_base.cast::<FreeBlock>();
@@ -225,6 +302,8 @@ pub fn initialize() -> Result<HeapStats, &'static str> {
         (*initial).next = null_mut();
         *HEAP.head.get() = initial;
     }
+    HEAP.base.store(base, Ordering::Release);
+    HEAP.end.store(end, Ordering::Release);
     HEAP.initialized.store(true, Ordering::Release);
     crate::serial_write("Kernel heap initialized: 1024 KiB from 256 contiguous PMM pages.\r\n");
     HEAP.stats().ok_or("kernel heap did not publish initialization")

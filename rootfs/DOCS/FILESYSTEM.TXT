@@ -1,17 +1,15 @@
-XVRFS FILESYSTEM NOTES
+XAVIEROS FILESYSTEM NOTES
 
-XVRFS v1 is a read-only filesystem image embedded into the kernel ELF.
-Its image is generated from the rootfs/ directory by mkinitramfs.py.
-The current version supports directories, file metadata, and text reads.
+The embedded root filesystem is XVRFS v1. It is read-only and embedded in the kernel.
+The writable test filesystem is XVDISKFS v1 and is mounted at /DISK when a supported
+QEMU ATA primary-master disk is available.
 
-Commands:
-  LS [PATH]       List immediate children of a directory.
-  CAT PATH        Print a UTF-8 text file.
-  STAT PATH       Display entry type and size.
-  PWD             Display the current root directory.
-  FSINFO          Display filesystem image statistics.
-  FSTEST          Run filesystem integrity checks.
+Useful commands:
+  LS /DISK
+  MKDIR /DISK/HOME
+  WRITE /DISK/HOME/HELLO.TXT Hello from XavierOS
+  CAT /DISK/HOME/HELLO.TXT
+  STAT /DISK/HOME/HELLO.TXT
 
-This first iteration has no disk driver and no write support. Files are
-included at build time. Writable storage and a disk-backed filesystem can
-be added after the filesystem API is stable.
+The disk filesystem is experimental and is not crash-safe. Attach only the disposable
+disk image created by run.py. FORMAT DISK erases all files on that image.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -41,7 +42,7 @@ def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProces
 def download(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {url}", flush=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "XavierOS-build/0.1.0"})
+    request = urllib.request.Request(url, headers={"User-Agent": "XavierOS-build/0.1.1"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as out:
         shutil.copyfileobj(response, out)
 
@@ -52,15 +53,102 @@ def find_named(directory: Path, name: str) -> Path | None:
     return next((p for p in directory.rglob("*") if p.is_file() and p.name.lower() == name.lower()), None)
 
 
-def safe_extract_tar(archive: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
+def _safe_archive_parts(name: str) -> tuple[str, ...]:
+    """Return a portable relative path, rejecting traversal and platform-specific escapes."""
+    if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+        raise RuntimeError(f"Unsafe path in archive: {name!r}")
+    raw_parts = name.split("/")
+    if any(part == ".." for part in raw_parts) or any(":" in part for part in raw_parts):
+        raise RuntimeError(f"Unsafe path in archive: {name!r}")
+    return tuple(part for part in raw_parts if part not in ("", "."))
+
+
+def _safe_target(destination: Path, parts: tuple[str, ...], original_name: str) -> Path:
     root_resolved = destination.resolve()
+    target = destination.joinpath(*parts)
+    resolved = target.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise RuntimeError(f"Unsafe path in archive: {original_name}")
+    return target
+
+
+def safe_extract_tar(archive: Path, destination: Path) -> None:
+    """Extract regular files/directories only; never follow archive-provided links."""
+    destination.mkdir(parents=True, exist_ok=True)
+    seen: set[tuple[str, ...]] = set()
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            target = (destination / member.name).resolve()
-            if target != root_resolved and root_resolved not in target.parents:
-                raise RuntimeError(f"Unsafe path in archive: {member.name}")
-        tar.extractall(destination)
+        members = tar.getmembers()
+        prepared: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+        for member in members:
+            parts = _safe_archive_parts(member.name)
+            if not parts:
+                if member.isdir():
+                    continue
+                raise RuntimeError(f"Archive member has no safe destination: {member.name!r}")
+            if not (member.isdir() or member.isfile()):
+                raise RuntimeError(f"Links and special files are not accepted in archives: {member.name}")
+            key = tuple(part.casefold() for part in parts)
+            if key in seen:
+                raise RuntimeError(f"Duplicate archive path: {member.name}")
+            seen.add(key)
+            _safe_target(destination, parts, member.name)
+            prepared.append((member, parts))
+
+        # Create directories first, then stream regular files manually. No archive
+        # member is allowed to create a symlink/hardlink that later members follow.
+        for member, parts in prepared:
+            if member.isdir():
+                _safe_target(destination, parts, member.name).mkdir(parents=True, exist_ok=True)
+        for member, parts in prepared:
+            if not member.isfile():
+                continue
+            target = _safe_target(destination, parts, member.name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise RuntimeError(f"Refusing to overwrite a symbolic link: {member.name}")
+            source = tar.extractfile(member)
+            if source is None:
+                raise RuntimeError(f"Could not read archive member: {member.name}")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def safe_extract_zip(archive: Path, destination: Path) -> None:
+    """Extract ZIP files without traversal, link, or case-insensitive path tricks."""
+    destination.mkdir(parents=True, exist_ok=True)
+    seen: set[tuple[str, ...]] = set()
+    with zipfile.ZipFile(archive) as source:
+        prepared: list[tuple[zipfile.ZipInfo, tuple[str, ...], bool]] = []
+        for member in source.infolist():
+            parts = _safe_archive_parts(member.filename)
+            is_dir = member.is_dir()
+            mode = (member.external_attr >> 16) & 0xFFFF
+            file_type = stat.S_IFMT(mode)
+            if file_type == stat.S_IFLNK or file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise RuntimeError(f"Links and special files are not accepted in archives: {member.filename}")
+            if not parts:
+                if is_dir:
+                    continue
+                raise RuntimeError(f"Archive member has no safe destination: {member.filename!r}")
+            key = tuple(part.casefold() for part in parts)
+            if key in seen:
+                raise RuntimeError(f"Duplicate archive path: {member.filename}")
+            seen.add(key)
+            _safe_target(destination, parts, member.filename)
+            prepared.append((member, parts, is_dir))
+
+        for member, parts, is_dir in prepared:
+            if is_dir:
+                _safe_target(destination, parts, member.filename).mkdir(parents=True, exist_ok=True)
+        for member, parts, is_dir in prepared:
+            if is_dir:
+                continue
+            target = _safe_target(destination, parts, member.filename)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise RuntimeError(f"Refusing to overwrite a symbolic link: {member.filename}")
+            with source.open(member) as input_stream, target.open("wb") as output:
+                shutil.copyfileobj(input_stream, output)
 
 
 def ensure_limine() -> tuple[Path, Path]:
@@ -142,13 +230,7 @@ def ensure_xorriso() -> Path:
         download(XORRISO_WINDOWS_URL, archive)
         shutil.rmtree(XORRISO_EXTRACT, ignore_errors=True)
         XORRISO_EXTRACT.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(archive) as zf:
-            base = XORRISO_EXTRACT.resolve()
-            for member in zf.infolist():
-                target = (XORRISO_EXTRACT / member.filename).resolve()
-                if target != base and base not in target.parents:
-                    raise RuntimeError(f"Unsafe path in archive: {member.filename}")
-            zf.extractall(XORRISO_EXTRACT)
+        safe_extract_zip(archive, XORRISO_EXTRACT)
         bundled = find_named(XORRISO_EXTRACT, "xorriso.exe")
         if bundled:
             return bundled

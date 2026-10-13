@@ -101,7 +101,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.0\r\n");
+    serial_write("\r\nXavierOS v0.1.1\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -382,7 +382,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.0 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.1 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -490,7 +490,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.0");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.1");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -701,7 +701,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.0");
+            console.write_line("PROJECT VERSION: 0.1.1");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -710,7 +710,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.0");
+            console.write_line("VERSION: 0.1.1");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -886,7 +886,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.0"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.1"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1051,7 +1051,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.0 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.1 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -1320,9 +1320,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
     // At typical 1024x768 QEMU resolution, keep an X-shaped logo on the left and
     // aligned facts on the right. On narrower framebuffers, stack the info below it.
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS V0.1.0");
+        sysinfo_row(console, "XX              XX", "XAVIEROS V0.1.1");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS V0.1.0");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS V0.1.1");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -1372,7 +1372,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("  XX          XX");
         console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS V0.1.0");
+        console.write_line("XAVIEROS V0.1.1");
         console.write_line("----------------");
         console.write_line("KERNEL: RUST NO_STD");
         console.write_line("ARCH: X86_64");
