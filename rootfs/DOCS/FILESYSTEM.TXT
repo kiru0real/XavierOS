@@ -1,0 +1,17 @@
+XVRFS FILESYSTEM NOTES
+
+XVRFS v1 is a read-only filesystem image embedded into the kernel ELF.
+Its image is generated from the rootfs/ directory by mkinitramfs.py.
+The current version supports directories, file metadata, and text reads.
+
+Commands:
+  LS [PATH]       List immediate children of a directory.
+  CAT PATH        Print a UTF-8 text file.
+  STAT PATH       Display entry type and size.
+  PWD             Display the current root directory.
+  FSINFO          Display filesystem image statistics.
+  FSTEST          Run filesystem integrity checks.
+
+This first iteration has no disk driver and no write support. Files are
+included at build time. Writable storage and a disk-backed filesystem can
+be added after the filesystem API is stable.

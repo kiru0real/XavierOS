@@ -2,15 +2,15 @@
 
 # XavierOS
 
-**A tiny experimental x86_64 hobby operating system written in Rust.**
+**A small x86_64 hobby operating system written in Rust.**
 
-Built from scratch with `no_std`, booted by Limine, and developed natively on Windows.
+A freestanding `no_std` kernel with a framebuffer console, memory management, CPU exception diagnostics, interrupt-driven keyboard input, an embedded read-only initramfs, persistent virtual-disk storage, and a cooperative task scheduler prototype.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-Experimental%20Beta-orange)](#status-and-limitations)
+[![Kernel version](https://img.shields.io/badge/version-0.1.0-informational)](CHANGELOG.md)
+[![Language](https://img.shields.io/badge/kernel-Rust-orange)](src/main.rs)
 
-**Current version: `0.1.0` · First public pre-release: `v0.1.0-beta.1`**
+**XavierOS 0.1.0 — First public release**
 
 [Русская версия README](README.ru.md)
 
@@ -20,188 +20,186 @@ Built from scratch with `no_std`, booted by Limine, and developed natively on Wi
 
 ## About
 
-XavierOS is a small hobby operating system project focused on learning how a computer boots and how a kernel manages memory, video output, and keyboard input. The kernel is written in Rust without the standard library (`#![no_std]`) and currently targets `x86_64`.
+XavierOS is a learning project for exploring how an operating system boots and manages memory, hardware events, files, and tasks. The kernel is written in Rust without the standard library (`#![no_std]`) and targets `x86_64-unknown-none`. Limine is used as the bootloader.
 
-The first public beta boots into a simple interactive text console rather than a desktop environment. The project is experimental and intended for learning and testing in a virtual machine.
+This release boots into the XavierOS text console, not a graphical desktop. It is intended for experimentation in QEMU and other disposable virtual machines, not as a daily-use or secure operating system.
 
-## Current features
+## Features in 0.1.0
 
-- **Rust bare-metal kernel** targeting `x86_64-unknown-none`.
-- **Limine boot protocol** and a hybrid BIOS/UEFI bootable ISO.
-- **Framebuffer console** with a built-in bitmap font.
-- **Polled PS/2 keyboard input** for the interactive shell.
-- **Serial diagnostics** through COM1, visible in the PowerShell window when using the provided QEMU script.
-- **Limine memory-map parsing** and a bitmap physical memory manager (PMM) for usable pages below 4 GiB.
-- **HHDM support** for physical-to-virtual address translation and zeroed-page allocation.
-- **PMM/HHDM self-tests** for allocation, freeing, zeroing, and memory access.
-- **Built-in console commands**, including system information, diagnostics, and a checked integer calculator.
-- **Windows-native build scripts**; WSL and a Linux environment are not required.
+- Freestanding Rust kernel using the Limine boot protocol.
+- Framebuffer console and built-in command shell.
+- Limine memory-map parsing, Higher Half Direct Map (HHDM), and bitmap physical memory manager (PMM) for usable pages below 4 GiB.
+- First-fit kernel heap backed by contiguous physical pages.
+- x86_64 IDT and diagnostic handlers for CPU exceptions, including register output and CR2 reporting on page faults.
+- Legacy 8259 PIC remapping and PIT timer on IRQ0; PS/2 keyboard input via IRQ1 and a bounded ring buffer.
+- Serial diagnostics through COM1.
+- Read-only XVRFS v1 initramfs embedded in the kernel, generated from `rootfs/` at build time.
+- Legacy ATA PIO driver for the QEMU primary IDE master.
+- Writable XVDISKFS v1 filesystem mounted at `/DISK`, with file and directory operations backed by a persistent 16 MiB virtual disk image.
+- A small VFS dispatcher for the embedded root filesystem and writable disk mount.
+- Cooperative task-context switching prototype with separate task stacks; preemptive scheduling is not implemented.
+- Portable Python scripts for setup, building, and running under Windows, macOS, and Linux.
 
 ## Build and run
 
 ### Requirements
 
-- Windows 10 or Windows 11.
-- PowerShell 5.1 or newer.
-- Rust and `rustup`.
-- QEMU for Windows (`qemu-system-x86_64.exe`).
-- An internet connection on the first build: the build script downloads the Limine binary tools and a Windows `xorriso` bundle when they are missing.
+- Python 3.10 or newer.
+- Rust stable toolchain with `rustup` and `cargo` ([rustup.rs](https://rustup.rs/)).
+- QEMU with `qemu-system-x86_64` on `PATH`.
+- `xorriso` on `PATH`; on Windows the build script can download the bundled executable on first build.
+- A C compiler (`cc`, Clang, or GCC) on macOS/Linux so the Limine host utility can be compiled.
+- Internet access on the first build to download the official Limine binary release and, if needed, the Windows `xorriso` bundle.
 
-### 1. Install Rust
+These are host-side build/run requirements. The kernel itself does not use Python at runtime.
 
-In PowerShell:
+### 1. Prepare the Rust target
 
-```powershell
-winget install --id Rustlang.Rustup -e
-```
-
-Close and reopen PowerShell after installation.
-
-### 2. Install QEMU
-
-Download QEMU for Windows from the [official QEMU downloads page](https://www.qemu.org/download/#windows). Make sure `qemu-system-x86_64.exe` is on `PATH`, or install QEMU in its usual Program Files directory.
-
-### 3. Build the ISO
-
-Open PowerShell in the repository directory and run:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass -Force
-.\setup.ps1
-.\build.ps1
-```
-
-The execution-policy command applies only to the current PowerShell process. It does not permanently change the machine-wide policy.
-
-A successful build creates:
+From the repository root:
 
 ```text
-build\xavieros.iso
+python setup.py
 ```
 
-### 4. Run in QEMU
+On some systems, use `python3` instead of `python`.
 
-```powershell
-.\run.ps1
-```
-
-Click inside the QEMU window to give the virtual machine keyboard focus. Switch to an English keyboard layout and type:
+### 2. Build the bootable ISO
 
 ```text
-HELP
-SYSINFO
-DIAG
+python build.py --clean
 ```
 
-Press Enter after each command. The serial diagnostic log is also shown in the PowerShell window.
+The script generates `build/xavieros.iso` and is configured to create a hybrid BIOS/UEFI image. The primary documented test environment is QEMU; booting on physical hardware and across all firmware implementations is not guaranteed.
 
-To clean generated build tools and outputs before rebuilding:
+### 3. Run in QEMU
 
-```powershell
-.\build.ps1 -Clean
+```text
+python run.py
 ```
 
-> **Tip:** Keeping the project in a short path such as `C:\dev\XavierOS` can make Windows toolchains easier to troubleshoot.
+On first launch, `run.py` creates a blank 16 MiB disk image at `data/xavieros-disk.img`. This data image persists across QEMU runs and clean builds. It is ignored by Git so that local user data is not committed.
+
+To reset the disk (this erases all files under `/DISK`):
+
+```text
+python run.py --reset-disk
+```
+
+To boot without the writable disk attached:
+
+```text
+python run.py --no-disk
+```
+
+The current storage driver targets the primary master on a legacy PC/PIIX IDE controller in QEMU. Use only the disposable disk image created for this project; do not attach a disk with valuable data.
+
+### Host setup notes
+
+- **Windows:** install Rust from rustup and QEMU from the [official QEMU downloads page](https://www.qemu.org/download/#windows). The first build can download the project's `xorriso` bundle.
+- **macOS:** install Rust, QEMU, and xorriso; with Homebrew: `brew install qemu xorriso`.
+- **Debian/Ubuntu:** install Rust and run `sudo apt install qemu-system-x86 xorriso`.
+
+Package names vary by operating system. Python scripts replace PowerShell-specific build tooling, but build utilities and supported hardware interfaces still have platform-specific requirements.
 
 ## Console commands
 
-Commands are currently entered in uppercase ASCII. The shell is intentionally small; it is not a POSIX shell and does not run Linux commands.
+Commands are entered in uppercase ASCII. This is XavierOS's own shell, not a POSIX shell.
 
 | Command | Description |
 |---|---|
-| `HELP` or `?` | Show available commands |
-| `ABOUT` | Describe the project and current state |
-| `BANNER` | Display the XavierOS logo |
-| `SYSINFO` | Show a XavierOS-branded system summary |
-| `INFO` | Show kernel, architecture, bootloader, and interface information |
-| `VERSION` | Print the current OS version (`0.1.0`) |
-| `CPU` | Display CPU vendor/model information exposed through CPUID |
-| `MEM` | Show memory-map and PMM statistics |
-| `PMM` | Show physical page allocator status |
-| `HHDM` | Show direct-map information |
-| `DIAG` | Run a compact system diagnostic and memory self-test |
-| `SELFTEST` | Run the PMM/HHDM tests again |
-| `CALC A OP B` | Calculate signed 64-bit integer `+`, `-`, `*`, or `/` expressions with overflow and divide-by-zero checks |
-| `ECHO TEXT` | Print text |
-| `CLEAR` | Clear the console |
-| `REBOOT` | Request a reboot of the virtual machine |
-| `HALT` | Halt the CPU until QEMU is restarted or closed |
+| `HELP` or `?` | List commands |
+| `ABOUT`, `INFO`, `VERSION` | Project/kernel information (`0.1.0`) |
+| `BANNER`, `SYSINFO`, `CPU` | Logo, system summary, and CPUID details |
+| `MEM`, `PMM`, `HHDM`, `HEAP` | Memory subsystem status |
+| `LS [PATH]`, `DIR [PATH]` | List a directory (defaults to `/`) |
+| `CAT PATH` | Print a UTF-8 text file (maximum buffer: 4 KiB) |
+| `STAT PATH` | Show file/directory metadata |
+| `PWD` | Show current directory; `cd`/working-directory changes are not implemented |
+| `FSINFO`, `FSTEST` | Initramfs information and checks |
+| `MKDIR /DISK/PATH` | Create a directory on the writable disk |
+| `WRITE /DISK/PATH TEXT` | Write text to a file on disk |
+| `TOUCH /DISK/PATH` | Create an empty file without truncating an existing one |
+| `RM /DISK/PATH` | Remove a file or an empty directory |
+| `DISK`, `DINFO` | Show disk/filesystem status |
+| `FORMAT DISK` | Destructively format the writable data disk |
+| `TASKS` | List cooperative task records and switch counters |
+| `TASKTEST` | Test cooperative context switching |
+| `IDT` | Show IDT and exception-handler status |
+| `IRQ`, `TIME` | Show interrupt/timer status and approximate uptime |
+| `DIAG` | Run compact system diagnostics |
+| `SELFTEST` | Run memory, interrupt, filesystem, disk-metadata and task checks |
+| `TRAP` | Intentionally execute an invalid opcode; halts the guest |
+| `CALC A OP B` | Checked signed integer arithmetic (`+`, `-`, `*`, `/`) |
+| `ECHO TEXT`, `CLEAR` | Print text or clear the console |
+| `REBOOT`, `HALT` | Reboot or halt the guest |
 
-Examples:
+### Suggested smoke test
 
 ```text
 HELP
-SYSINFO
-MEM
-CALC 12 * 4
-CALC -7 + 3
-ECHO HELLO XAVIEROS
+IDT
+IRQ
+TIME
+LS /
+CAT /ETC/ISSUE
+LS /DISK
+MKDIR /DISK/HOME
+WRITE /DISK/HOME/HELLO.TXT Hello from XavierOS!
+CAT /DISK/HOME/HELLO.TXT
+DISK
+TASKTEST
+TASKS
+FSINFO
+FSTEST
 SELFTEST
+DIAG
 ```
 
-`SYSINFO` reports the CPU model exposed to the guest by QEMU and memory usable by XavierOS inside the virtual machine. It does **not** report the host computer's full hardware inventory or all installed physical RAM.
+Restart QEMU and run `CAT /DISK/HOME/HELLO.TXT` to verify disk persistence. Run `TRAP` last because it deliberately triggers a fatal CPU exception and halts the guest.
 
 ## Project structure
 
 ```text
 XavierOS/
-├── .cargo/
-│   └── config.toml      # Bare-metal target and linker flags
-├── src/
-│   ├── main.rs          # Kernel entry point, framebuffer, keyboard, shell
-│   └── memory.rs        # Limine memory map, HHDM, physical page allocator
-├── limine.conf          # Limine boot configuration
-├── linker.ld            # Kernel ELF layout and Limine request sections
-├── setup.ps1            # Prepare the Rust target
-├── build.ps1            # Compile kernel and create bootable ISO
-├── run.ps1              # Launch the ISO in QEMU
+├── .cargo/config.toml
+├── src/main.rs          # Kernel entry, framebuffer, shell, keyboard decoding
+├── src/memory.rs        # Memory map, HHDM, physical page allocator
+├── src/interrupts.rs    # IDT, exception handlers, PIC/PIT and IRQ dispatch
+├── src/heap.rs          # Kernel heap
+├── src/fs.rs            # Read-only XVRFS initramfs reader
+├── src/ata.rs           # Legacy ATA PIO sector I/O
+├── src/diskfs.rs        # Writable XVDISKFS filesystem
+├── src/vfs.rs           # VFS path and mount dispatcher
+├── src/task.rs          # Cooperative task contexts and scheduler prototype
+├── rootfs/              # Files embedded into initramfs
+├── setup.py             # Install Rust bare-metal target
+├── mkinitramfs.py       # Generate initramfs from rootfs/
+├── build.py             # Compile kernel and create bootable ISO
+├── run.py               # Launch QEMU and attach virtual disk
+├── limine.conf
+├── linker.ld
 ├── Cargo.toml
+├── Cargo.lock
 ├── LICENSE
 ├── CHANGELOG.md
-└── README.md
+├── XVRFS-FORMAT.md
+└── XVDISKFS-FORMAT.md
 ```
 
-Generated directories such as `target/`, `build/`, and `tools/` are not source files and should not be committed. `Cargo.lock` should be committed for this binary project when generated by Cargo.
+Generated `target/`, `build/`, and `tools/` directories should not be committed. Keep `Cargo.lock` under version control for this binary project. The local disk image under `data/` is deliberately ignored by Git.
 
-## Roadmap
+## Limitations
 
-The project is evolving incrementally. Possible next milestones include:
+XavierOS 0.1.0 is an experimental hobby OS. Its disk filesystem uses a simple metadata/extents layout and is not crash-safe; it must only be used with disposable virtual-disk images. ATA PIO is synchronous and currently supports the QEMU primary-master legacy IDE setup, not arbitrary storage hardware. The task scheduler is cooperative: there is no timer preemption, full blocking scheduler, user mode, or process isolation. There is no network stack or desktop. Fatal CPU exceptions print diagnostics and halt the guest. The heap is a basic first-fit allocator and has not been stress-tested. PMM manages usable physical pages below 4 GiB and is not SMP-safe. The keyboard driver assumes a conventional PS/2 controller and Set 1 scancodes; extended keys are not supported.
 
-- Better console editing, command history, and scrolling.
-- A kernel heap and more memory-manager tests.
-- CPU exceptions and interrupt handling.
-- An interrupt-driven keyboard driver.
-- Virtual memory management and a more complete physical memory manager.
-- Storage, a filesystem, and eventually a small userspace.
-
-These are goals, not features promised by the current beta.
-
-## Status and limitations
-
-XavierOS is an **experimental hobby OS**, not a general-purpose or secure operating system. The current version has no desktop environment, filesystem, networking stack, userspace, process scheduler, kernel heap, or complete interrupt/exception framework. The physical page allocator manages only pages below 4 GiB and is not SMP-safe. Keyboard input currently polls the emulated PS/2 controller and assumes conventional Set 1 scancodes.
-
-**Run XavierOS in QEMU or another disposable virtual machine. Do not use it on your primary machine or rely on it to protect data.** The project has not been validated for general-purpose physical-hardware use.
+Run XavierOS only in QEMU or another disposable virtual machine. Do not use it on your primary machine or rely on it to protect data. Physical-hardware compatibility has not been established.
 
 ## Contributing
 
-Bug reports, ideas, and pull requests are welcome. Please include:
+Bug reports and pull requests are welcome. Include your host OS, Python version, `rustc --version`, QEMU version, full build output or serial log, and reproduction steps.
 
-- Windows version and Rust version (`rustc --version`).
-- QEMU version.
-- The full output of `build.ps1` or the serial console log.
-- Steps to reproduce the issue.
+## License and acknowledgements
 
-Please keep changes focused and update the README or changelog when user-visible behavior changes.
+XavierOS source code and documentation are distributed under the [MIT License](LICENSE). Third-party tools downloaded by build scripts remain under their own licenses.
 
-## License
-
-Original XavierOS source code and documentation are distributed under the [MIT License](LICENSE). MIT is a permissive license that allows reuse and modification as long as the copyright and license notice are retained. See [Choose a License: MIT](https://choosealicense.com/licenses/mit/).
-
-The build scripts download third-party tools such as Limine and `xorriso`. Those tools and any third-party components remain under their respective licenses; this repository's MIT license does not replace those licenses.
-
-## Acknowledgements
-
-- [Rust](https://www.rust-lang.org/) and its bare-metal target support.
-- [Limine](https://github.com/limine-bootloader/limine) and the [Limine boot protocol](https://github.com/Limine-Bootloader/limine-protocol).
-- [QEMU](https://www.qemu.org/) for virtual-machine testing.
-- [xorriso](https://www.gnu.org/software/xorriso/) for ISO image creation.
+Thanks to [Rust](https://www.rust-lang.org/), [Limine](https://github.com/limine-bootloader/limine), [QEMU](https://www.qemu.org/), and [xorriso](https://www.gnu.org/software/xorriso/).

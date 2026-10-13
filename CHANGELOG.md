@@ -1,20 +1,26 @@
 # Changelog
 
-Notable changes to XavierOS are documented here.
+## 0.1.0 — 2026-10-14
 
-## 0.1.0 — First public beta
+First public release of XavierOS.
 
-- Boots a freestanding Rust `no_std` kernel through Limine.
-- Native Windows PowerShell build and QEMU run scripts.
-- Limine framebuffer console with polled PS/2 keyboard input.
-- Interactive command shell and XavierOS-branded system summary.
-- Limine memory-map parsing, HHDM address translation, and bitmap PMM for pages below 4 GiB.
-- PMM/HHDM self-tests and zeroed-page allocation.
-- Commands for system information, diagnostics, a checked integer calculator, reboot, and halt.
+- Freestanding Rust `no_std` kernel for x86_64 booted with Limine.
+- Framebuffer text console and interactive built-in shell.
+- Limine memory-map parsing, HHDM, bitmap PMM for usable physical pages below 4 GiB, and a first-fit kernel heap.
+- x86_64 IDT and diagnostic handlers for CPU exceptions.
+- Legacy PIC remapping, PIT timer, and PS/2 keyboard input through IRQs.
+- Read-only XVRFS v1 initramfs generated from `rootfs/` and embedded in the kernel.
+- Legacy ATA PIO sector I/O for the QEMU primary IDE master.
+- Writable XVDISKFS v1 mounted at `/DISK`, with create/read/write/remove operations and data persistence in a virtual disk image between QEMU runs.
+- VFS dispatcher for the embedded root filesystem and writable disk.
+- Cooperative task-context switching prototype and self-test commands.
+- Cross-platform Python helpers for preparing the Rust target, building the ISO, and running QEMU on Windows, macOS, and Linux.
 
-### Known limitations
+## Known limitations
 
-- Experimental; intended for QEMU and learning, not daily use.
-- No desktop, filesystem, networking, userspace, process scheduler, or kernel heap.
-- Keyboard input polls the emulated PS/2 controller.
-- PMM only manages physical pages below 4 GiB and is not SMP-safe.
+- Intended for QEMU and learning; physical-hardware support is not established.
+- Disk filesystem is experimental and not crash-safe. Use only disposable virtual disk images.
+- Storage driver currently targets a legacy PC/PIIX IDE setup in QEMU.
+- Task scheduling is cooperative; no timer preemption, user mode, or process isolation.
+- No network stack or desktop environment.
+- PMM handles usable pages below 4 GiB and is not SMP-safe.

@@ -1,0 +1,2 @@
+HELLO FROM THE XAVIEROS INITRAMFS.
+The file system is alive.
