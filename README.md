@@ -10,7 +10,7 @@ A `no_std` kernel booted by Limine, with a framebuffer console, memory managemen
 [![Platform](https://img.shields.io/badge/Target-x86__64-informational)](#current-features)
 [![Status](https://img.shields.io/badge/Status-Experimental-orange)](#status-and-limitations)
 
-**Source version: `0.1.1` · Latest published release: [`0.1.1`](https://github.com/kiru0real/XavierOS/releases/tag/v0.1.1) until the maintenance update is verified and published.**
+**Source version: `0.1.1` · Latest published release: [`0.1.1`](https://github.com/kiru0real/XavierOS/releases/tag/v0.1.1) **
 
 [Русская версия README](README.ru.md)
 
