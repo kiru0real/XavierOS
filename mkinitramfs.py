@@ -15,6 +15,16 @@ KIND_DIRECTORY = 1
 KIND_FILE = 2
 
 
+def _validate_case_insensitive_paths(paths: list[str]) -> None:
+    """Reject paths that collide on case-insensitive filesystems (including Windows)."""
+    seen: set[str] = set()
+    for path in paths:
+        key = path.casefold()
+        if key in seen:
+            raise ValueError(f"case-insensitive path collision: {path}")
+        seen.add(key)
+
+
 def build(rootfs: Path, output: Path) -> None:
     if not rootfs.is_dir():
         raise FileNotFoundError(f"root filesystem directory not found: {rootfs}")
@@ -37,12 +47,7 @@ def build(rootfs: Path, output: Path) -> None:
     items.sort(key=lambda item: (item[1].casefold(), item[0], item[1]))
     if not items:
         raise ValueError("rootfs contains no entries")
-    seen: set[str] = set()
-    for _, path, _ in items:
-        key = path.casefold()
-        if key in seen:
-            raise ValueError(f"case-insensitive path collision: {path}")
-        seen.add(key)
+    _validate_case_insensitive_paths([path for _, path, _ in items])
 
     table_offset = HEADER.size
     data_cursor = table_offset + len(items) * RECORD.size

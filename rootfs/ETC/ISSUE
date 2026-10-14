@@ -1,3 +1,3 @@
-XavierOS 0.1.1 - experimental x86_64 hobby operating system
+XavierOS 0.1.2 - experimental x86_64 hobby operating system
 Booted with Limine. Kernel language: Rust (no_std).
 Filesystem: read-only XVRFS initramfs and writable XVDISKFS at /DISK.

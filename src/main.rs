@@ -9,6 +9,8 @@ mod ata;
 mod diskfs;
 mod vfs;
 mod task;
+mod crypto;
+mod users;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -18,6 +20,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 const COM1: u16 = 0x3F8;
 static SHIFT_STATE: AtomicU8 = AtomicU8::new(0);
+static EXTENDED_SCANCODE: AtomicU8 = AtomicU8::new(0);
 const LIMINE_COMMON_MAGIC: [u64; 2] = [
     0xC7B1_DD30_DF4C_8B88,
     0x0A82_E883_A194_F07B,
@@ -101,7 +104,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.1\r\n");
+    serial_write("\r\nXavierOS v0.1.2\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -199,6 +202,17 @@ pub extern "C" fn _start() -> ! {
             serial_write("\r\n");
         }
     }
+    match users::initialize() {
+        Ok(()) => {
+            serial_write("Local user database ready; initial console identity is live.\r\n");
+            serial_write("User account access is experimental and does not isolate kernel privileges.\r\n");
+        }
+        Err(error) => {
+            serial_write("User database unavailable: ");
+            serial_write(error);
+            serial_write("; continuing in live session.\r\n");
+        }
+    }
 
     if !framebuffer_is_supported(&framebuffer) {
         serial_write("ERROR: Unsupported framebuffer format or dimensions.\r\n");
@@ -219,7 +233,6 @@ fn halt_forever() -> ! {
 const CONSOLE_MAX_COLS: usize = 120;
 const CONSOLE_MAX_LINES: usize = 64;
 const CONSOLE_INPUT_CAPACITY: usize = 128;
-const CONSOLE_PROMPT: &str = "XAVIEROS> ";
 const CONSOLE_TEXT_X: usize = 40;
 const CONSOLE_TEXT_Y: usize = 116;
 const CONSOLE_FOOTER_HEIGHT: usize = 42;
@@ -382,7 +395,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.1 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.2 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -428,6 +441,23 @@ impl Console {
         }
     }
 
+    fn current_line_len(&self) -> usize {
+        self.lines[self.line_count - 1].len
+    }
+
+    fn replace_current_input(&mut self, start: usize, input: &[u8]) {
+        let line_index = self.line_count - 1;
+        if start > self.max_cols || start > CONSOLE_MAX_COLS {
+            return;
+        }
+        let available = self.max_cols.saturating_sub(start).min(CONSOLE_MAX_COLS - start);
+        let length = input.len().min(available);
+        self.lines[line_index].bytes[start..].fill(b' ');
+        self.lines[line_index].bytes[start..start + length].copy_from_slice(&input[..length]);
+        self.lines[line_index].len = start + length;
+        self.render_current_line();
+    }
+
     fn render_current_line(&self) {
         let visible_rows = self.visible_rows();
         let first_line = self.line_count.saturating_sub(visible_rows);
@@ -471,6 +501,59 @@ enum KeyboardKey {
     Character(u8),
     Enter,
     Backspace,
+    HistoryUp,
+    HistoryDown,
+    Tab,
+}
+
+const COMMAND_HISTORY_CAPACITY: usize = 16;
+
+#[derive(Clone, Copy)]
+struct HistoryEntry {
+    bytes: [u8; CONSOLE_INPUT_CAPACITY],
+    len: usize,
+}
+
+impl HistoryEntry {
+    const EMPTY: Self = Self { bytes: [0; CONSOLE_INPUT_CAPACITY], len: 0 };
+}
+
+struct CommandHistory {
+    entries: [HistoryEntry; COMMAND_HISTORY_CAPACITY],
+    next: usize,
+    count: usize,
+}
+
+impl CommandHistory {
+    const fn new() -> Self {
+        Self { entries: [HistoryEntry::EMPTY; COMMAND_HISTORY_CAPACITY], next: 0, count: 0 }
+    }
+
+    fn push(&mut self, command: &[u8]) {
+        if command.is_empty() || command.iter().all(|byte| byte.is_ascii_whitespace()) { return; }
+        if self.count > 0 {
+            let previous = (self.next + COMMAND_HISTORY_CAPACITY - 1) % COMMAND_HISTORY_CAPACITY;
+            let entry = &self.entries[previous];
+            if entry.len == command.len() && entry.bytes[..entry.len].iter().copied().eq(command.iter().copied()) {
+                return;
+            }
+        }
+        let length = command.len().min(CONSOLE_INPUT_CAPACITY);
+        let entry = &mut self.entries[self.next];
+        entry.bytes.fill(0);
+        entry.bytes[..length].copy_from_slice(&command[..length]);
+        entry.len = length;
+        self.next = (self.next + 1) % COMMAND_HISTORY_CAPACITY;
+        self.count = (self.count + 1).min(COMMAND_HISTORY_CAPACITY);
+    }
+
+    fn copy_back(&self, offset: usize, output: &mut [u8; CONSOLE_INPUT_CAPACITY]) -> Option<usize> {
+        if offset >= self.count { return None; }
+        let index = (self.next + COMMAND_HISTORY_CAPACITY - 1 - offset) % COMMAND_HISTORY_CAPACITY;
+        let entry = &self.entries[index];
+        output[..entry.len].copy_from_slice(&entry.bytes[..entry.len]);
+        Some(entry.len)
+    }
 }
 
 fn framebuffer_is_supported(fb: &Framebuffer) -> bool {
@@ -490,10 +573,13 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.1");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.2");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
+    console.write_line("SHELL: UP/DOWN HISTORY | TAB COMMAND AND PATH COMPLETION");
+    console.write_line("ACCOUNT SYSTEM: USERADD / LOGIN / LOGOUT / WHOAMI");
+    console.write_line("FIRST SETUP: USERADD <name>, THEN LOGIN <name>.");
     console.write_line("");
     match memory_summary {
         Some((stats, pmm_ready)) => {
@@ -505,16 +591,22 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         None => console.write_line("MEMORY MANAGER: UNAVAILABLE"),
     }
     console.write_line("");
-    console.write(CONSOLE_PROMPT);
+    write_shell_prompt(&mut console);
     console.render();
 
     serial_write("Interactive shell ready. PIC/PIT active; type HELP for commands.\r\n");
     interrupts::enable_interrupts();
 
+    let mut history = CommandHistory::new();
     loop {
         let mut input = [0u8; CONSOLE_INPUT_CAPACITY];
         let mut input_len = 0usize;
-        let input_limit = console.input_limit(CONSOLE_PROMPT.len());
+        let prompt_start = console.current_line_len();
+        let prompt_len = users::current_name_len() + "@XAVIEROS> ".len();
+        let input_limit = console.input_limit(prompt_len);
+        let mut history_offset: Option<usize> = None;
+        let mut saved_input = [0u8; CONSOLE_INPUT_CAPACITY];
+        let mut saved_input_len = 0usize;
 
         loop {
             match keyboard_poll_key() {
@@ -525,6 +617,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                         console.put_byte(byte);
                         serial_write_byte(byte);
                         console.render_current_line();
+                        history_offset = None;
                     }
                 }
                 Some(KeyboardKey::Backspace) => {
@@ -533,13 +626,56 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                         console.backspace();
                         serial_write("\x08 \x08");
                         console.render_current_line();
+                        history_offset = None;
+                    }
+                }
+                Some(KeyboardKey::HistoryUp) => {
+                    if history.count > 0 {
+                        let offset = match history_offset {
+                            None => {
+                                saved_input[..input_len].copy_from_slice(&input[..input_len]);
+                                saved_input_len = input_len;
+                                Some(0)
+                            }
+                            Some(current) if current + 1 < history.count => Some(current + 1),
+                            Some(current) => Some(current),
+                        };
+                        if let Some(offset) = offset {
+                            history_offset = Some(offset);
+                            if let Some(length) = history.copy_back(offset, &mut input) {
+                                input_len = length.min(input_limit);
+                                console.replace_current_input(prompt_start, &input[..input_len]);
+                            }
+                        }
+                    }
+                }
+                Some(KeyboardKey::HistoryDown) => {
+                    if let Some(current) = history_offset {
+                        if current == 0 {
+                            history_offset = None;
+                            input[..saved_input_len].copy_from_slice(&saved_input[..saved_input_len]);
+                            input_len = saved_input_len.min(input_limit);
+                        } else {
+                            history_offset = Some(current - 1);
+                            if let Some(length) = history.copy_back(current - 1, &mut input) {
+                                input_len = length.min(input_limit);
+                            }
+                        }
+                        console.replace_current_input(prompt_start, &input[..input_len]);
+                    }
+                }
+                Some(KeyboardKey::Tab) => {
+                    if let Some(new_len) = complete_input(&mut console, &mut input, input_len, input_limit) {
+                        input_len = new_len;
+                        history_offset = None;
                     }
                 }
                 Some(KeyboardKey::Enter) => {
                     console.newline();
+                    history.push(&input[..input_len]);
                     let command_line = core::str::from_utf8(&input[..input_len]).unwrap_or("");
                     process_command(&mut console, command_line, memory_summary);
-                    console.write(CONSOLE_PROMPT);
+                    write_shell_prompt(&mut console);
                     console.render();
                     break;
                 }
@@ -564,13 +700,25 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
     const RIGHT_SHIFT: u8 = 0x02;
 
     let scancode = interrupts::keyboard_pop_scancode()?;
-    // Ignore extended-key prefixes and their following scan code for now.
-    // This shell handles printable Set-1 keys; arrows/navigation can be added later.
-    if scancode == 0xE0 || scancode == 0xE1 {
+    if scancode == 0xE0 {
+        EXTENDED_SCANCODE.store(1, Ordering::Relaxed);
         return None;
     }
+    if scancode == 0xE1 {
+        EXTENDED_SCANCODE.store(0, Ordering::Relaxed);
+        return None;
+    }
+    let extended = EXTENDED_SCANCODE.swap(0, Ordering::Relaxed) != 0;
     let released = scancode & 0x80 != 0;
     let code = scancode & 0x7F;
+    if extended {
+        if released { return None; }
+        return match code {
+            0x48 => Some(KeyboardKey::HistoryUp),
+            0x50 => Some(KeyboardKey::HistoryDown),
+            _ => None,
+        };
+    }
     if code == 0x2A || code == 0x36 {
         let bit = if code == 0x2A { LEFT_SHIFT } else { RIGHT_SHIFT };
         if released {
@@ -589,6 +737,7 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
     match code {
         0x1C => Some(KeyboardKey::Enter),
         0x0E => Some(KeyboardKey::Backspace),
+        0x0F => Some(KeyboardKey::Tab),
         0x02 => Some(KeyboardKey::Character(if shifted { b'!' } else { b'1' })),
         0x03 => Some(KeyboardKey::Character(if shifted { b'@' } else { b'2' })),
         0x04 => Some(KeyboardKey::Character(if shifted { b'#' } else { b'3' })),
@@ -601,42 +750,321 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
         0x0B => Some(KeyboardKey::Character(if shifted { b')' } else { b'0' })),
         0x0C => Some(KeyboardKey::Character(if shifted { b'_' } else { b'-' })),
         0x0D => Some(KeyboardKey::Character(if shifted { b'+' } else { b'=' })),
-        0x10 => Some(KeyboardKey::Character(b'Q')),
-        0x11 => Some(KeyboardKey::Character(b'W')),
-        0x12 => Some(KeyboardKey::Character(b'E')),
-        0x13 => Some(KeyboardKey::Character(b'R')),
-        0x14 => Some(KeyboardKey::Character(b'T')),
-        0x15 => Some(KeyboardKey::Character(b'Y')),
-        0x16 => Some(KeyboardKey::Character(b'U')),
-        0x17 => Some(KeyboardKey::Character(b'I')),
-        0x18 => Some(KeyboardKey::Character(b'O')),
-        0x19 => Some(KeyboardKey::Character(b'P')),
+        0x10 => Some(KeyboardKey::Character(if shifted { b'Q' } else { b'q' })),
+        0x11 => Some(KeyboardKey::Character(if shifted { b'W' } else { b'w' })),
+        0x12 => Some(KeyboardKey::Character(if shifted { b'E' } else { b'e' })),
+        0x13 => Some(KeyboardKey::Character(if shifted { b'R' } else { b'r' })),
+        0x14 => Some(KeyboardKey::Character(if shifted { b'T' } else { b't' })),
+        0x15 => Some(KeyboardKey::Character(if shifted { b'Y' } else { b'y' })),
+        0x16 => Some(KeyboardKey::Character(if shifted { b'U' } else { b'u' })),
+        0x17 => Some(KeyboardKey::Character(if shifted { b'I' } else { b'i' })),
+        0x18 => Some(KeyboardKey::Character(if shifted { b'O' } else { b'o' })),
+        0x19 => Some(KeyboardKey::Character(if shifted { b'P' } else { b'p' })),
         0x1A => Some(KeyboardKey::Character(if shifted { b'{' } else { b'[' })),
         0x1B => Some(KeyboardKey::Character(if shifted { b'}' } else { b']' })),
-        0x1E => Some(KeyboardKey::Character(b'A')),
-        0x1F => Some(KeyboardKey::Character(b'S')),
-        0x20 => Some(KeyboardKey::Character(b'D')),
-        0x21 => Some(KeyboardKey::Character(b'F')),
-        0x22 => Some(KeyboardKey::Character(b'G')),
-        0x23 => Some(KeyboardKey::Character(b'H')),
-        0x24 => Some(KeyboardKey::Character(b'J')),
-        0x25 => Some(KeyboardKey::Character(b'K')),
-        0x26 => Some(KeyboardKey::Character(b'L')),
+        0x1E => Some(KeyboardKey::Character(if shifted { b'A' } else { b'a' })),
+        0x1F => Some(KeyboardKey::Character(if shifted { b'S' } else { b's' })),
+        0x20 => Some(KeyboardKey::Character(if shifted { b'D' } else { b'd' })),
+        0x21 => Some(KeyboardKey::Character(if shifted { b'F' } else { b'f' })),
+        0x22 => Some(KeyboardKey::Character(if shifted { b'G' } else { b'g' })),
+        0x23 => Some(KeyboardKey::Character(if shifted { b'H' } else { b'h' })),
+        0x24 => Some(KeyboardKey::Character(if shifted { b'J' } else { b'j' })),
+        0x25 => Some(KeyboardKey::Character(if shifted { b'K' } else { b'k' })),
+        0x26 => Some(KeyboardKey::Character(if shifted { b'L' } else { b'l' })),
         0x27 => Some(KeyboardKey::Character(if shifted { b':' } else { b';' })),
         0x28 => Some(KeyboardKey::Character(if shifted { b'"' } else { b'\'' })),
         0x2B => Some(KeyboardKey::Character(if shifted { b'|' } else { b'\\' })),
-        0x2C => Some(KeyboardKey::Character(b'Z')),
-        0x2D => Some(KeyboardKey::Character(b'X')),
-        0x2E => Some(KeyboardKey::Character(b'C')),
-        0x2F => Some(KeyboardKey::Character(b'V')),
-        0x30 => Some(KeyboardKey::Character(b'B')),
-        0x31 => Some(KeyboardKey::Character(b'N')),
-        0x32 => Some(KeyboardKey::Character(b'M')),
+        0x2C => Some(KeyboardKey::Character(if shifted { b'Z' } else { b'z' })),
+        0x2D => Some(KeyboardKey::Character(if shifted { b'X' } else { b'x' })),
+        0x2E => Some(KeyboardKey::Character(if shifted { b'C' } else { b'c' })),
+        0x2F => Some(KeyboardKey::Character(if shifted { b'V' } else { b'v' })),
+        0x30 => Some(KeyboardKey::Character(if shifted { b'B' } else { b'b' })),
+        0x31 => Some(KeyboardKey::Character(if shifted { b'N' } else { b'n' })),
+        0x32 => Some(KeyboardKey::Character(if shifted { b'M' } else { b'm' })),
         0x33 => Some(KeyboardKey::Character(if shifted { b'<' } else { b',' })),
         0x34 => Some(KeyboardKey::Character(if shifted { b'>' } else { b'.' })),
         0x35 => Some(KeyboardKey::Character(if shifted { b'?' } else { b'/' })),
         0x39 => Some(KeyboardKey::Character(b' ')),
         _ => None,
+    }
+}
+
+const COMMAND_COMPLETIONS: &[&str] = &[
+    "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CPU", "DIAG", "DIR", "DISK", "ECHO",
+    "FORMAT", "FSINFO", "FSTEST", "HALT", "HEAP", "HELP", "HHDM", "HOME", "IDT",
+    "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
+    "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH",
+    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE",
+];
+
+fn prefix_matches(candidate: &str, prefix: &[u8]) -> bool {
+    candidate.as_bytes().len() >= prefix.len()
+        && candidate.as_bytes()[..prefix.len()].iter().zip(prefix.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn complete_input(
+    console: &mut Console,
+    input: &mut [u8; CONSOLE_INPUT_CAPACITY],
+    input_len: usize,
+    input_limit: usize,
+) -> Option<usize> {
+    if input_len >= input_limit { return None; }
+    let snapshot = *input;
+    let current = &snapshot[..input_len];
+    let first_space = current.iter().position(|byte| byte.is_ascii_whitespace());
+    if first_space.is_none() {
+        let mut count = 0usize;
+        let mut first_match = "";
+        let mut common_len = 0usize;
+        for &command in COMMAND_COMPLETIONS {
+            if !prefix_matches(command, current) { continue; }
+            if count == 0 {
+                first_match = command;
+                common_len = command.len();
+            } else {
+                common_len = common_len.min(command.as_bytes().iter().zip(first_match.as_bytes())
+                    .take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count());
+            }
+            count += 1;
+        }
+        if count == 0 { return None; }
+        let chosen = if count == 1 { first_match.len() } else { common_len };
+        if chosen <= input_len { return None; }
+        let mut replacement = [0u8; CONSOLE_INPUT_CAPACITY];
+        replacement[..chosen].copy_from_slice(&first_match.as_bytes()[..chosen]);
+        let mut new_len = chosen;
+        if count == 1 && new_len < input_limit {
+            replacement[new_len] = b' ';
+            new_len += 1;
+        }
+        let prompt_start = console.current_line_len().saturating_sub(input_len);
+        input[..new_len].copy_from_slice(&replacement[..new_len]);
+        input[new_len..].fill(0);
+        console.replace_current_input(prompt_start, &input[..new_len]);
+        return Some(new_len);
+    }
+
+    let command_end = first_space.unwrap_or(0);
+    let command = core::str::from_utf8(&current[..command_end]).unwrap_or("");
+    let path_command = ["LS", "DIR", "CAT", "STAT", "MKDIR", "WRITE", "TOUCH", "RM"]
+        .iter().any(|known| command.eq_ignore_ascii_case(*known));
+    if !path_command { return None; }
+    // WRITE takes both a path and file contents; stop path completion once the content token starts.
+    if command.eq_ignore_ascii_case("WRITE")
+        && current.iter().filter(|byte| byte.is_ascii_whitespace()).count() > 1
+    {
+        return None;
+    }
+    let token_start = current.iter().rposition(|byte| byte.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(0);
+    let token = core::str::from_utf8(&current[token_start..]).unwrap_or("");
+
+    let (directory, parent_prefix, leaf_prefix) = if token.is_empty() {
+        ("/", "", "")
+    } else if token.ends_with('/') {
+        let parent = token.trim_end_matches('/');
+        (if parent.is_empty() { "/" } else { parent }, token, "")
+    } else if let Some(slash) = token.rfind('/') {
+        let parent = &token[..slash];
+        (if parent.is_empty() { "/" } else { parent }, &token[..slash + 1], &token[slash + 1..])
+    } else {
+        ("/", "", token)
+    };
+    if !users::may_access_path(directory) { return None; }
+
+    let mut first_name = [0u8; 64];
+    let mut first_name_len = 0usize;
+    let mut first_is_dir = false;
+    let mut count = 0usize;
+    let mut common_len = 0usize;
+    let result = vfs::list_directory(directory, |name, is_dir| {
+        if !prefix_matches(name, leaf_prefix.as_bytes()) { return; }
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > first_name.len() { return; }
+        let candidate_len = parent_prefix.len().saturating_add(name_bytes.len());
+        if candidate_len > CONSOLE_INPUT_CAPACITY { return; }
+        let mut candidate_path = [0u8; CONSOLE_INPUT_CAPACITY];
+        candidate_path[..parent_prefix.len()].copy_from_slice(parent_prefix.as_bytes());
+        candidate_path[parent_prefix.len()..candidate_len].copy_from_slice(name_bytes);
+        let candidate_str = core::str::from_utf8(&candidate_path[..candidate_len]).unwrap_or("");
+        if !users::may_access_path(candidate_str) { return; }
+        if count == 0 {
+            first_name[..name_bytes.len()].copy_from_slice(name_bytes);
+            first_name_len = name_bytes.len();
+            first_is_dir = is_dir;
+            common_len = name_bytes.len();
+        } else {
+            common_len = common_len.min(name_bytes.iter().zip(first_name[..first_name_len].iter())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count());
+        }
+        count += 1;
+    });
+    if result.is_err() || count == 0 { return None; }
+
+    let unique = count == 1;
+    let leaf_len = if unique { first_name_len } else { common_len };
+    if leaf_len <= leaf_prefix.len() { return None; }
+    let mut new_len = token_start.checked_add(parent_prefix.len())?.checked_add(leaf_len)?;
+    // Reject an overlong completion before slicing into the fixed-size line buffer.
+    if new_len > input_limit || new_len > CONSOLE_INPUT_CAPACITY { return None; }
+    let mut replacement = [0u8; CONSOLE_INPUT_CAPACITY];
+    replacement[..token_start].copy_from_slice(&current[..token_start]);
+    let mut write_at = token_start;
+    replacement[write_at..write_at + parent_prefix.len()].copy_from_slice(parent_prefix.as_bytes());
+    write_at += parent_prefix.len();
+    replacement[write_at..write_at + leaf_len].copy_from_slice(&first_name[..leaf_len]);
+    write_at += leaf_len;
+    if unique {
+        let suffix = if first_is_dir { b'/' } else { b' ' };
+        if write_at < input_limit { replacement[write_at] = suffix; new_len += 1; }
+    }
+    let prompt_start = console.current_line_len().saturating_sub(input_len);
+    input[..new_len].copy_from_slice(&replacement[..new_len]);
+    input[new_len..].fill(0);
+    console.replace_current_input(prompt_start, &input[..new_len]);
+    Some(new_len)
+}
+
+fn write_shell_prompt(console: &mut Console) {
+    let mut name_buffer = [0u8; 16];
+    console.write(users::current_name(&mut name_buffer));
+    console.write("@XAVIEROS> ");
+}
+
+fn read_hidden_input(console: &mut Console, prompt: &str, output: &mut [u8]) -> Option<usize> {
+    console.write(prompt);
+    console.render();
+    let mut length = 0usize;
+    loop {
+        match keyboard_poll_key() {
+            Some(KeyboardKey::Character(byte)) if (0x20..=0x7E).contains(&byte) => {
+                if length < output.len() {
+                    output[length] = byte;
+                    length += 1;
+                    console.put_byte(b'*');
+                    serial_write_byte(b'*');
+                    console.render_current_line();
+                }
+            }
+            Some(KeyboardKey::Backspace) if length > 0 => {
+                length -= 1;
+                output[length] = 0;
+                console.backspace();
+                serial_write("\x08 \x08");
+                console.render_current_line();
+            }
+            Some(KeyboardKey::Enter) => {
+                console.newline();
+                console.render();
+                return Some(length);
+            }
+            None => interrupts::wait_for_interrupt(),
+            _ => {}
+        }
+    }
+}
+
+fn command_user_add(console: &mut Console, username: &str) {
+    if !users::is_initialized() {
+        console.write_line("USER DATABASE IS UNAVAILABLE. CHECK THE DISK OR USE FORMAT DISK TO RECOVER.");
+        return;
+    }
+    if !users::can_manage_accounts() {
+        console.write_line("USERADD REQUIRES FIRST-RUN LIVE SETUP OR ADMINISTRATOR ACCESS.");
+        return;
+    }
+    if username.is_empty() {
+        console.write_line("USAGE: USERADD <LOWERCASE_NAME>");
+        return;
+    }
+    if let Err(error) = users::validate_new_username(username) {
+        console.write("USERADD ERROR: "); console.write_line(error);
+        return;
+    }
+    let mut first = [0u8; 64];
+    let mut second = [0u8; 64];
+    let first_len = match read_hidden_input(console, "NEW PASSWORD (8-63 CHARS): ", &mut first) {
+        Some(length) => length,
+        None => { first.fill(0); second.fill(0); return; }
+    };
+    let second_len = match read_hidden_input(console, "CONFIRM PASSWORD: ", &mut second) {
+        Some(length) => length,
+        None => { first.fill(0); second.fill(0); return; }
+    };
+    if first_len != second_len || first[..first_len] != second[..second_len] {
+        first.fill(0); second.fill(0);
+        console.write_line("PASSWORDS DO NOT MATCH.");
+        return;
+    }
+    let result = users::create(username, &first[..first_len]);
+    first.fill(0); second.fill(0);
+    match result {
+        Ok(()) => {
+            console.write("USER CREATED: "); console.write_line(username);
+            console.write_line("HOME DIRECTORY CREATED UNDER /DISK/HOME.");
+            console.write_line("USE LOGIN <NAME> TO SIGN IN.");
+        }
+        Err(error) => { console.write("USERADD ERROR: "); console.write_line(error); }
+    }
+}
+
+fn command_login(console: &mut Console, username: &str) {
+    if username.is_empty() {
+        console.write_line("USAGE: LOGIN <NAME>");
+        return;
+    }
+    let mut password = [0u8; 64];
+    let length = match read_hidden_input(console, "PASSWORD: ", &mut password) {
+        Some(length) => length,
+        None => { password.fill(0); return; }
+    };
+    let result = users::authenticate(username, &password[..length]);
+    password.fill(0);
+    match result {
+        Ok(()) => {
+            let mut name_buffer = [0u8; 16];
+            console.write("LOGIN SUCCESSFUL. WELCOME, "); console.write_line(users::current_name(&mut name_buffer));
+            if users::is_admin() {
+                console.write_line("ROLE: ADMINISTRATOR. USER MANAGEMENT AND DISK ACCESS ENABLED.");
+            } else {
+                console.write_line("ROLE: USER. DISK ACCESS IS LIMITED TO YOUR HOME DIRECTORY.");
+            }
+            console.write_line("NOTE: THIS DOES NOT ISOLATE KERNEL PRIVILEGES.");
+        }
+        Err(error) => { console.write("LOGIN FAILED: "); console.write_line(error); }
+    }
+}
+
+fn command_change_password(console: &mut Console) {
+    if users::is_live() {
+        console.write_line("LIVE SESSION HAS NO PASSWORD. USE USERADD TO CREATE AN ACCOUNT.");
+        return;
+    }
+    let mut old_password = [0u8; 64];
+    let mut new_password = [0u8; 64];
+    let mut confirm = [0u8; 64];
+    let old_len = match read_hidden_input(console, "CURRENT PASSWORD: ", &mut old_password) {
+        Some(length) => length,
+        None => { old_password.fill(0); new_password.fill(0); confirm.fill(0); return; }
+    };
+    let new_len = match read_hidden_input(console, "NEW PASSWORD (8-63 CHARS): ", &mut new_password) {
+        Some(length) => length,
+        None => { old_password.fill(0); new_password.fill(0); confirm.fill(0); return; }
+    };
+    let confirm_len = match read_hidden_input(console, "CONFIRM NEW PASSWORD: ", &mut confirm) {
+        Some(length) => length,
+        None => { old_password.fill(0); new_password.fill(0); confirm.fill(0); return; }
+    };
+    if new_len != confirm_len || new_password[..new_len] != confirm[..confirm_len] {
+        old_password.fill(0); new_password.fill(0); confirm.fill(0);
+        console.write_line("PASSWORDS DO NOT MATCH.");
+        return;
+    }
+    let result = users::change_password(&old_password[..old_len], &new_password[..new_len]);
+    old_password.fill(0); new_password.fill(0); confirm.fill(0);
+    match result {
+        Ok(()) => console.write_line("PASSWORD UPDATED."),
+        Err(error) => { console.write("PASSWD ERROR: "); console.write_line(error); }
     }
 }
 
@@ -653,13 +1081,24 @@ fn process_command(
     serial_write(command_line);
     serial_write("\r\n");
 
-    let command = command_line.split_whitespace().next().unwrap_or("");
-    let arguments = command_line.strip_prefix(command).unwrap_or("").trim();
+    let raw_command = command_line.split_whitespace().next().unwrap_or("");
+    let mut command_bytes = [0u8; 24];
+    if raw_command.len() > command_bytes.len() {
+        console.write_line("COMMAND NAME TOO LONG.");
+        return;
+    }
+    for (index, byte) in raw_command.bytes().enumerate() {
+        command_bytes[index] = byte.to_ascii_uppercase();
+    }
+    let command = core::str::from_utf8(&command_bytes[..raw_command.len()]).unwrap_or("");
+    let arguments = command_line.get(raw_command.len()..).unwrap_or("").trim();
 
     match command {
         "HELP" | "?" => {
             console.write_line("XAVIEROS COMMANDS:");
             console.write_line("HELP / ?    - SHOW THIS LIST");
+            console.write_line("UP / DOWN   - NAVIGATE COMMAND HISTORY (16 COMMANDS)");
+            console.write_line("TAB         - COMPLETE COMMANDS AND VFS PATHS");
             console.write_line("ABOUT       - ABOUT XAVIEROS");
             console.write_line("BANNER      - SHOW THE XAVIEROS LOGO");
             console.write_line("CALC A OP B - INTEGER CALCULATOR (+ - * /)");
@@ -676,6 +1115,13 @@ fn process_command(
             console.write_line("WRITE PATH TEXT - WRITE TEXT UNDER /DISK");
             console.write_line("TOUCH PATH  - CREATE AN EMPTY FILE UNDER /DISK");
             console.write_line("RM PATH     - REMOVE A FILE / EMPTY DIRECTORY");
+            console.write_line("USERADD NAME- CREATE A USER (FIRST USER / ADMIN ONLY)");
+            console.write_line("USERS       - LIST USERS (ADMIN ONLY)");
+            console.write_line("LOGIN NAME  - SIGN IN TO A LOCAL USER");
+            console.write_line("LOGOUT      - RETURN TO THE LIVE SESSION");
+            console.write_line("WHOAMI      - SHOW CURRENT SESSION IDENTITY");
+            console.write_line("PASSWD      - CHANGE YOUR ACCOUNT PASSWORD");
+            console.write_line("HOME        - SHOW THE CURRENT USER HOME");
             console.write_line("DISK        - SHOW WRITABLE DISK STATUS");
             console.write_line("FORMAT DISK - ERASE AND FORMAT THE DATA DISK");
             console.write_line("TASKS       - LIST COOPERATIVE KERNEL TASKS");
@@ -701,7 +1147,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.1");
+            console.write_line("PROJECT VERSION: 0.1.2");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -710,7 +1156,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.1");
+            console.write_line("VERSION: 0.1.2");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -745,7 +1191,14 @@ fn process_command(
         "HHDM" => show_hhdm(console, memory_summary),
         "HEAP" => show_heap(console),
         "LS" | "DIR" => {
-            let path = if arguments.is_empty() { "/" } else { arguments };
+            let mut home_buffer = [0u8; 48];
+            let path = if arguments.is_empty() && !users::is_live() {
+                users::home_path(&mut home_buffer).unwrap_or("/")
+            } else if arguments.is_empty() { "/" } else { arguments };
+            if !users::may_access_path(path) {
+                console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME.");
+                return;
+            }
             console.write("DIRECTORY: ");
             console.write_line(path);
             match vfs::list_directory(path, |name, is_dir| {
@@ -767,6 +1220,8 @@ fn process_command(
         "CAT" => {
             if arguments.is_empty() {
                 console.write_line("USAGE: CAT PATH");
+            } else if !users::may_access_path(arguments) {
+                console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME.");
             } else {
                 let mut buffer = [0u8; 4096];
                 match vfs::read_file(arguments, &mut buffer) {
@@ -792,6 +1247,8 @@ fn process_command(
         "STAT" => {
             if arguments.is_empty() {
                 console.write_line("USAGE: STAT PATH");
+            } else if !users::may_access_path(arguments) {
+                console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME.");
             } else {
                 match vfs::stat(arguments) {
                     Ok(entry) => {
@@ -812,6 +1269,7 @@ fn process_command(
         }
         "MKDIR" => {
             if arguments.is_empty() { console.write_line("USAGE: MKDIR /DISK/PATH"); }
+            else if !users::may_access_path(arguments) { console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME."); }
             else { match vfs::mkdir(arguments) {
                 Ok(()) => console.write_line("DIRECTORY CREATED."),
                 Err(error) => { console.write("MKDIR ERROR: "); console.write_line(error); }
@@ -819,15 +1277,17 @@ fn process_command(
         }
         "WRITE" => {
             match arguments.split_once(' ') {
-                Some((path, text)) if !path.is_empty() => match vfs::write_file(path, text.trim_start().as_bytes()) {
+                Some((path, text)) if !path.is_empty() && users::may_access_path(path) => match vfs::write_file(path, text.trim_start().as_bytes()) {
                     Ok(()) => console.write_line("FILE WRITTEN TO DISK."),
                     Err(error) => { console.write("WRITE ERROR: "); console.write_line(error); }
                 },
+                Some((_, _)) => console.write_line("ACCESS DENIED OR INVALID PATH."),
                 _ => console.write_line("USAGE: WRITE /DISK/PATH TEXT"),
             }
         }
         "TOUCH" => {
             if arguments.is_empty() { console.write_line("USAGE: TOUCH /DISK/PATH"); }
+            else if !users::may_access_path(arguments) { console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME."); }
             else { match vfs::touch(arguments) {
                 Ok(()) => console.write_line("EMPTY FILE CREATED."),
                 Err(error) => { console.write("TOUCH ERROR: "); console.write_line(error); }
@@ -835,19 +1295,60 @@ fn process_command(
         }
         "RM" => {
             if arguments.is_empty() { console.write_line("USAGE: RM /DISK/PATH"); }
+            else if !users::may_access_path(arguments) { console.write_line("ACCESS DENIED: DISK PATH IS OUTSIDE YOUR HOME."); }
             else { match vfs::remove(arguments) {
                 Ok(()) => console.write_line("ENTRY REMOVED."),
                 Err(error) => { console.write("RM ERROR: "); console.write_line(error); }
             } }
         }
+        "USERADD" => command_user_add(console, arguments),
+        "USERS" => {
+            if !users::can_manage_accounts() {
+                console.write_line("ACCESS DENIED: ADMINISTRATOR REQUIRED.");
+            } else if !users::is_initialized() {
+                console.write_line("USER DATABASE IS UNAVAILABLE; CHECK DISK STATUS.");
+            } else if users::count() == 0 {
+                console.write_line("NO PERSISTENT USERS. USE: USERADD <NAME>");
+            } else {
+                console.write_line("LOCAL USERS:");
+                users::list(|name| console.write_line(name));
+            }
+        }
+        "LOGIN" => command_login(console, arguments),
+        "LOGOUT" => match users::logout() {
+            Ok(()) => console.write_line("SIGNED OUT. RETURNED TO LIVE SESSION."),
+            Err(error) => { console.write("LOGOUT ERROR: "); console.write_line(error); }
+        },
+        "WHOAMI" => {
+            let mut name_buffer = [0u8; 16];
+            console.write("CURRENT USER: "); console.write_line(users::current_name(&mut name_buffer));
+            console.write_line(if users::is_live() { "SESSION: LIVE / TEMPORARY" } else if users::is_admin() { "SESSION: PERSISTENT ADMINISTRATOR" } else { "SESSION: PERSISTENT USER" });
+        }
+        "PASSWD" => command_change_password(console),
+        "HOME" => {
+            if users::is_live() { console.write_line("LIVE SESSION HOME: / (NO PRIVATE HOME)"); }
+            else {
+                let mut buffer = [0u8; 48];
+                console.write("HOME: ");
+                console.write_line(users::home_path(&mut buffer).unwrap_or("/"));
+            }
+        }
         "DISK" | "DINFO" => show_disk_info(console),
         "FORMAT" => {
-            if !arguments.eq_ignore_ascii_case("DISK") {
+            if !users::can_manage_accounts() {
+                console.write_line("FORMAT REQUIRES ADMINISTRATOR ACCESS.");
+            } else if !arguments.eq_ignore_ascii_case("DISK") {
                 console.write_line("USAGE: FORMAT DISK (ERASES THE WRITABLE DISK)");
             } else {
                 console.write_line("WARNING: FORMATTING ERASES ALL FILES UNDER /DISK.");
                 match diskfs::format() {
-                    Ok(()) => console.write_line("XVDISKFS FORMATTED AND MOUNTED."),
+                    Ok(()) => {
+                        console.write_line("XVDISKFS FORMATTED AND MOUNTED.");
+                        match users::initialize() {
+                            Ok(()) => console.write_line("EMPTY LIVE USER DATABASE INITIALIZED."),
+                            Err(error) => { console.write("USER STORE RESET WARNING: "); console.write_line(error); }
+                        }
+                    },
                     Err(error) => { console.write("FORMAT ERROR: "); console.write_line(error); }
                 }
             }
@@ -868,7 +1369,14 @@ fn process_command(
             Ok(()) => console.write_line("COOPERATIVE SCHEDULER SELF-TEST: PASS"),
             Err(error) => { console.write("TASKTEST FAIL: "); console.write_line(error); }
         },
-        "PWD" => console.write_line("CURRENT DIRECTORY: / (WRITABLE MOUNT: /DISK)"),
+        "PWD" => {
+            if users::is_live() { console.write_line("CURRENT DIRECTORY: / (LIVE SESSION)"); }
+            else {
+                let mut buffer = [0u8; 48];
+                console.write("CURRENT DIRECTORY: ");
+                console.write_line(users::home_path(&mut buffer).unwrap_or("/"));
+            }
+        },
         "FSINFO" => show_fsinfo(console),
         "FSTEST" => match fs::self_test() {
             Ok(()) => console.write_line("FILESYSTEM SELF-TEST: PASS"),
@@ -886,7 +1394,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.1"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.2"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -951,6 +1459,14 @@ fn process_command(
                     console.write("COOPERATIVE SCHEDULER SELF-TEST: FAIL: ");
                     console.write_line(error);
                 }
+            }
+            if users::is_initialized() {
+                match users::self_test() {
+                    Ok(()) => console.write_line("USER DATABASE / PASSWORD HASH SELF-TEST: PASS"),
+                    Err(error) => { failed = true; console.write("USER SELF-TEST: FAIL: "); console.write_line(error); }
+                }
+            } else {
+                console.write_line("USER DATABASE: SKIPPED (DISK / DATABASE UNAVAILABLE)");
             }
             console.write_line(if interrupts::is_initialized() { "IDT INITIALIZATION: PASS" } else { "IDT INITIALIZATION: FAIL" });
             if !interrupts::is_initialized() { failed = true; }
@@ -1051,7 +1567,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.1 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.2 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -1320,9 +1836,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
     // At typical 1024x768 QEMU resolution, keep an X-shaped logo on the left and
     // aligned facts on the right. On narrower framebuffers, stack the info below it.
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS V0.1.1");
+        sysinfo_row(console, "XX              XX", "XAVIEROS V0.1.2");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS V0.1.1");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS V0.1.2");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -1372,7 +1888,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("  XX          XX");
         console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS V0.1.1");
+        console.write_line("XAVIEROS V0.1.2");
         console.write_line("----------------");
         console.write_line("KERNEL: RUST NO_STD");
         console.write_line("ARCH: X86_64");
@@ -1454,7 +1970,7 @@ fn fill_rect(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, color: u3
 fn draw_text(fb: &Framebuffer, x: usize, y: usize, text: &str, scale: usize, color: u32) {
     if scale == 0 { return; }
     for (char_index, byte) in text.bytes().enumerate() {
-        let rows = glyph(byte);
+        let rows = glyph(byte.to_ascii_uppercase());
         for (row_index, bits) in rows.iter().enumerate() {
             for col in 0..5 {
                 if bits & (1 << (4 - col)) == 0 { continue; }

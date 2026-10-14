@@ -1,158 +1,91 @@
-<div align="center">
-
 # XavierOS
 
-**A small experimental x86_64 operating system written in Rust.**
-
-A `no_std` kernel booted by Limine, with a framebuffer console, memory management, CPU exception diagnostics, interrupt-driven keyboard input, an embedded initramfs, and a small writable filesystem for a QEMU virtual disk.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Target-x86__64-informational)](#current-features)
-[![Status](https://img.shields.io/badge/Status-Experimental-orange)](#status-and-limitations)
-
-**Source version: `0.1.1` · Latest published release: [`0.1.1`](https://github.com/kiru0real/XavierOS/releases/tag/v0.1.1) **
-
+**Version 0.1.2** · Experimental x86_64 hobby operating system written in Rust.  
 [Русская версия README](README.ru.md)
 
-</div>
+XavierOS is a small `no_std` kernel booted by Limine. It is built for learning and QEMU experiments, not everyday or production use.
 
----
+## Table of contents
 
-## About
+- [Features](#features)
+- [Build and run](#build-and-run)
+- [Accounts](#accounts)
+- [Shell](#shell)
+- [Documentation](#documentation)
+- [Limitations and safety](#limitations-and-safety)
+- [License](#license)
 
-XavierOS is a learning-focused hobby operating system. It is written in Rust without the standard library (`#![no_std]`) and currently targets `x86_64-unknown-none`. It boots to its own text console; there is no desktop environment yet.
+## Features
 
-The `main` branch contains the source snapshot for the planned `0.1.1` maintenance update. That update is **not considered release-ready until the kernel build and QEMU tests pass**. The existing `v0.1.0` GitHub Release remains unchanged.
-
-## Current features
-
-- Limine boot protocol and a hybrid BIOS/UEFI ISO build path.
-- Framebuffer console and custom command shell.
-- Limine memory-map parsing, higher-half direct map (HHDM), bitmap physical memory manager (PMM), and a 1 MiB first-fit kernel heap.
-- x86_64 IDT and CPU exception diagnostics, including general-purpose registers and CR2 for page faults.
-- Legacy PIC/PIT setup, timer tick counter, and PS/2 keyboard input via IRQ1 and a bounded ring buffer.
-- Read-only XVRFS v1 initramfs embedded in the kernel image.
-- ATA PIO driver for the QEMU primary IDE master and writable XVDISKFS v1 at `/DISK`.
-- VFS routing between embedded files and the writable disk filesystem.
-- Cooperative task-context switching prototype with independent task stacks. This is **not** timer-preemptive multitasking.
-- Self-tests and diagnostics for memory, heap, interrupts, filesystem mounts, disk metadata, and cooperative task switching.
-- Cross-platform Python build/run helpers for Windows, macOS, and Linux.
-
-## 0.1.1 maintenance work
-
-The current source snapshot includes the following maintenance changes:
-
-- Keep an existing file's data extent reserved until its replacement metadata is committed; do not overwrite the old extent while preparing a replacement.
-- Validate the writable filesystem's root metadata, file storage fields, parent chains, directory depth, and extent ranges during mount.
-- Harden heap deallocation against out-of-range pointers, malformed allocation headers, overlapping free ranges, and common double-free corruption cases.
-- Check ATA read/write command completion after the data phase rather than assuming the data transfer alone means success.
-- Extract downloaded Limine/xorriso archives without following archive-provided links; reject traversal paths, special files, and duplicate case-insensitive paths.
-- Add host-side tests for Python tooling, initramfs generation, and release packaging.
-
-These changes are hardening measures, not a security audit or a guarantee of crash-safe storage.
+- Limine boot, framebuffer console, PS/2 keyboard, PIC/PIT interrupts and IDT exception diagnostics.
+- Physical page allocator, HHDM and kernel heap.
+- ATA PIO block I/O and writable XVDISKFS on a persistent QEMU disk.
+- Read-only XVRFS initramfs and a small VFS mount dispatcher.
+- Cooperative task/context-switch prototype.
+- Local account database, password login, home directories and basic shell-level path restrictions.
+- 16-entry command history with Up/Down and Tab completion for commands and accessible VFS paths.
+- Portable Python build/run scripts for Windows, macOS and Linux.
 
 ## Build and run
 
-### Requirements
-
-- Python 3.10 or newer.
-- Rust toolchain (`rustup` and `cargo`) from [rustup.rs](https://rustup.rs/).
-- QEMU with `qemu-system-x86_64` on `PATH`.
-- `xorriso` on `PATH`. The Windows build can fetch the project's xorriso fallback if needed.
-- A C compiler (`cc`, Clang, or GCC) on macOS/Linux to compile the official Limine host utility when no prebuilt utility is found.
-- Internet access for the first build to download the Limine binary package and, on Windows if needed, the xorriso fallback.
-
-### Prepare the Rust target
-
-From the repository root:
+Requirements: Rust via `rustup`, Python 3.10+, QEMU and the host tools described below. On macOS/Linux, install a C compiler and `xorriso`; on Windows the setup script can prepare supported helper tools.
 
 ```text
 python setup.py
-```
-
-### Build the ISO
-
-```text
+python -m unittest discover -s tests -v
 python build.py --clean
-```
-
-The ISO is written to `build/xavieros.iso`.
-
-### Run in QEMU
-
-```text
 python run.py
 ```
 
-`run.py` creates a 16 MiB persistent disk image at `data/xavieros-disk.img` on first run. Files written under `/DISK` remain between normal runs and rebuilds. The image is deliberately ignored by Git.
+The build creates `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB disk at `data/xavieros-disk.img`. To erase and recreate that disk (this deletes files and accounts), run `python run.py --reset-disk`.
 
-**Destructive operations:** `python run.py --reset-disk` recreates the disk image, and the in-OS command `FORMAT DISK` erases its filesystem. Use only the disposable QEMU image created by the runner; do not attach a real or valuable disk.
+## Accounts
 
-For troubleshooting, start with `python build.py --clean` and save the full output. QEMU's serial diagnostics are attached to the terminal.
-
-## Testing
-
-Run host-side checks with:
+XavierOS starts in a temporary `live` session. On a fresh disk, create the first account; it becomes the administrator:
 
 ```text
-python -m compileall -q build.py run.py setup.py mkinitramfs.py package_release.py tests
-python -m unittest discover -s tests -v
-python mkinitramfs.py --output build/initramfs-check.xfs
+USERADD alice
+LOGIN alice
+WHOAMI
+HOME
+PASSWD
 ```
 
-Then compare the generated image with the checked-in `initramfs.xfs` if no rootfs files were changed. Build the kernel with:
+`USERADD` asks for a password twice and masks the input. Passwords must contain 8–63 printable ASCII characters, are case-sensitive, and are stored as salted PBKDF2-HMAC-SHA256 hashes. Up to eight persistent accounts are supported. The first persistent account is the administrator. An administrator can create additional accounts with `USERADD bob`; standard users can access the writable disk only through their own `/DISK/HOME/<name>` directory. `LOGOUT` returns to the temporary `live` session, which becomes restricted after the first account exists. `USERS` lists accounts for the administrator.
 
-```text
-cargo build --release --target x86_64-unknown-none
-```
+## Shell
 
-Boot QEMU and run the smoke test described in [TESTING.md](TESTING.md). Host-side tests do not start QEMU or validate physical hardware, so the kernel build and runtime checks must be run locally.
+Press **Up/Down** to browse recent commands. Press **Tab** to complete a command (for example, `ho` → `HOME`) or a unique accessible file/directory path. Ambiguous matches may extend to their common prefix; if the prefix does not grow, the line is left unchanged.
 
-## Console command quick reference
-
-The shell uses XavierOS's own commands, not a POSIX shell.
-
-| Command | Purpose |
-|---|---|
-| `HELP`, `ABOUT`, `VERSION` | Help and kernel version |
-| `SYSINFO`, `INFO`, `CPU`, `MEM`, `PMM`, `HHDM`, `HEAP` | System and memory information |
-| `IDT`, `IRQ`, `TIME`, `DIAG` | Interrupt and diagnostic status |
-| `LS`, `DIR`, `CAT`, `STAT`, `PWD`, `FSINFO`, `FSTEST` | Embedded and mounted filesystem access |
-| `DISK`, `DINFO`, `MKDIR`, `WRITE`, `TOUCH`, `RM` | Writable `/DISK` storage |
-| `FORMAT DISK` | Destructively format the writable virtual disk |
-| `TASKS`, `TASKTEST` | Inspect and test cooperative tasks |
-| `SELFTEST` | Run available subsystem self-tests |
-| `CALC`, `ECHO`, `CLEAR`, `REBOOT`, `HALT` | Shell utilities |
-| `TRAP` | Intentionally trigger a fatal invalid-opcode exception; QEMU stops |
-
-The command set may evolve. `HELP` inside the running kernel is the authoritative list for a given build.
+Useful commands: `HELP`, `SYSINFO`, `LS`, `CAT`, `WRITE`, `MKDIR`, `RM`, `DISK`, `TASKS`, `SELFTEST`, `WHOAMI`, `LOGIN`, `LOGOUT`, `PASSWD`.
 
 ## Documentation
 
-- [Architecture overview](ARCHITECTURE.md)
-- [Testing and release checklist](TESTING.md)
-- [Roadmap](ROADMAP.md)
-- [XVRFS v1 format](XVRFS-FORMAT.md)
-- [XVDISKFS v1 format](XVDISKFS-FORMAT.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
+The README is the starting point. These focused documents explain the design, formats, testing and contribution workflow:
 
-## Status and limitations
+| Document | Purpose |
+|---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | Changes by version |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Kernel components and boot/data flow |
+| [`TASKS.md`](TASKS.md) | Cooperative task prototype and limitations |
+| [`ROADMAP.md`](ROADMAP.md) | Planned development direction |
+| [`TESTING.md`](TESTING.md) | Host-side, QEMU, account and disk regression checks |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Guidelines for contributions |
+| [`SECURITY.md`](SECURITY.md) | Security limitations and reporting guidance |
+| [`XVRFS-FORMAT.md`](XVRFS-FORMAT.md) | Read-only initramfs image format |
+| [`XVDISKFS-FORMAT.md`](XVDISKFS-FORMAT.md) | Writable virtual-disk filesystem layout |
+| [`MIGRATION-PORTABLE.md`](MIGRATION-PORTABLE.md) | Portable build tools and GitHub browser upload notes |
 
-XavierOS is experimental and is intended for learning and virtual-machine testing, not daily use or production workloads.
+## Limitations and safety
 
-- Physical hardware and every BIOS/UEFI implementation have not been validated; the main test target is QEMU.
-- ATA support targets a legacy PC/PIIX IDE controller through synchronous LBA28 PIO. It is not a general storage-driver stack.
-- XVDISKFS is a small custom filesystem and is **not crash-safe**. Power loss or a failed write may leave inconsistent metadata; backups and recovery tools are not implemented.
-- The heap, PMM, and scheduler are single-core prototypes, not an SMP-safe kernel architecture.
-- Task switching is cooperative. There is no timer preemption, process isolation, user mode, ELF loader, networking, or desktop environment.
-- The kernel has no general-purpose interrupt-safe locking framework. IRQ handlers must not allocate heap memory or perform disk I/O.
+- The account manager is experimental. Commands run in ring 0; this is **not** user-mode process isolation or a hardened security boundary. Do not use real or reused passwords.
+- Salt generation prefers CPU RDRAND when available and falls back to a timer/TSC-derived value on CPUs that do not expose it. The fallback is not a cryptographic random-number generator.
+- XVDISKFS is small and is not journaled or crash-safe. Use disposable virtual disk images.
+- The scheduler is cooperative. User-mode programs, virtual address-space isolation, networking, a desktop and broad physical-hardware support are not implemented.
+- QEMU is the supported development target; physical hardware is not validated.
 
-## Contributing
-
-Focused bug reports and small pull requests are welcome. Include the host OS, Rust/Python/QEMU versions, full build output, serial log, and the exact smoke-test steps. Never include real disk images or private data. See [CONTRIBUTING.md](CONTRIBUTING.md).
+`FORMAT DISK` erases the writable filesystem, including user accounts. The persistent disk image is local state and is excluded from Git.
 
 ## License
 
-XavierOS is licensed under the MIT License. See [LICENSE](LICENSE).
+MIT. See [`LICENSE`](LICENSE).

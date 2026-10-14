@@ -133,12 +133,11 @@ class InitramfsBuilderTests(unittest.TestCase):
             self.assertEqual(paths["ETC/ISSUE"], b"XavierOS test\n")
 
     def test_rejects_case_insensitive_collisions(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "Foo.txt").write_text("a", encoding="utf-8")
-            (root / "foo.TXT").write_text("b", encoding="utf-8")
-            with self.assertRaises(ValueError):
-                mkinitramfs.build(root, Path(temp) / "out.xfs")
+        # This tests the collision policy directly because the host filesystem may
+        # (as on default Windows volumes) be unable to store Foo.txt and foo.TXT
+        # as two distinct entries in the same directory.
+        with self.assertRaises(ValueError):
+            mkinitramfs._validate_case_insensitive_paths(["Foo.txt", "foo.TXT"])
 
     def test_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -161,10 +160,45 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.1.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.2.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
+
+
+class RepositoryShapeTests(unittest.TestCase):
+    def test_version_metadata_is_consistent(self) -> None:
+        cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        package = (ROOT / "package_release.py").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('version = "0.1.2"', cargo)
+        self.assertIn('VERSION = "0.1.2"', package)
+        self.assertIn("Version 0.1.2", readme)
+
+    def test_only_two_markdown_docs_remain_in_source_tree(self) -> None:
+        docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
+        self.assertEqual(docs, {"README.md", "CHANGELOG.md"})
+
+    def test_shell_history_and_tab_completion_are_wired_into_kernel(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("COMMAND_HISTORY_CAPACITY: usize = 16", main)
+        self.assertIn("0x48 => Some(KeyboardKey::HistoryUp)", main)
+        self.assertIn("0x50 => Some(KeyboardKey::HistoryDown)", main)
+        self.assertIn("0x0F => Some(KeyboardKey::Tab)", main)
+        self.assertIn("fn complete_input(", main)
+        self.assertIn("users::may_access_path(candidate_str)", main)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Up/Down", readme)
+        self.assertIn("Tab completion", readme)
+
+    def test_account_subsystems_are_wired_into_kernel(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("mod crypto;", main)
+        self.assertIn("mod users;", main)
+        self.assertIn('"USERADD" => command_user_add', main)
+        self.assertIn('"LOGIN" => command_login', main)
+        self.assertTrue((ROOT / "src" / "users.rs").is_file())
+        self.assertTrue((ROOT / "src" / "crypto.rs").is_file())
 
 
 if __name__ == "__main__":
