@@ -63,7 +63,16 @@ Passwords are hidden while typing, must be 8–63 printable ASCII characters, ar
 ## Documentation
 
 - [Russian README](README.ru.md)
+- [Architecture](ARCHITECTURE.md)
 - [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Migration Portable](MIGRATION-PORTABLE.md)
+- [Roadmap](ROADMAP.md)
+- [Security](SECURITY.md)
+- [Tasks](TASKS.md)
+- [Testing](TESTING.md)
+- [XVDISKFS-Format](XVDISKFS-FORMAT.md)
+- [XVRFS-Format](XVRFS-FORMAT.md)
 - [License](LICENSE)
 
 MIT license.
