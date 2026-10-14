@@ -88,8 +88,8 @@ def main() -> int:
         print(f"error: QEMU was not found. {hint}", file=sys.stderr)
         return 1
     print("Starting XavierOS in QEMU; close the emulator window to stop it.", flush=True)
-    # Legacy PC/PIIX chipset exposes the primary ATA PIO ports used by src/ata.rs.
-    command = [qemu, "-machine", "pc", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d"]
+    # Legacy PC/PIIX chipset exposes primary ATA PIO; the QEMU max CPU exposes RDRAND when supported by TCG.
+    command = [qemu, "-machine", "pc", "-cpu", "max", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d"]
     if not args.no_disk:
         try:
             disk = ensure_disk_image(args.reset_disk)

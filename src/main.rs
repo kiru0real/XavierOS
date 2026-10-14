@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 const COM1: u16 = 0x3F8;
 static SHIFT_STATE: AtomicU8 = AtomicU8::new(0);
+static CONTROL_STATE: AtomicU8 = AtomicU8::new(0);
 static EXTENDED_SCANCODE: AtomicU8 = AtomicU8::new(0);
 const LIMINE_COMMON_MAGIC: [u64; 2] = [
     0xC7B1_DD30_DF4C_8B88,
@@ -104,7 +105,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.2\r\n");
+    serial_write("\r\nXavierOS v0.1.3\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -395,7 +396,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.2 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.3 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -458,6 +459,32 @@ impl Console {
         self.render_current_line();
     }
 
+    fn render_input_cursor(&self, column: usize) {
+        // Draw a slim vertical caret in the character gap, not an underline
+        // beneath the text. Keeping it in the inter-cell gap avoids covering
+        // the glyph immediately before or after the insertion point.
+        let visible_rows = self.visible_rows();
+        let first_line = self.line_count.saturating_sub(visible_rows);
+        let index = self.line_count - 1;
+        let screen_row = index.saturating_sub(first_line);
+        let cell_x = CONSOLE_TEXT_X.saturating_add(column.saturating_mul(6 * self.scale));
+        let x = if column > 0 { cell_x.saturating_sub(self.scale) } else { cell_x };
+        let y = CONSOLE_TEXT_Y + screen_row * self.line_height;
+        let cursor_width = self.scale.max(1);
+        let cursor_height = (7 * self.scale).min(self.line_height);
+        let width = self.framebuffer.width as usize;
+        if x < width.saturating_sub(cursor_width) && cursor_height > 0 {
+            fill_rect(
+                &self.framebuffer,
+                x,
+                y,
+                cursor_width,
+                cursor_height,
+                rgb(&self.framebuffer, 89, 218, 255),
+            );
+        }
+    }
+
     fn render_current_line(&self) {
         let visible_rows = self.visible_rows();
         let first_line = self.line_count.saturating_sub(visible_rows);
@@ -503,6 +530,13 @@ enum KeyboardKey {
     Backspace,
     HistoryUp,
     HistoryDown,
+    CursorLeft,
+    CursorRight,
+    CursorHome,
+    CursorEnd,
+    Delete,
+    ClearLine,
+    Cancel,
     Tab,
 }
 
@@ -573,11 +607,11 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.2");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.3");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
-    console.write_line("SHELL: UP/DOWN HISTORY | TAB COMMAND AND PATH COMPLETION");
+    console.write_line("SHELL: ARROWS EDIT LINE | UP/DOWN HISTORY | TAB COMPLETION");
     console.write_line("ACCOUNT SYSTEM: USERADD / LOGIN / LOGOUT / WHOAMI");
     console.write_line("FIRST SETUP: USERADD <name>, THEN LOGIN <name>.");
     console.write_line("");
@@ -604,37 +638,87 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         let prompt_start = console.current_line_len();
         let prompt_len = users::current_name_len() + "@XAVIEROS> ".len();
         let input_limit = console.input_limit(prompt_len);
+        console.render_input_cursor(prompt_start);
         let mut history_offset: Option<usize> = None;
         let mut saved_input = [0u8; CONSOLE_INPUT_CAPACITY];
         let mut saved_input_len = 0usize;
+        let mut saved_cursor = 0usize;
+        let mut cursor = 0usize;
 
         loop {
             match keyboard_poll_key() {
                 Some(KeyboardKey::Character(byte)) => {
                     if input_len < input_limit && is_console_character(byte) {
-                        input[input_len] = byte;
+                        input.copy_within(cursor..input_len, cursor + 1);
+                        input[cursor] = byte;
                         input_len += 1;
-                        console.put_byte(byte);
-                        serial_write_byte(byte);
-                        console.render_current_line();
+                        cursor += 1;
+                        if input_len < input.len() { input[input_len] = 0; }
+                        redraw_input(&mut console, prompt_start, &input, input_len, cursor);
                         history_offset = None;
                     }
                 }
                 Some(KeyboardKey::Backspace) => {
-                    if input_len > 0 {
+                    if cursor > 0 {
+                        input.copy_within(cursor..input_len, cursor - 1);
                         input_len -= 1;
-                        console.backspace();
-                        serial_write("\x08 \x08");
-                        console.render_current_line();
+                        cursor -= 1;
+                        if input_len < input.len() { input[input_len] = 0; }
+                        redraw_input(&mut console, prompt_start, &input, input_len, cursor);
                         history_offset = None;
                     }
+                }
+                Some(KeyboardKey::Delete) => {
+                    if cursor < input_len {
+                        input.copy_within(cursor + 1..input_len, cursor);
+                        input_len -= 1;
+                        if input_len < input.len() { input[input_len] = 0; }
+                        redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                        history_offset = None;
+                    }
+                }
+                Some(KeyboardKey::CursorLeft) => {
+                    cursor = cursor.saturating_sub(1);
+                    redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                }
+                Some(KeyboardKey::CursorRight) => {
+                    cursor = (cursor + 1).min(input_len);
+                    redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                }
+                Some(KeyboardKey::CursorHome) => {
+                    cursor = 0;
+                    redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                }
+                Some(KeyboardKey::CursorEnd) => {
+                    cursor = input_len;
+                    redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                }
+                Some(KeyboardKey::ClearLine) => {
+                    input.fill(0);
+                    input_len = 0;
+                    cursor = 0;
+                    history_offset = None;
+                    redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                }
+                Some(KeyboardKey::Cancel) => {
+                    input.fill(0);
+                    input_len = 0;
+                    cursor = 0;
+                    console.replace_current_input(prompt_start, &[]);
+                    console.write("^C");
+                    console.newline();
+                    write_shell_prompt(&mut console);
+                    console.render();
+                    break;
                 }
                 Some(KeyboardKey::HistoryUp) => {
                     if history.count > 0 {
                         let offset = match history_offset {
                             None => {
+                                saved_input.fill(0);
                                 saved_input[..input_len].copy_from_slice(&input[..input_len]);
                                 saved_input_len = input_len;
+                                saved_cursor = cursor;
                                 Some(0)
                             }
                             Some(current) if current + 1 < history.count => Some(current + 1),
@@ -644,7 +728,8 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                             history_offset = Some(offset);
                             if let Some(length) = history.copy_back(offset, &mut input) {
                                 input_len = length.min(input_limit);
-                                console.replace_current_input(prompt_start, &input[..input_len]);
+                                cursor = input_len;
+                                redraw_input(&mut console, prompt_start, &input, input_len, cursor);
                             }
                         }
                     }
@@ -653,21 +738,29 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                     if let Some(current) = history_offset {
                         if current == 0 {
                             history_offset = None;
+                            input.fill(0);
                             input[..saved_input_len].copy_from_slice(&saved_input[..saved_input_len]);
                             input_len = saved_input_len.min(input_limit);
+                            cursor = saved_cursor.min(input_len);
                         } else {
                             history_offset = Some(current - 1);
                             if let Some(length) = history.copy_back(current - 1, &mut input) {
                                 input_len = length.min(input_limit);
+                                cursor = input_len;
                             }
                         }
-                        console.replace_current_input(prompt_start, &input[..input_len]);
+                        redraw_input(&mut console, prompt_start, &input, input_len, cursor);
                     }
                 }
                 Some(KeyboardKey::Tab) => {
-                    if let Some(new_len) = complete_input(&mut console, &mut input, input_len, input_limit) {
-                        input_len = new_len;
-                        history_offset = None;
+                    // Completion currently operates on the token at the end of the line.
+                    if cursor == input_len {
+                        if let Some(new_len) = complete_input(&mut console, &mut input, input_len, input_limit) {
+                            input_len = new_len;
+                            cursor = new_len;
+                            redraw_input(&mut console, prompt_start, &input, input_len, cursor);
+                            history_offset = None;
+                        }
                     }
                 }
                 Some(KeyboardKey::Enter) => {
@@ -685,6 +778,17 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
     }
 }
 
+fn redraw_input(
+    console: &mut Console,
+    prompt_start: usize,
+    input: &[u8; CONSOLE_INPUT_CAPACITY],
+    input_len: usize,
+    cursor: usize,
+) {
+    console.replace_current_input(prompt_start, &input[..input_len]);
+    console.render_input_cursor(prompt_start.saturating_add(cursor.min(input_len)));
+}
+
 fn is_console_character(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -698,6 +802,8 @@ fn is_console_character(byte: u8) -> bool {
 fn keyboard_poll_key() -> Option<KeyboardKey> {
     const LEFT_SHIFT: u8 = 0x01;
     const RIGHT_SHIFT: u8 = 0x02;
+    const LEFT_CONTROL: u8 = 0x01;
+    const RIGHT_CONTROL: u8 = 0x02;
 
     let scancode = interrupts::keyboard_pop_scancode()?;
     if scancode == 0xE0 {
@@ -711,15 +817,17 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
     let extended = EXTENDED_SCANCODE.swap(0, Ordering::Relaxed) != 0;
     let released = scancode & 0x80 != 0;
     let code = scancode & 0x7F;
-    if extended {
-        if released { return None; }
-        return match code {
-            0x48 => Some(KeyboardKey::HistoryUp),
-            0x50 => Some(KeyboardKey::HistoryDown),
-            _ => None,
-        };
+
+    if code == 0x1D {
+        let bit = if extended { RIGHT_CONTROL } else { LEFT_CONTROL };
+        if released {
+            CONTROL_STATE.fetch_and(!bit, Ordering::Relaxed);
+        } else {
+            CONTROL_STATE.fetch_or(bit, Ordering::Relaxed);
+        }
+        return None;
     }
-    if code == 0x2A || code == 0x36 {
+    if !extended && (code == 0x2A || code == 0x36) {
         let bit = if code == 0x2A { LEFT_SHIFT } else { RIGHT_SHIFT };
         if released {
             SHIFT_STATE.fetch_and(!bit, Ordering::Relaxed);
@@ -728,9 +836,26 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
         }
         return None;
     }
-    // Ignore key-release and extended-prefix scancodes.
-    if released || code == 0xE0 {
-        return None;
+    if released { return None; }
+
+    if extended {
+        return match code {
+            0x48 => Some(KeyboardKey::HistoryUp),
+            0x50 => Some(KeyboardKey::HistoryDown),
+            0x4B => Some(KeyboardKey::CursorLeft),
+            0x4D => Some(KeyboardKey::CursorRight),
+            0x47 => Some(KeyboardKey::CursorHome),
+            0x4F => Some(KeyboardKey::CursorEnd),
+            0x53 => Some(KeyboardKey::Delete),
+            _ => None,
+        };
+    }
+    if CONTROL_STATE.load(Ordering::Relaxed) != 0 {
+        return match code {
+            0x2E => Some(KeyboardKey::Cancel), // Ctrl+C
+            0x16 => Some(KeyboardKey::ClearLine), // Ctrl+U
+            _ => None,
+        };
     }
     let shifted = SHIFT_STATE.load(Ordering::Relaxed) != 0;
 
@@ -791,9 +916,9 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
 
 const COMMAND_COMPLETIONS: &[&str] = &[
     "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CPU", "DIAG", "DIR", "DISK", "ECHO",
-    "FORMAT", "FSINFO", "FSTEST", "HALT", "HEAP", "HELP", "HHDM", "HOME", "IDT",
+    "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "IDT",
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
-    "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH",
+    "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
     "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE",
 ];
 
@@ -933,6 +1058,7 @@ fn write_shell_prompt(console: &mut Console) {
 
 fn read_hidden_input(console: &mut Console, prompt: &str, output: &mut [u8]) -> Option<usize> {
     console.write(prompt);
+    let masked_input_start = console.current_line_len();
     console.render();
     let mut length = 0usize;
     loop {
@@ -957,6 +1083,14 @@ fn read_hidden_input(console: &mut Console, prompt: &str, output: &mut [u8]) -> 
                 console.newline();
                 console.render();
                 return Some(length);
+            }
+            Some(KeyboardKey::Cancel) => {
+                output.fill(0);
+                console.replace_current_input(masked_input_start, &[]);
+                console.write("^C");
+                console.newline();
+                console.render();
+                return None;
             }
             None => interrupts::wait_for_interrupt(),
             _ => {}
@@ -1009,6 +1143,13 @@ fn command_user_add(console: &mut Console, username: &str) {
 }
 
 fn command_login(console: &mut Console, username: &str) {
+    let remaining = users::login_lockout_remaining_ticks();
+    if remaining > 0 {
+        console.write("LOGIN RATE-LIMITED. WAIT APPROXIMATELY ");
+        console.write_decimal((remaining + 99) / 100);
+        console.write_line(" SECOND(S).");
+        return;
+    }
     if username.is_empty() {
         console.write_line("USAGE: LOGIN <NAME>");
         return;
@@ -1031,7 +1172,15 @@ fn command_login(console: &mut Console, username: &str) {
             }
             console.write_line("NOTE: THIS DOES NOT ISOLATE KERNEL PRIVILEGES.");
         }
-        Err(error) => { console.write("LOGIN FAILED: "); console.write_line(error); }
+        Err(error) => {
+            console.write("LOGIN FAILED: "); console.write_line(error);
+            let remaining = users::login_lockout_remaining_ticks();
+            if remaining > 0 {
+                console.write("RATE LIMIT ACTIVE FOR APPROXIMATELY ");
+                console.write_decimal((remaining + 99) / 100);
+                console.write_line(" SECOND(S).");
+            }
+        }
     }
 }
 
@@ -1098,6 +1247,8 @@ fn process_command(
             console.write_line("XAVIEROS COMMANDS:");
             console.write_line("HELP / ?    - SHOW THIS LIST");
             console.write_line("UP / DOWN   - NAVIGATE COMMAND HISTORY (16 COMMANDS)");
+            console.write_line("LEFT / RIGHT / HOME / END / DELETE - EDIT INPUT");
+            console.write_line("CTRL+U       - CLEAR INPUT | CTRL+C - CANCEL INPUT");
             console.write_line("TAB         - COMPLETE COMMANDS AND VFS PATHS");
             console.write_line("ABOUT       - ABOUT XAVIEROS");
             console.write_line("BANNER      - SHOW THE XAVIEROS LOGO");
@@ -1123,6 +1274,10 @@ fn process_command(
             console.write_line("PASSWD      - CHANGE YOUR ACCOUNT PASSWORD");
             console.write_line("HOME        - SHOW THE CURRENT USER HOME");
             console.write_line("DISK        - SHOW WRITABLE DISK STATUS");
+            console.write_line("DF          - SHOW DISK SPACE USAGE");
+            console.write_line("FSCK        - CHECK DISK METADATA WITHOUT REPAIRING (ADMIN/LIVE)");
+            console.write_line("HEALTH      - SHOW QUICK KERNEL SUBSYSTEM STATUS");
+            console.write_line("UPTIME      - SHOW TIME SINCE KERNEL START");
             console.write_line("FORMAT DISK - ERASE AND FORMAT THE DATA DISK");
             console.write_line("TASKS       - LIST COOPERATIVE KERNEL TASKS");
             console.write_line("TASKTEST    - TEST CONTEXT SWITCHING");
@@ -1147,7 +1302,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.2");
+            console.write_line("PROJECT VERSION: 0.1.3");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -1156,7 +1311,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.2");
+            console.write_line("VERSION: 0.1.3");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1378,6 +1533,34 @@ fn process_command(
             }
         },
         "FSINFO" => show_fsinfo(console),
+        "DF" => show_disk_usage(console),
+        "FSCK" => {
+            if !users::can_manage_accounts() {
+                console.write_line("FSCK REQUIRES ADMINISTRATOR OR FIRST-RUN LIVE ACCESS.");
+            } else {
+                console.write_line("FSCK: READ-ONLY CHECK; DISK CONTENTS WILL NOT BE MODIFIED.");
+                match diskfs::check_disk() {
+                    Ok(report) => {
+                        console.write_line("XVDISKFS CHECK: PASS");
+                        console.write("FILES: "); console.write_decimal(report.files as u64);
+                        console.write(" | DIRECTORIES: "); console.write_decimal(report.directories as u64);
+                        console.write_line("");
+                        console.write("ALLOCATED: "); console.write_decimal(report.used_sectors);
+                        console.write(" / "); console.write_decimal(report.total_data_sectors as u64);
+                        console.write_line(" DATA SECTORS");
+                        console.write("FREE: "); console.write_decimal(report.free_sectors);
+                        console.write_line(" DATA SECTORS");
+                        console.write_line("CHECK MODE: READ ONLY; NO AUTOMATIC REPAIR.");
+                    }
+                    Err(error) => {
+                        console.write("XVDISKFS CHECK: FAIL: "); console.write_line(error);
+                        console.write_line("NO CHANGES WERE WRITTEN. BACK UP THE DISK BEFORE ANY REPAIR.");
+                    }
+                }
+            }
+        }
+        "HEALTH" => show_health(console, memory_summary),
+        "UPTIME" => show_time(console),
         "FSTEST" => match fs::self_test() {
             Ok(()) => console.write_line("FILESYSTEM SELF-TEST: PASS"),
             Err(error) => {
@@ -1394,7 +1577,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.2"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.3"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1567,7 +1750,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.2 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.3 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -1830,90 +2013,166 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
     } else {
         "UNKNOWN CPU MODEL"
     };
+    let mut current_name = [0u8; 16];
+    let username = users::current_name(&mut current_name);
+    let framebuffer = &console.framebuffer;
+    let display_width = framebuffer.width;
+    let display_height = framebuffer.height;
 
     console.write_line("");
-
-    // At typical 1024x768 QEMU resolution, keep an X-shaped logo on the left and
-    // aligned facts on the right. On narrower framebuffers, stack the info below it.
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS V0.1.2");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.3");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS V0.1.2");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.3");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
-
-        sysinfo_prefix(console, "      XX  XX      ");
-        console.write("CPU VENDOR: ");
-        console.write_line(vendor);
-
-        sysinfo_prefix(console, "       XXXX       ");
-        console.write("CPU: ");
-        console.write_line(cpu_brand);
-
+        sysinfo_prefix(console, "      XX  XX      "); console.write("CPU VENDOR: "); console.write_line(vendor);
+        sysinfo_prefix(console, "       XXXX       "); console.write("CPU: "); console.write_line(cpu_brand);
+        sysinfo_prefix(console, "      XX  XX      "); console.write("USER: "); console.write(username);
+        console.write(" (");
+        console.write(if users::is_live() { "LIVE" } else if users::is_admin() { "ADMIN" } else { "USER" });
+        console.write_line(")");
+        sysinfo_prefix(console, "     XX    XX     "); console.write("UPTIME: "); write_uptime(console); console.write_line("");
+        // This newline ends the UPTIME row; it must not add an empty visual row.
+        sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");
+        console.write_decimal(display_width); console.write("X"); console.write_decimal(display_height); console.write_line("");
         match memory_summary {
             Some((stats, pmm_ready)) => {
-                sysinfo_prefix(console, "      XX  XX      ");
-                console.write("RAM: ");
-                console.write_decimal(stats.total_usable_bytes / (1024 * 1024));
-                console.write_line(" MIB USABLE");
-
-                sysinfo_prefix(console, "     XX    XX     ");
-                console.write("PMM MANAGED: ");
-                console.write_decimal(stats.managed_pages as u64);
-                console.write_line(" PAGES");
-
-                sysinfo_prefix(console, "    XX      XX    ");
-                console.write("PMM FREE: ");
-                console.write_decimal(memory::free_page_count() as u64);
-                console.write_line(" PAGES");
-
-                sysinfo_row(console, "   XX        XX   ", if stats.hhdm_offset != 0 { "HHDM: READY" } else { "HHDM: UNAVAILABLE" });
-                sysinfo_row(console, "  XX          XX  ", if pmm_ready { "PMM SELF-TEST: PASS" } else { "PMM SELF-TEST: FAIL" });
+                sysinfo_prefix(console, "   XX        XX   "); console.write("RAM: ");
+                console.write_decimal(stats.total_usable_bytes / (1024 * 1024)); console.write_line(" MIB USABLE");
+                sysinfo_prefix(console, "  XX          XX  "); console.write("PMM FREE: ");
+                console.write_decimal(memory::free_page_count() as u64); console.write_line(" PAGES");
+                sysinfo_row(console, " XX            XX ", if stats.hhdm_offset != 0 { "HHDM: READY" } else { "HHDM: UNAVAILABLE" });
+                sysinfo_row(console, "XX              XX", if pmm_ready { "PMM: PASS" } else { "PMM: FAILED" });
             }
             None => {
-                sysinfo_row(console, "      XX  XX      ", "RAM: MEMORY MAP UNAVAILABLE");
-                sysinfo_row(console, "     XX    XX     ", "PMM: UNAVAILABLE");
-                sysinfo_row(console, "    XX      XX    ", "HHDM: UNAVAILABLE");
-                sysinfo_row(console, "   XX        XX   ", "PMM SELF-TEST: NOT RUN");
+                sysinfo_row(console, "   XX        XX   ", "RAM: MEMORY MAP UNAVAILABLE");
+                sysinfo_row(console, "  XX          XX  ", "PMM: UNAVAILABLE");
+                sysinfo_row(console, " XX            XX ", "HHDM: UNAVAILABLE");
+                sysinfo_row(console, "XX              XX", "PMM: NOT TESTED");
             }
         }
-        sysinfo_row(console, " XX            XX ", if diskfs::mount_status() { "DISK: XVDISKFS READY" } else { "DISK: UNAVAILABLE" });
-        sysinfo_row(console, "XX              XX", "SCHEDULER: COOPERATIVE");
+        if let Some(heap_stats) = heap::stats() {
+            sysinfo_prefix(console, "                  "); console.write("HEAP: ");
+            console.write_decimal((heap_stats.capacity_bytes.saturating_sub(heap_stats.free_bytes)) as u64 / 1024);
+            console.write(" / "); console.write_decimal(heap_stats.capacity_bytes as u64 / 1024);
+            console.write_line(" KIB USED");
+        } else {
+            sysinfo_row(console, "                  ", "HEAP: UNAVAILABLE");
+        }
+        if let Some(info) = diskfs::info() {
+            sysinfo_prefix(console, "                  "); console.write("DISK: ");
+            if info.mounted {
+                console.write("XVDISKFS ");
+                console.write_decimal((info.total_sectors as u64 * 512) / (1024 * 1024));
+                console.write_line(" MIB");
+            } else {
+                console.write_line("UNAVAILABLE");
+            }
+        }
+        sysinfo_row(console, "                  ", "SCHEDULER: COOPERATIVE");
+        sysinfo_row(console, "                  ", "SHELL: XAVIER CONSOLE");
     } else {
-        console.write_line("      XX  XX");
-        console.write_line("     XX    XX");
-        console.write_line("    XX      XX");
-        console.write_line("   XX        XX");
-        console.write_line("  XX          XX");
-        console.write_line(" XX            XX");
+        console.write_line("      XX  XX"); console.write_line("     XX    XX");
+        console.write_line("    XX      XX"); console.write_line("   XX        XX");
+        console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS V0.1.2");
-        console.write_line("----------------");
-        console.write_line("KERNEL: RUST NO_STD");
-        console.write_line("ARCH: X86_64");
+        console.write_line("XAVIEROS 0.1.3"); console.write_line("---------------");
+        console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
-        console.write_line(if diskfs::mount_status() { "DISK: XVDISKFS READY" } else { "DISK: UNAVAILABLE" });
-        console.write_line("SCHEDULER: COOPERATIVE");
-        console.write("CPU VENDOR: ");
-        console.write_line(vendor);
+        console.write("USER: "); console.write_line(username);
+        console.write("UPTIME: "); write_uptime(console); console.write_line("");
+        console.write("DISPLAY: "); console.write_decimal(display_width); console.write("X"); console.write_decimal(display_height); console.write_line("");
+        console.write("CPU VENDOR: "); console.write_line(vendor);
         console.write("CPU: ");
         let max_cpu_chars = console.max_cols.saturating_sub(5);
         console.write_line(&cpu_brand[..cpu_brand.len().min(max_cpu_chars)]);
         match memory_summary {
             Some((stats, pmm_ready)) => {
-                console.write("RAM: ");
-                console.write_decimal(stats.total_usable_bytes / (1024 * 1024));
-                console.write_line(" MIB USABLE");
-                console.write("PMM FREE: ");
-                console.write_decimal(memory::free_page_count() as u64);
-                console.write_line(" PAGES");
-                console.write_line(if pmm_ready { "PMM SELF-TEST: PASS" } else { "PMM SELF-TEST: FAIL" });
+                console.write("RAM: "); console.write_decimal(stats.total_usable_bytes / (1024 * 1024)); console.write_line(" MIB USABLE");
+                console.write("PMM FREE: "); console.write_decimal(memory::free_page_count() as u64); console.write_line(" PAGES");
+                console.write_line(if pmm_ready { "PMM: PASS" } else { "PMM: FAILED" });
             }
             None => console.write_line("MEMORY / PMM: UNAVAILABLE"),
         }
+        if let Some(heap_stats) = heap::stats() {
+            console.write("HEAP FREE: "); console.write_decimal(heap_stats.free_bytes as u64 / 1024); console.write_line(" KIB");
+        }
+        console.write_line(if diskfs::mount_status() { "DISK: XVDISKFS READY" } else { "DISK: UNAVAILABLE" });
+        console.write_line("SCHEDULER: COOPERATIVE");
     }
     console.write_line("");
+}
+
+fn write_uptime(console: &mut Console) {
+    let total_seconds = interrupts::timer_ticks() / 100;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        console.write_decimal(hours); console.write("H ");
+    }
+    if hours > 0 || minutes > 0 {
+        console.write_decimal(minutes); console.write("M ");
+    }
+    console.write_decimal(seconds); console.write("S");
+}
+
+fn show_disk_usage(console: &mut Console) {
+    let Some(info) = diskfs::info() else {
+        console.write_line("DF: DISK STATISTICS UNAVAILABLE.");
+        return;
+    };
+    if !info.available || !info.mounted {
+        console.write_line("DF: WRITABLE XVDISKFS IS NOT MOUNTED.");
+        console.write("DETAIL: "); console.write_line(diskfs::last_error());
+        return;
+    }
+    console.write_line("XVDISKFS SPACE USAGE (512-BYTE SECTORS)");
+    console.write("TOTAL DATA: "); console.write_decimal(info.total_data_sectors as u64);
+    console.write(" SECTORS / "); console.write_decimal(info.total_data_sectors as u64 * 512); console.write_line(" BYTES");
+    console.write("ALLOCATED: "); console.write_decimal(info.used_sectors);
+    console.write(" SECTORS / "); console.write_decimal(info.used_sectors * 512); console.write_line(" BYTES");
+    console.write("FREE: "); console.write_decimal(info.free_sectors); console.write_line(" SECTORS");
+    console.write("LOGICAL FILE DATA: "); console.write_decimal(info.used_bytes); console.write_line(" BYTES");
+    console.write("FILES: "); console.write_decimal(info.files as u64);
+    console.write(" | DIRECTORIES: "); console.write_decimal(info.directories as u64); console.write_line("");
+    console.write("DIRECTORY SLOTS FREE: "); console.write_decimal(info.free_entries as u64); console.write_line("");
+}
+
+fn show_health(console: &mut Console, memory_summary: Option<(MemoryStats, bool)>) {
+    console.write_line("XAVIEROS SYSTEM HEALTH");
+    let mut warnings = 0usize;
+    let (ram_ok, hhdm_ok) = match memory_summary {
+        Some((stats, pmm_ok)) => (pmm_ok, stats.hhdm_offset != 0),
+        None => (false, false),
+    };
+    let rows: [(&str, bool); 8] = [
+        ("IDT / EXCEPTIONS", interrupts::is_initialized()),
+        ("PIC / PIT", interrupts::hardware_is_initialized()),
+        ("PS/2 KEYBOARD IRQ", interrupts::keyboard_is_initialized()),
+        ("PMM / HHDM", ram_ok && hhdm_ok),
+        ("KERNEL HEAP", heap::is_initialized()),
+        ("INITRAMFS", fs::info().is_ok()),
+        ("WRITABLE XVDISKFS", diskfs::mount_status()),
+        ("USER DATABASE", users::is_initialized()),
+    ];
+    for (name, okay) in rows {
+        console.write(name); console.write(": "); console.write_line(if okay { "READY" } else { "UNAVAILABLE / CHECK" });
+        if !okay { warnings += 1; }
+    }
+    console.write("PASSWORD SALT RNG: ");
+    if users::secure_salt_available() { console.write_line("RDRAND AVAILABLE"); }
+    else { console.write_line("RDRAND UNAVAILABLE (ACCOUNT CREATE / PASSWD DISABLED)"); warnings += 1; }
+    console.write("UPTIME: "); write_uptime(console); console.write_line("");
+    console.write("TASKS: ");
+    let (total, runnable, switches) = task::stats();
+    console.write_decimal(total as u64); console.write(" TOTAL / "); console.write_decimal(runnable as u64);
+    console.write(" RUNNABLE / "); console.write_decimal(switches); console.write_line(" SWITCHES");
+    if warnings == 0 { console.write_line("HEALTH SUMMARY: ALL CHECKED SUBSYSTEMS READY"); }
+    else { console.write("HEALTH SUMMARY: "); console.write_decimal(warnings as u64); console.write_line(" CHECK(S) NEED ATTENTION"); }
+    console.write_line("NOTE: THIS IS A STATUS SUMMARY, NOT A SECURITY AUDIT.");
 }
 
 fn sysinfo_prefix(console: &mut Console, logo: &str) {

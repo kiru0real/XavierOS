@@ -73,12 +73,26 @@ pub struct DiskInfo {
     pub directories: usize,
     pub free_entries: usize,
     pub used_bytes: u64,
+    pub total_data_sectors: u32,
+    pub used_sectors: u64,
+    pub free_sectors: u64,
 }
 
 #[derive(Clone, Copy)]
 pub struct EntryInfo {
     pub is_dir: bool,
     pub size: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct FsCheckReport {
+    pub files: usize,
+    pub directories: usize,
+    pub free_entries: usize,
+    pub used_bytes: u64,
+    pub used_sectors: u64,
+    pub total_data_sectors: u32,
+    pub free_sectors: u64,
 }
 
 pub fn initialize() -> Result<DiskInfo, &'static str> {
@@ -131,21 +145,103 @@ pub fn last_error() -> &'static str {
 pub fn info() -> Option<DiskInfo> {
     let state = unsafe { &*STATE.get() };
     if !state.mounted {
-        return Some(DiskInfo { available: ata::is_ready(), mounted: false, total_sectors: ata::sector_count(), files: 0, directories: 0, free_entries: MAX_ENTRIES, used_bytes: 0 });
+        let total_sectors = ata::sector_count();
+        let total_data_sectors = total_sectors.saturating_sub(DATA_START);
+        return Some(DiskInfo {
+            available: ata::is_ready(), mounted: false, total_sectors,
+            files: 0, directories: 0, free_entries: MAX_ENTRIES, used_bytes: 0,
+            total_data_sectors, used_sectors: 0, free_sectors: total_data_sectors as u64,
+        });
     }
     let mut files = 0usize;
     let mut directories = 0usize;
     let mut free_entries = 0usize;
     let mut used_bytes = 0u64;
+    let mut used_sectors = 0u64;
     for entry in &state.entries {
         match entry.kind {
             KIND_FREE => free_entries += 1,
             KIND_DIR => directories += 1,
-            KIND_FILE => { files += 1; used_bytes = used_bytes.saturating_add(entry.size as u64); },
+            KIND_FILE => {
+                files += 1;
+                used_bytes = used_bytes.saturating_add(entry.size as u64);
+                used_sectors = used_sectors.saturating_add(entry.sectors as u64);
+            },
             _ => return None,
         }
     }
-    Some(DiskInfo { available: ata::is_ready(), mounted: true, total_sectors: state.total_sectors, files, directories, free_entries, used_bytes })
+    let total_data_sectors = state.total_sectors.saturating_sub(DATA_START);
+    let free_sectors = (total_data_sectors as u64).saturating_sub(used_sectors);
+    Some(DiskInfo {
+        available: ata::is_ready(), mounted: true, total_sectors: state.total_sectors,
+        files, directories, free_entries, used_bytes, total_data_sectors,
+        used_sectors, free_sectors,
+    })
+}
+
+/// Validate the on-disk superblock and metadata table without modifying either disk
+/// contents or the currently mounted in-memory state. Safe to use when mount failed.
+pub fn check_disk() -> Result<FsCheckReport, &'static str> {
+    if !ata::is_ready() {
+        return Err("ATA DEVICE IS NOT READY; DISK WAS NOT MODIFIED");
+    }
+    let device_sectors = ata::sector_count();
+    let mut superblock = [0u8; SECTOR_SIZE];
+    ata::read_sector(0, &mut superblock)?;
+    if superblock.get(0..8) != Some(MAGIC.as_slice()) {
+        return Err("XVDISKFS SIGNATURE IS MISSING OR INVALID");
+    }
+    if get_u32(&superblock, 8) != Some(VERSION) {
+        return Err("UNSUPPORTED XVDISKFS VERSION");
+    }
+    if get_u32(&superblock, 16) != Some(META_LBA)
+        || get_u32(&superblock, 20) != Some(META_SECTORS)
+        || get_u32(&superblock, 24) != Some(DATA_START)
+        || get_u32(&superblock, 28) != Some(MAX_ENTRIES as u32)
+        || get_u32(&superblock, 32) != Some(checksum32(&superblock[0..32]))
+    {
+        return Err("XVDISKFS SUPERBLOCK VALIDATION FAILED");
+    }
+    let declared_sectors = get_u32(&superblock, 12).ok_or("INVALID DISK SIZE FIELD")?;
+    if declared_sectors > device_sectors || declared_sectors < DATA_START + 1 {
+        return Err("XVDISKFS DISK SIZE DOES NOT MATCH DEVICE");
+    }
+
+    // State is fixed-size and stack-backed: no allocation and no persistent writes.
+    let mut scan = State::new();
+    scan.total_sectors = declared_sectors;
+    for sector_index in 0..META_SECTORS {
+        let mut sector = [0u8; SECTOR_SIZE];
+        ata::read_sector(META_LBA + sector_index, &mut sector)?;
+        for item in 0..ENTRIES_PER_SECTOR {
+            let index = sector_index as usize * ENTRIES_PER_SECTOR + item;
+            if index >= MAX_ENTRIES { break; }
+            scan.entries[index] = decode_entry(&sector[item * 64..item * 64 + 64])?;
+        }
+    }
+    validate_entries(&scan)?;
+
+    let mut report = FsCheckReport {
+        files: 0, directories: 0, free_entries: 0, used_bytes: 0,
+        used_sectors: 0, total_data_sectors: declared_sectors - DATA_START, free_sectors: 0,
+    };
+    for entry in &scan.entries {
+        match entry.kind {
+            KIND_FREE => report.free_entries += 1,
+            KIND_DIR => report.directories += 1,
+            KIND_FILE => {
+                report.files += 1;
+                report.used_bytes = report.used_bytes.saturating_add(entry.size as u64);
+                report.used_sectors = report.used_sectors.saturating_add(entry.sectors as u64);
+            }
+            _ => return Err("INVALID ENTRY TYPE DURING FSCK"),
+        }
+    }
+    if report.used_sectors > report.total_data_sectors as u64 {
+        return Err("ALLOCATED SECTOR COUNT EXCEEDS DATA AREA");
+    }
+    report.free_sectors = report.total_data_sectors as u64 - report.used_sectors;
+    Ok(report)
 }
 
 pub fn format() -> Result<(), &'static str> {

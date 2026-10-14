@@ -160,7 +160,7 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.2.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.3.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
@@ -171,13 +171,13 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.2"', cargo)
-        self.assertIn('VERSION = "0.1.2"', package)
-        self.assertIn("Version 0.1.2", readme)
+        self.assertIn('version = "0.1.3"', cargo)
+        self.assertIn('VERSION = "0.1.3"', package)
+        self.assertIn("Version 0.1.3", readme)
 
-    def test_only_two_markdown_docs_remain_in_source_tree(self) -> None:
+    def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
-        self.assertEqual(docs, {"README.md", "CHANGELOG.md"})
+        self.assertEqual(docs, {"README.md", "README.ru.md", "CHANGELOG.md"})
 
     def test_shell_history_and_tab_completion_are_wired_into_kernel(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
@@ -199,6 +199,65 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('"LOGIN" => command_login', main)
         self.assertTrue((ROOT / "src" / "users.rs").is_file())
         self.assertTrue((ROOT / "src" / "crypto.rs").is_file())
+
+    def test_shell_line_editor_controls_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        for feature in ("CursorLeft", "CursorRight", "CursorHome", "CursorEnd", "Delete", "ClearLine", "Cancel"):
+            self.assertIn(f"KeyboardKey::{feature}", main)
+        self.assertIn("fn redraw_input(", main)
+        self.assertIn("let cursor_height = (7 * self.scale).min(self.line_height);", main)
+        self.assertNotIn("self.line_height.saturating_sub(3);", main)
+
+    def test_disk_fsck_df_and_health_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
+        self.assertIn('"FSCK" =>', main)
+        self.assertIn('"DF" =>', main)
+        self.assertIn('"HEALTH" =>', main)
+        self.assertIn("pub fn check_disk()", diskfs)
+        self.assertIn("OVERLAPPING FILE EXTENTS ON DISK", diskfs)
+
+    def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.3")', main)
+        show_start = main.index("fn show_sysinfo(")
+        show_end = main.index("fn ", show_start + 3)
+        show = main[show_start:show_end]
+        self.assertIn('sysinfo_prefix(console, "     XX    XX     "); console.write("UPTIME: "); write_uptime(console); console.write_line("");', show)
+        self.assertIn('write_uptime(console); console.write_line("");\n        // This newline ends the UPTIME row; it must not add an empty visual row.\n        sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");', show)
+        self.assertIn('sysinfo_prefix(console, "                  "); console.write("HEAP: ");', show)
+        self.assertIn('sysinfo_prefix(console, "                  "); console.write("DISK: ");', show)
+        self.assertIn('sysinfo_row(console, "                  ", "SCHEDULER: COOPERATIVE")', show)
+        self.assertIn('sysinfo_row(console, "                  ", "SHELL: XAVIER CONSOLE")', show)
+        for fact in ("CPU VENDOR:", "DISPLAY:", "USER:", "UPTIME:", "PMM:", "HEAP:", "DISK:"):
+            self.assertIn(fact, main)
+        self.assertIn("neofetch-style `SYSINFO`", readme)
+        self.assertIn('"HEALTH" => show_health', main)
+
+    def test_fsck_scans_without_writing(self) -> None:
+        diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
+        start = diskfs.index("pub fn check_disk()")
+        end = diskfs.index("pub fn format()", start)
+        check_body = diskfs[start:end]
+        self.assertIn("ata::read_sector", check_body)
+        self.assertNotIn("ata::write_sector", check_body)
+        self.assertIn("read-only metadata check", (ROOT / "README.md").read_text(encoding="utf-8"))
+
+    def test_fsck_and_df_document_their_safety_boundary(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("does not repair", readme)
+        self.assertIn("read-only metadata check", readme)
+        self.assertIn("DF", readme)
+
+    def test_account_auth_is_throttled_and_weak_salt_fallback_removed(self) -> None:
+        users = (ROOT / "src" / "users.rs").read_text(encoding="utf-8")
+        run_script = (ROOT / "run.py").read_text(encoding="utf-8")
+        self.assertIn("FAILED_LOGIN_LIMIT: u8 = 3", users)
+        self.assertIn("LOGIN_LOCKOUT_TICKS", users)
+        self.assertIn("pub fn secure_salt_available()", users)
+        self.assertNotIn("rdtsc", users.lower())
+        self.assertIn('"-cpu", "max"', run_script)
 
 
 if __name__ == "__main__":

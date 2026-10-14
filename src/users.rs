@@ -3,7 +3,6 @@
 
 use core::arch::{asm, x86_64::__cpuid};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{crypto, diskfs, interrupts, vfs};
 
@@ -16,7 +15,9 @@ const MAGIC: &[u8; 8] = b"XUSER002";
 const HEADER_SIZE: usize = 9;
 const RECORD_SIZE: usize = 1 + NAME_CAPACITY + SALT_SIZE + HASH_SIZE;
 const DB_CAPACITY: usize = HEADER_SIZE + MAX_USERS * RECORD_SIZE + 4;
-static SALT_COUNTER: AtomicU64 = AtomicU64::new(1);
+const FAILED_LOGIN_LIMIT: u8 = 3;
+const LOGIN_LOCKOUT_TICKS: u64 = 500; // PIT runs at 100 Hz: five seconds.
+const RDRAND_RETRIES: usize = 10;
 
 #[derive(Clone, Copy)]
 struct Account {
@@ -41,11 +42,13 @@ struct State {
     count: usize,
     current: i8, // -1 is the temporary live session; 0..count are persistent accounts.
     initialized: bool,
+    failed_login_attempts: u8,
+    lockout_until_tick: u64,
 }
 
 impl State {
     const fn new() -> Self {
-        Self { accounts: [Account::empty(); MAX_USERS], count: 0, current: -1, initialized: false }
+        Self { accounts: [Account::empty(); MAX_USERS], count: 0, current: -1, initialized: false, failed_login_attempts: 0, lockout_until_tick: 0 }
     }
 }
 
@@ -141,7 +144,7 @@ pub fn create(name: &str, password: &[u8]) -> Result<(), &'static str> {
     let mut account = Account::empty();
     account.name_len = name.len() as u8;
     account.name[..name.len()].copy_from_slice(name.as_bytes());
-    fill_salt(name, &mut account.salt);
+    fill_salt(&mut account.salt)?;
     account.hash = crypto::pbkdf2_sha256(password, &account.salt, crypto::PASSWORD_ITERATIONS);
 
     ensure_directory("/DISK/HOME")?;
@@ -153,22 +156,62 @@ pub fn create(name: &str, password: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn login_lockout_remaining_ticks() -> u64 {
+    let now = interrupts::timer_ticks();
+    let until = unsafe { (*STATE.get()).lockout_until_tick };
+    until.saturating_sub(now)
+}
+
+fn record_login_failure() {
+    let now = interrupts::timer_ticks();
+    let state = unsafe { &mut *STATE.get() };
+    if state.lockout_until_tick > now {
+        return;
+    }
+    state.failed_login_attempts = state.failed_login_attempts.saturating_add(1);
+    if state.failed_login_attempts >= FAILED_LOGIN_LIMIT {
+        state.failed_login_attempts = 0;
+        state.lockout_until_tick = now.saturating_add(LOGIN_LOCKOUT_TICKS);
+    }
+}
+
 pub fn authenticate(name: &str, password: &[u8]) -> Result<(), &'static str> {
     if !is_initialized() { return Err("USER DATABASE IS NOT AVAILABLE"); }
     if !is_live() { return Err("LOG OUT BEFORE SWITCHING ACCOUNTS"); }
-    if password.is_empty() || password.len() > 63 { return Err("INVALID USERNAME OR PASSWORD"); }
-    let mut state = unsafe { *STATE.get() };
-    let Some((index, account)) = state.accounts[..state.count].iter().enumerate()
-        .find(|(_, account)| account.name().eq_ignore_ascii_case(name)) else {
-            // Do comparable work for unknown usernames to reduce trivial timing differences.
-            let dummy_salt = [0xA5u8; 16];
-            let _ = crypto::pbkdf2_sha256(password, &dummy_salt, crypto::PASSWORD_ITERATIONS);
-            return Err("INVALID USERNAME OR PASSWORD");
-        };
-    let actual = crypto::pbkdf2_sha256(password, &account.salt, crypto::PASSWORD_ITERATIONS);
-    if !crypto::constant_time_eq(&actual, &account.hash) { return Err("INVALID USERNAME OR PASSWORD"); }
+    if login_lockout_remaining_ticks() > 0 {
+        return Err("LOGIN TEMPORARILY LOCKED AFTER FAILED ATTEMPTS");
+    }
+    if password.is_empty() || password.len() > 63 {
+        record_login_failure();
+        return Err("INVALID USERNAME OR PASSWORD");
+    }
+
+    // Copy the record fields so no reference into mutable global state survives
+    // the expensive PBKDF2 operation.
+    let found = {
+        let state = unsafe { &*STATE.get() };
+        state.accounts[..state.count].iter().enumerate()
+            .find(|(_, account)| account.name().eq_ignore_ascii_case(name))
+            .map(|(index, account)| (index, account.salt, account.hash))
+    };
+    let Some((index, salt, stored_hash)) = found else {
+        // Comparable password-hash work makes unknown names less distinguishable.
+        let dummy_salt = [0xA5u8; SALT_SIZE];
+        let _ = crypto::pbkdf2_sha256(password, &dummy_salt, crypto::PASSWORD_ITERATIONS);
+        record_login_failure();
+        return Err("INVALID USERNAME OR PASSWORD");
+    };
+
+    let actual = crypto::pbkdf2_sha256(password, &salt, crypto::PASSWORD_ITERATIONS);
+    if !crypto::constant_time_eq(&actual, &stored_hash) {
+        record_login_failure();
+        return Err("INVALID USERNAME OR PASSWORD");
+    }
+
+    let state = unsafe { &mut *STATE.get() };
     state.current = index as i8;
-    unsafe { *STATE.get() = state; }
+    state.failed_login_attempts = 0;
+    state.lockout_until_tick = 0;
     Ok(())
 }
 
@@ -192,8 +235,7 @@ pub fn change_password(old_password: &[u8], new_password: &[u8]) -> Result<(), &
         return Err("CURRENT PASSWORD IS INCORRECT");
     }
     let mut candidate = snapshot;
-    let account_snapshot = candidate.accounts[index];
-    fill_salt(account_snapshot.name(), &mut candidate.accounts[index].salt);
+    fill_salt(&mut candidate.accounts[index].salt)?;
     candidate.accounts[index].hash = crypto::pbkdf2_sha256(new_password, &candidate.accounts[index].salt, crypto::PASSWORD_ITERATIONS);
     save_database(&candidate)?;
     unsafe { *STATE.get() = candidate; }
@@ -306,38 +348,42 @@ fn home_path_for<'a>(name: &str, buffer: &'a mut [u8; 48]) -> Result<&'a str, &'
     core::str::from_utf8(&buffer[..length]).map_err(|_| "INVALID HOME PATH")
 }
 
-fn fill_salt(name: &str, salt: &mut [u8; SALT_SIZE]) {
-    // Prefer CPU RDRAND when advertised. Some simple QEMU CPU models do not expose it, so
-    // fall back to a unique, timer/TSC-mixed seed. Salt uniqueness matters for password hashing;
-    // this fallback is still not a cryptographic random-number generator.
-    let has_rdrand = unsafe { __cpuid(1).ecx & (1 << 30) != 0 };
-    if has_rdrand {
-        let mut bytes = [0u8; SALT_SIZE];
-        let mut okay = true;
-        for chunk in bytes.chunks_exact_mut(8) {
+pub fn secure_salt_available() -> bool {
+    (__cpuid(1).ecx & (1 << 30)) != 0
+}
+
+/// Obtain salt bytes only from the CPU's RDRAND generator. A clock/TSC fallback
+/// is intentionally forbidden: predictability would undermine password salts.
+fn fill_salt(salt: &mut [u8; SALT_SIZE]) -> Result<(), &'static str> {
+    if !secure_salt_available() {
+        salt.fill(0);
+        return Err("CPU RDRAND IS UNAVAILABLE; SECURE ACCOUNT CREATION IS DISABLED");
+    }
+    let mut bytes = [0u8; SALT_SIZE];
+    for chunk in bytes.chunks_exact_mut(8) {
+        let mut obtained = false;
+        for _ in 0..RDRAND_RETRIES {
             let mut word: u64 = 0;
             let mut success: u8 = 0;
             unsafe {
-                asm!("rdrand {word}", "setc {success}", word = lateout(reg) word, success = lateout(reg_byte) success, options(nomem, nostack));
+                asm!("rdrand {word}", "setc {success}",
+                    word = lateout(reg) word,
+                    success = lateout(reg_byte) success,
+                    options(nomem, nostack));
             }
-            if success == 0 { okay = false; break; }
-            chunk.copy_from_slice(&word.to_le_bytes());
+            if success != 0 {
+                chunk.copy_from_slice(&word.to_le_bytes());
+                obtained = true;
+                break;
+            }
         }
-        if okay { *salt = bytes; return; }
+        if !obtained {
+            salt.fill(0);
+            return Err("CPU RDRAND FAILED; SECURE ACCOUNT OPERATION ABORTED");
+        }
     }
-    let counter = SALT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ticks = interrupts::timer_ticks();
-    let mut low: u32 = 0;
-    let mut high: u32 = 0;
-    unsafe { asm!("rdtsc", out("eax") low, out("edx") high, options(nomem, nostack)); }
-    let mut input = [0u8; 64];
-    input[..8].copy_from_slice(&ticks.to_le_bytes());
-    input[8..16].copy_from_slice(&counter.to_le_bytes());
-    input[16..20].copy_from_slice(&low.to_le_bytes());
-    input[20..24].copy_from_slice(&high.to_le_bytes());
-    let name_len = name.len().min(40);
-    input[24..24 + name_len].copy_from_slice(&name.as_bytes()[..name_len]);
-    salt.copy_from_slice(&crypto::sha256(&input[..24 + name_len])[..SALT_SIZE]);
+    *salt = bytes;
+    Ok(())
 }
 
 fn save_database(state: &State) -> Result<(), &'static str> {

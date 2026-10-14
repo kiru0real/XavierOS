@@ -1,34 +1,21 @@
 # XavierOS
 
-**Version 0.1.2** · Experimental x86_64 hobby operating system written in Rust.  
-[Русская версия README](README.ru.md)
+**Version 0.1.3** · Experimental x86_64 hobby operating system written in Rust.
 
 XavierOS is a small `no_std` kernel booted by Limine. It is built for learning and QEMU experiments, not everyday or production use.
 
-## Table of contents
-
-- [Features](#features)
-- [Build and run](#build-and-run)
-- [Accounts](#accounts)
-- [Shell](#shell)
-- [Documentation](#documentation)
-- [Limitations and safety](#limitations-and-safety)
-- [License](#license)
-
 ## Features
 
-- Limine boot, framebuffer console, PS/2 keyboard, PIC/PIT interrupts and IDT exception diagnostics.
-- Physical page allocator, HHDM and kernel heap.
-- ATA PIO block I/O and writable XVDISKFS on a persistent QEMU disk.
-- Read-only XVRFS initramfs and a small VFS mount dispatcher.
+- Limine boot, framebuffer shell, PS/2 keyboard and PIC/PIT interrupts.
+- IDT exception handlers with serial diagnostics; PMM, HHDM and a kernel heap.
+- ATA PIO, writable XVDISKFS on a persistent QEMU disk, read-only XVRFS initramfs and VFS.
 - Cooperative task/context-switch prototype.
-- Local account database, password login, home directories and basic shell-level path restrictions.
-- 16-entry command history with Up/Down and Tab completion for commands and accessible VFS paths.
-- Portable Python build/run scripts for Windows, macOS and Linux.
+- Local user accounts, PBKDF2-HMAC-SHA256 password hashes, login throttling and basic shell-level path restrictions.
+- Command history, Tab completion, editable input line, `FSCK`, `DF`, `HEALTH` and neofetch-style `SYSINFO`.
 
 ## Build and run
 
-Requirements: Rust via `rustup`, Python 3.10+, QEMU and the host tools described below. On macOS/Linux, install a C compiler and `xorriso`; on Windows the setup script can prepare supported helper tools.
+Requirements: Rust via `rustup`, Python 3.10+, QEMU, and host tools. On macOS/Linux install a C compiler and `xorriso`; on Windows the build script can prepare its supported helper tools.
 
 ```text
 python setup.py
@@ -37,11 +24,13 @@ python build.py --clean
 python run.py
 ```
 
-The build creates `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB disk at `data/xavieros-disk.img`. To erase and recreate that disk (this deletes files and accounts), run `python run.py --reset-disk`.
+The build creates `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB disk at `data/xavieros-disk.img`. To erase that disk and all accounts/files, run `python run.py --reset-disk`.
+
+The shell uses a thin vertical input caret, command history, and Tab completion.
 
 ## Accounts
 
-XavierOS starts in a temporary `live` session. On a fresh disk, create the first account; it becomes the administrator:
+On a fresh disk, the temporary `live` session can create the first account, which becomes administrator:
 
 ```text
 USERADD alice
@@ -51,41 +40,30 @@ HOME
 PASSWD
 ```
 
-`USERADD` asks for a password twice and masks the input. Passwords must contain 8–63 printable ASCII characters, are case-sensitive, and are stored as salted PBKDF2-HMAC-SHA256 hashes. Up to eight persistent accounts are supported. The first persistent account is the administrator. An administrator can create additional accounts with `USERADD bob`; standard users can access the writable disk only through their own `/DISK/HOME/<name>` directory. `LOGOUT` returns to the temporary `live` session, which becomes restricted after the first account exists. `USERS` lists accounts for the administrator.
+Passwords are hidden while typing, must be 8–63 printable ASCII characters, are case-sensitive, and are stored as salted PBKDF2-HMAC-SHA256 hashes. After three failed sign-in attempts, login is rate-limited for five seconds. Account creation/password changes require CPU RDRAND; `run.py` uses QEMU `-cpu max` so this is typically available under QEMU TCG. Accounts created by 0.1.2 keep their existing salt until the user runs `PASSWD` once. Up to eight accounts are supported. Standard users are restricted by shell checks to their own `/DISK/HOME/<name>` directory.
 
-## Shell
+## Shell quick reference
 
-Press **Up/Down** to browse recent commands. Press **Tab** to complete a command (for example, `ho` → `HOME`) or a unique accessible file/directory path. Ambiguous matches may extend to their common prefix; if the prefix does not grow, the line is left unchanged.
+- **Editing:** Left/Right, Home/End, Delete, Backspace, Ctrl+U (clear line), Ctrl+C (cancel input).
+- **History and completion:** Up/Down browse 16 recent commands; Tab completes command names and accessible paths.
+- **Disk:** `DISK`, `DF`, `FSCK` (read-only metadata check), `LS`, `CAT`, `WRITE`, `MKDIR`, `RM`.
+- **System:** `SYSINFO`, `HEALTH`, `UPTIME`, `MEM`, `HEAP`, `PMM`, `IRQ`, `TASKS`, `SELFTEST`.
+- **Accounts:** `USERADD`, `USERS`, `LOGIN`, `LOGOUT`, `WHOAMI`, `PASSWD`, `HOME`.
 
-Useful commands: `HELP`, `SYSINFO`, `LS`, `CAT`, `WRITE`, `MKDIR`, `RM`, `DISK`, `TASKS`, `SELFTEST`, `WHOAMI`, `LOGIN`, `LOGOUT`, `PASSWD`.
+`SYSINFO` deliberately keeps a neofetch-like layout: X logo, OS/kernel, CPU, display, user/session, uptime, RAM/PMM, heap, disk and scheduler. `HEALTH` is a compact subsystem status report, not a security audit. `FSCK` checks the on-disk superblock, metadata, directory tree, extents and overlap without writing repairs.
+
+## Limitations
+
+- Account management and access checks are experimental; commands run in ring 0. This is not user-mode process isolation or a hardened security boundary. Do not use real or reused passwords.
+- Password salt generation is fail-closed: without RDRAND, account creation/password changes are disabled rather than using a predictable timer/TSC fallback.
+- XVDISKFS is not journaled or crash-safe. FSCK is read-only and does not repair corruption. Use disposable virtual disk images.
+- Scheduling is cooperative. User-mode processes, address-space isolation, networking, a desktop and broad physical-hardware support are not implemented.
+- QEMU is the supported development target; physical hardware is not validated.
 
 ## Documentation
 
-The README is the starting point. These focused documents explain the design, formats, testing and contribution workflow:
+- [Russian README](README.ru.md)
+- [Changelog](CHANGELOG.md)
+- [License](LICENSE)
 
-| Document | Purpose |
-|---|---|
-| [`CHANGELOG.md`](CHANGELOG.md) | Changes by version |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Kernel components and boot/data flow |
-| [`TASKS.md`](TASKS.md) | Cooperative task prototype and limitations |
-| [`ROADMAP.md`](ROADMAP.md) | Planned development direction |
-| [`TESTING.md`](TESTING.md) | Host-side, QEMU, account and disk regression checks |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Guidelines for contributions |
-| [`SECURITY.md`](SECURITY.md) | Security limitations and reporting guidance |
-| [`XVRFS-FORMAT.md`](XVRFS-FORMAT.md) | Read-only initramfs image format |
-| [`XVDISKFS-FORMAT.md`](XVDISKFS-FORMAT.md) | Writable virtual-disk filesystem layout |
-| [`MIGRATION-PORTABLE.md`](MIGRATION-PORTABLE.md) | Portable build tools and GitHub browser upload notes |
-
-## Limitations and safety
-
-- The account manager is experimental. Commands run in ring 0; this is **not** user-mode process isolation or a hardened security boundary. Do not use real or reused passwords.
-- Salt generation prefers CPU RDRAND when available and falls back to a timer/TSC-derived value on CPUs that do not expose it. The fallback is not a cryptographic random-number generator.
-- XVDISKFS is small and is not journaled or crash-safe. Use disposable virtual disk images.
-- The scheduler is cooperative. User-mode programs, virtual address-space isolation, networking, a desktop and broad physical-hardware support are not implemented.
-- QEMU is the supported development target; physical hardware is not validated.
-
-`FORMAT DISK` erases the writable filesystem, including user accounts. The persistent disk image is local state and is excluded from Git.
-
-## License
-
-MIT. See [`LICENSE`](LICENSE).
+MIT license.
