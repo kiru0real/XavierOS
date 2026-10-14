@@ -1,6 +1,6 @@
 # XavierOS 0.1.1 Testing Checklist
 
-This checklist is required before publishing `v0.1.1`. The CI workflow checks host tooling and compiles the kernel, but does not start QEMU.
+This checklist is required before publishing `v0.1.1`. Host-side checks are useful, but they do not replace a clean kernel build and runtime tests in QEMU.
 
 ## 1. Host-side checks
 
@@ -87,7 +87,6 @@ Record the following before publishing:
 - Rust version:
 - Python version:
 - QEMU version:
-- CI run URL/result:
 - Clean ISO build result:
 - SELFTEST result:
 - Persistent write/reboot/read result:

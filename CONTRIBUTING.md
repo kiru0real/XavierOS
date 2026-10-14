@@ -16,7 +16,7 @@ python -m unittest discover -s tests -v
 cargo build --release --target x86_64-unknown-none
 ```
 
-For kernel-facing changes, also build the ISO and boot it in QEMU. Run `SELFTEST` and the relevant section of `TESTING.md`. CI is useful but does not replace QEMU testing.
+For kernel-facing changes, also build the ISO and boot it in QEMU. Run `SELFTEST` and the relevant section of `TESTING.md`. Host-side checks do not replace QEMU testing.
 
 ## Safety rules
 

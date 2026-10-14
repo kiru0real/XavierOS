@@ -47,7 +47,7 @@ The current source snapshot includes the following maintenance changes:
 - Harden heap deallocation against out-of-range pointers, malformed allocation headers, overlapping free ranges, and common double-free corruption cases.
 - Check ATA read/write command completion after the data phase rather than assuming the data transfer alone means success.
 - Extract downloaded Limine/xorriso archives without following archive-provided links; reject traversal paths, special files, and duplicate case-insensitive paths.
-- Add host-side tests and a GitHub Actions workflow for Python tooling, reproducible initramfs generation, and freestanding Rust compilation.
+- Add host-side tests for Python tooling, initramfs generation, and release packaging.
 
 These changes are hardening measures, not a security audit or a guarantee of crash-safe storage.
 
@@ -106,7 +106,7 @@ Then compare the generated image with the checked-in `initramfs.xfs` if no rootf
 cargo build --release --target x86_64-unknown-none
 ```
 
-Boot QEMU and run the smoke test described in [TESTING.md](TESTING.md). The CI workflow covers the host tests and freestanding Rust compilation; it does not run QEMU or validate physical hardware.
+Boot QEMU and run the smoke test described in [TESTING.md](TESTING.md). Host-side tests do not start QEMU or validate physical hardware, so the kernel build and runtime checks must be run locally.
 
 ## Console command quick reference
 

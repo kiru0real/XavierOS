@@ -6,7 +6,6 @@
 
 Ядро `no_std` с загрузкой через Limine, framebuffer-консолью, управлением памятью, диагностикой исключений процессора, клавиатурными прерываниями, встроенной файловой системой и небольшой записываемой файловой системой на виртуальном диске QEMU.
 
-[![CI](https://github.com/kiru0real/XavierOS/actions/workflows/ci.yml/badge.svg)](https://github.com/kiru0real/XavierOS/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-x86__64-informational)](#возможности)
 [![Status](https://img.shields.io/badge/Status-Experimental-orange)](#статус-и-ограничения)
@@ -46,7 +45,7 @@ XavierOS — учебный hobby-проект для изучения загр�
 - Усилена проверка освобождения памяти в heap: границы, заголовки аллокаций, пересечения со свободными блоками и распространённые случаи повторного освобождения.
 - ATA-драйвер проверяет завершение чтения/записи после передачи данных.
 - Загрузка архивов Limine/xorriso не следует ссылкам из архива; отклоняются path traversal, специальные файлы и дубли путей без учёта регистра.
-- Добавлены host-тесты и GitHub Actions для Python-инструментов, воспроизводимой initramfs и компиляции ядра.
+- Добавлены локальные host-тесты для Python-инструментов, генерации initramfs и подготовки релиза.
 
 Это меры укрепления надёжности, а не аудит безопасности и не гарантия целостности файловой системы при сбое питания.
 
@@ -96,7 +95,7 @@ python mkinitramfs.py --output build/initramfs-check.xfs
 cargo build --release --target x86_64-unknown-none
 ```
 
-Затем запусти QEMU и пройди smoke-test из [TESTING.md](TESTING.md). GitHub Actions проверяет host-тесты и компиляцию ядра; он не запускает QEMU и не подтверждает поддержку физического оборудования.
+Затем запусти QEMU и пройди smoke-test из [TESTING.md](TESTING.md). Host-тесты не запускают QEMU и не подтверждают поддержку физического оборудования, поэтому сборку ядра и runtime-проверки нужно выполнить локально.
 
 ## Основные команды
 

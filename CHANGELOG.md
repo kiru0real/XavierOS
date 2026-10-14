@@ -17,7 +17,6 @@ Notable changes to XavierOS are documented here. The GitHub release `v0.1.0` rem
 ### Added
 
 - Host-side unit tests for safe archive extraction, initramfs format generation, path-collision rejection, and release packaging checksums.
-- GitHub Actions CI for Python syntax/tests, deterministic initramfs generation, and freestanding Rust compilation.
 - `package_release.py`, which copies `build/xavieros.iso` to `dist/xavieros-0.1.1.iso` and generates `dist/SHA256SUMS.txt` for manual upload to GitHub Releases.
 - Architecture, testing, roadmap, contribution, security, and release-update documentation plus issue/PR templates.
 
