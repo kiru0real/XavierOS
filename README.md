@@ -6,7 +6,6 @@
 
 A `no_std` kernel booted by Limine, with a framebuffer console, memory management, CPU exception diagnostics, interrupt-driven keyboard input, an embedded initramfs, and a small writable filesystem for a QEMU virtual disk.
 
-[![CI](https://github.com/kiru0real/XavierOS/actions/workflows/ci.yml/badge.svg)](https://github.com/kiru0real/XavierOS/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Target-x86__64-informational)](#current-features)
 [![Status](https://img.shields.io/badge/Status-Experimental-orange)](#status-and-limitations)
