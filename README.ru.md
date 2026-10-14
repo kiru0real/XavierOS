@@ -10,7 +10,7 @@
 [![Target](https://img.shields.io/badge/Target-x86__64-informational)](#возможности)
 [![Status](https://img.shields.io/badge/Status-Experimental-orange)](#статус-и-ограничения)
 
-**Версия исходников: `0.1.1` · Последний опубликованный релиз: [`0.1.0`](https://github.com/kiru0real/XavierOS/releases/tag/v0.1.0) до проверки и публикации обновления.**
+**Версия исходников: `0.1.1` · Последний опубликованный релиз: [`0.1.1`](https://github.com/kiru0real/XavierOS/releases/tag/v0.1.1) **
 
 [English README](README.md)
 
