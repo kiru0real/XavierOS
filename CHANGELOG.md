@@ -1,16 +1,20 @@
 # Changelog
 
+## 0.1.4 — Experimental networking
+
+- Added QEMU E1000 initialization with DMA RX/TX rings and polled Ethernet frame I/O.
+- Added ARP, static QEMU user-network IPv4 configuration, ICMP echo (`PING`), and DNS A-record lookup.
+- Added `NET` for NIC/link/address diagnostics and attached an emulated E1000 adapter in the portable QEMU run script.
+- Explicitly maps the E1000 PCI MMIO register window before volatile register access, fixing an early page fault.
+- Improved `PING` with multiple probes (1–8), unique sequence numbers, packet-loss statistics, ICMP unreachable/time-exceeded diagnostics, received-packet TTL, and TSC-based RTT timing when supported.
+- Fixed the `SYSINFO` row break so `DISPLAY` no longer merges into `UPTIME` or overlaps the X logo.
+
 ## 0.1.3 — Shell, account and filesystem maintenance
 
 - Added input cursor editing: Left/Right, Home/End, Delete, Ctrl+U and Ctrl+C.
 - Changed the shell input cursor from an underline to a thin vertical caret.
-- Fixed `SYSINFO` row termination: `UPTIME` and `DISPLAY` now render on separate lines, preventing the next X fragment and display label from being concatenated into one row.
-- Kept the pixel-style X at exactly 15 rows, with no repeated pattern below it; remaining system fields stay aligned in the same column.
-- Added temporary login rate limiting after repeated failed sign-in attempts.
-- Removed the predictable timer/TSC password-salt fallback; account creation and password changes now require RDRAND.
-- Added read-only XVDISKFS consistency check (`FSCK`) and space summary (`DF`).
-- Expanded neofetch-style `SYSINFO` and added `HEALTH` and `UPTIME` commands.
-- Updated host tests and compact bilingual documentation.
+- Added login rate limiting, read-only filesystem consistency checks (`FSCK`), disk usage (`DF`), `HEALTH` and `UPTIME`.
+- Account creation and password changes require RDRAND instead of falling back to predictable timer/TSC-derived salts.
 
 ## 0.1.2 — Local user accounts and shell usability
 

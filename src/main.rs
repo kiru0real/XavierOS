@@ -11,6 +11,7 @@ mod vfs;
 mod task;
 mod crypto;
 mod users;
+mod net;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -105,7 +106,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.3\r\n");
+    serial_write("\r\nXavierOS v0.1.4\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -212,6 +213,15 @@ pub extern "C" fn _start() -> ! {
             serial_write("User database unavailable: ");
             serial_write(error);
             serial_write("; continuing in live session.\r\n");
+        }
+    }
+
+    match net::initialize() {
+        Ok(()) => serial_write("E1000 network driver initialized (QEMU user-mode network profile 10.0.2.15/24).\r\n"),
+        Err(error) => {
+            serial_write("Network unavailable: ");
+            serial_write(error);
+            serial_write("\r\n");
         }
     }
 
@@ -396,7 +406,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.3 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.4 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -607,7 +617,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.3");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.4");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -919,7 +929,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "IDT",
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
-    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE",
+    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING",
 ];
 
 fn prefix_matches(candidate: &str, prefix: &[u8]) -> bool {
@@ -1258,6 +1268,8 @@ fn process_command(
             console.write_line("DIAG        - RUN A SYSTEM DIAGNOSTIC");
             console.write_line("ECHO TEXT   - PRINT TEXT");
             console.write_line("HHDM        - SHOW DIRECT-MAP INFORMATION");
+            console.write_line("NET         - SHOW E1000 LINK / IPV4 CONFIGURATION");
+            console.write_line("PING HOST [COUNT] - ICMP ECHO TEST (DEFAULT 4, MAX 8)");
             console.write_line("HEAP        - SHOW KERNEL HEAP STATISTICS");
             console.write_line("LS [PATH]   - LIST A VFS DIRECTORY (ALIAS: DIR)");
             console.write_line("CAT PATH    - PRINT A FILE FROM ANY MOUNT");
@@ -1302,7 +1314,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.3");
+            console.write_line("PROJECT VERSION: 0.1.4");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -1311,7 +1323,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.3");
+            console.write_line("VERSION: 0.1.4");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1344,6 +1356,73 @@ fn process_command(
         },
         "PMM" => show_pmm(console, memory_summary),
         "HHDM" => show_hhdm(console, memory_summary),
+        "NET" => show_network(console),
+        "PING" => {
+            let mut ping_args = arguments.split_whitespace();
+            let target = ping_args.next().unwrap_or("");
+            if target.is_empty() {
+                console.write_line("USAGE: PING <IPV4 ADDRESS OR HOSTNAME> [COUNT 1-8]");
+            } else {
+                let count = match ping_args.next() {
+                    None => 4usize,
+                    Some(value) => match value.parse::<usize>() {
+                        Ok(value) if (1..=8).contains(&value) => value,
+                        _ => {
+                            console.write_line("PING COUNT MUST BE BETWEEN 1 AND 8.");
+                            return;
+                        }
+                    },
+                };
+                if ping_args.next().is_some() {
+                    console.write_line("USAGE: PING <IPV4 ADDRESS OR HOSTNAME> [COUNT 1-8]");
+                    return;
+                }
+                console.write("PING "); console.write(target);
+                console.write(" WITH "); console.write_decimal(count as u64); console.write_line(" PROBE(S)");
+                match net::resolve_target(target) {
+                    Err(error) => { console.write("PING FAILED: "); console.write_line(error); }
+                    Ok(address) => {
+                        let mut received = 0usize;
+                        for sequence in 1..=count {
+                            match net::ping_address(address, sequence as u16) {
+                                Ok(reply) => {
+                                    received += 1;
+                                    console.write("REPLY FROM "); write_ipv4(console, reply.address);
+                                    console.write(": SEQ="); console.write_decimal(reply.sequence as u64);
+                                    console.write(" TTL="); console.write_decimal(reply.ttl as u64);
+                                    console.write(" TIME=");
+                                    if let Some(microseconds) = reply.rtt_microseconds {
+                                        console.write_decimal(microseconds / 1000);
+                                        console.write(".");
+                                        let fraction = microseconds % 1000;
+                                        if fraction < 100 { console.write("0"); }
+                                        if fraction < 10 { console.write("0"); }
+                                        console.write_decimal(fraction);
+                                        console.write_line(" MS");
+                                    } else if reply.elapsed_ticks == 0 {
+                                        console.write_line("<10 MS (PIT RESOLUTION)");
+                                    } else {
+                                        console.write("~");
+                                        console.write_decimal(reply.elapsed_ticks.saturating_mul(10));
+                                        console.write_line(" MS (PIT RESOLUTION)");
+                                    }
+                                }
+                                Err(error) => {
+                                    console.write("PROBE "); console.write_decimal(sequence as u64);
+                                    console.write(": "); console.write_line(error);
+                                }
+                            }
+                        }
+                        let lost = count.saturating_sub(received);
+                        let loss_percent = lost.saturating_mul(100) / count;
+                        console.write("PING STATS: SENT="); console.write_decimal(count as u64);
+                        console.write(" RECEIVED="); console.write_decimal(received as u64);
+                        console.write(" LOST="); console.write_decimal(lost as u64);
+                        console.write(" ("); console.write_decimal(loss_percent as u64); console.write_line("% LOSS)");
+                    }
+                }
+            }
+        }
         "HEAP" => show_heap(console),
         "LS" | "DIR" => {
             let mut home_buffer = [0u8; 48];
@@ -1577,7 +1656,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.3"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.4"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1675,6 +1754,46 @@ fn process_command(
     }
 }
 
+fn show_network(console: &mut Console) {
+    console.write_line("XAVIEROS NETWORK STATUS");
+    console.write("DRIVER: "); console.write_line(net::status_text());
+    match net::info() {
+        Some(info) => {
+            console.write("LINK: "); console.write_line(if info.link_up { "UP" } else { "DOWN" });
+            console.write("MAC: ");
+            for (index, byte) in info.mac.iter().copied().enumerate() {
+                if index != 0 { console.write(":"); }
+                write_hex_byte(console, byte);
+            }
+            console.write_line("");
+            console.write("IPV4: "); write_ipv4(console, info.local_ip); console.write_line("");
+            console.write("NETMASK: "); write_ipv4(console, info.netmask); console.write_line("");
+            console.write("GATEWAY: "); write_ipv4(console, info.gateway); console.write_line("");
+            console.write("DNS: "); write_ipv4(console, info.dns); console.write_line("");
+            console.write_line("PROFILE: QEMU USER NETWORK (10.0.2.0/24)");
+            console.write_line("SUPPORTED: ARP / IPV4 / ICMP PING / DNS A LOOKUPS");
+            console.write_line("NOT IMPLEMENTED: DHCP / TCP / IPV6 / E1000 IRQ MODE");
+        }
+        None => {
+            console.write_line("NO READY E1000 DEVICE.");
+            console.write_line("RUN WITH THE PROJECT run.py SCRIPT TO ATTACH THE QEMU NIC.");
+        }
+    }
+}
+
+fn write_hex_byte(console: &mut Console, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = [HEX[(value >> 4) as usize], HEX[(value & 0x0F) as usize]];
+    console.write(core::str::from_utf8(&bytes).unwrap_or("00"));
+}
+
+fn write_ipv4(console: &mut Console, address: [u8; 4]) {
+    for (index, octet) in address.iter().copied().enumerate() {
+        if index != 0 { console.write("."); }
+        console.write_decimal(octet as u64);
+    }
+}
+
 fn show_disk_info(console: &mut Console) {
     console.write_line("XAVIEROS WRITABLE STORAGE");
     console.write_line(if ata::is_ready() { "ATA PRIMARY MASTER: READY" } else { "ATA PRIMARY MASTER: UNAVAILABLE" });
@@ -1750,7 +1869,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.3 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.4 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -1926,6 +2045,7 @@ fn run_diagnostics(console: &mut Console, memory_summary: Option<(MemoryStats, b
     console.write_line(" @ 32 BPP");
     console.write_line("INPUT: PS/2 KEYBOARD IRQ + RING BUFFER");
     console.write_line(if ata::is_ready() { "ATA PIO PRIMARY MASTER: READY" } else { "ATA PIO DISK: UNAVAILABLE" });
+    console.write("E1000 NETWORK: "); console.write_line(net::status_text());
     console.write_line(if diskfs::mount_status() { "XVDISKFS MOUNT: /DISK READY" } else { "XVDISKFS MOUNT: UNAVAILABLE" });
     let (task_total, task_runnable, context_switches) = task::stats();
     console.write("COOPERATIVE TASKS: "); console.write_decimal(task_total as u64);
@@ -2021,9 +2141,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.3");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.4");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.3");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.4");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2034,7 +2154,8 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write(if users::is_live() { "LIVE" } else if users::is_admin() { "ADMIN" } else { "USER" });
         console.write_line(")");
         sysinfo_prefix(console, "     XX    XX     "); console.write("UPTIME: "); write_uptime(console); console.write_line("");
-        // This newline ends the UPTIME row; it must not add an empty visual row.
+        // Every logo row must end before the next row starts; otherwise DISPLAY
+        // and the next logo fragment are concatenated onto the UPTIME line.
         sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");
         console.write_decimal(display_width); console.write("X"); console.write_decimal(display_height); console.write_line("");
         match memory_summary {
@@ -2078,7 +2199,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.1.3"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.1.4"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
@@ -2148,7 +2269,7 @@ fn show_health(console: &mut Console, memory_summary: Option<(MemoryStats, bool)
         Some((stats, pmm_ok)) => (pmm_ok, stats.hhdm_offset != 0),
         None => (false, false),
     };
-    let rows: [(&str, bool); 8] = [
+    let rows: [(&str, bool); 9] = [
         ("IDT / EXCEPTIONS", interrupts::is_initialized()),
         ("PIC / PIT", interrupts::hardware_is_initialized()),
         ("PS/2 KEYBOARD IRQ", interrupts::keyboard_is_initialized()),
@@ -2157,6 +2278,7 @@ fn show_health(console: &mut Console, memory_summary: Option<(MemoryStats, bool)
         ("INITRAMFS", fs::info().is_ok()),
         ("WRITABLE XVDISKFS", diskfs::mount_status()),
         ("USER DATABASE", users::is_initialized()),
+        ("E1000 NETWORK", net::is_ready()),
     ];
     for (name, okay) in rows {
         console.write(name); console.write(": "); console.write_line(if okay { "READY" } else { "UNAVAILABLE / CHECK" });

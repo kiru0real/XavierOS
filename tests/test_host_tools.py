@@ -160,7 +160,7 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.3.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.4.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
@@ -171,9 +171,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.3"', cargo)
-        self.assertIn('VERSION = "0.1.3"', package)
-        self.assertIn("Version 0.1.3", readme)
+        self.assertIn('version = "0.1.4"', cargo)
+        self.assertIn('VERSION = "0.1.4"', package)
+        self.assertIn("Version 0.1.4", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -220,12 +220,12 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.3")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.4")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
         self.assertIn('sysinfo_prefix(console, "     XX    XX     "); console.write("UPTIME: "); write_uptime(console); console.write_line("");', show)
-        self.assertIn('write_uptime(console); console.write_line("");\n        // This newline ends the UPTIME row; it must not add an empty visual row.\n        sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");', show)
+        self.assertIn('sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");', show)
         self.assertIn('sysinfo_prefix(console, "                  "); console.write("HEAP: ");', show)
         self.assertIn('sysinfo_prefix(console, "                  "); console.write("DISK: ");', show)
         self.assertIn('sysinfo_row(console, "                  ", "SCHEDULER: COOPERATIVE")', show)
@@ -234,6 +234,35 @@ class RepositoryShapeTests(unittest.TestCase):
             self.assertIn(fact, main)
         self.assertIn("neofetch-style `SYSINFO`", readme)
         self.assertIn('"HEALTH" => show_health', main)
+
+    def test_network_driver_and_qemu_nic_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        self.assertIn("mod net;", main)
+        self.assertIn('"NET" => show_network(console)', main)
+        self.assertIn('"PING" => {', main)
+        for feature in ("probe_e1000", "REG_RDBAL", "REG_TDBAL", "resolve_mac", "resolve_hostname", "pub fn ping"):
+            self.assertIn(feature, net)
+        # PCI BAR addresses are not necessarily covered by Limine's RAM HHDM mappings.
+        # Explicitly map the E1000 register window before the first volatile MMIO read/write.
+        self.assertIn("pub fn map_mmio_region(physical_start: u64, length: u64)", (ROOT / "src" / "memory.rs").read_text(encoding="utf-8"))
+        map_call = net.index("memory::map_mmio_region(bar_address, 0x6000)")
+        pointer_translation = net.index("memory::physical_to_virtual(bar_address)")
+        first_mmio_write = net.index("mmio_write(mmio_ptr, REG_IMC, u32::MAX)")
+        self.assertLess(map_call, pointer_translation)
+        self.assertLess(pointer_translation, first_mmio_write)
+        self.assertIn('"-netdev", "user,id=xvnet0", "-device", "e1000,netdev=xvnet0"', run)
+
+    def test_sysinfo_uptime_and_display_are_separate_rows(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        start = main.index("fn show_sysinfo(")
+        end = main.index("fn ", start + 3)
+        show = main[start:end]
+        uptime = show.index('write_uptime(console); console.write_line("");')
+        display = show.index('console.write("DISPLAY: ")')
+        self.assertLess(uptime, display)
+        self.assertIn('VERSION: 0.1.4', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -258,6 +287,28 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("pub fn secure_salt_available()", users)
         self.assertNotIn("rdtsc", users.lower())
         self.assertIn('"-cpu", "max"', run_script)
+
+
+    def test_ping_polish_uses_real_headers_precise_timing_and_bounds(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("PING <IPV4 ADDRESS OR HOSTNAME> [COUNT 1-8]", main)
+        self.assertIn("PING STATS: SENT=", main)
+        self.assertIn("net::resolve_target(target)", main)
+        self.assertIn("net::ping_address(address, sequence as u16)", main)
+        self.assertIn("pub rtt_microseconds: Option<u64>", net)
+        self.assertIn("fn tsc_frequency_hz() -> Option<u64>", net)
+        self.assertIn("ttl: ip.ttl", net)
+        self.assertIn("quoted_echo_matches(icmp_packet, address, sequence)", net)
+        self.assertIn("destination host is unreachable", net)
+        self.assertIn("request timed out after 3 seconds", net)
+
+    def test_ping_timing_never_claims_zero_ms_from_coarse_pit(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("<10 MS (PIT RESOLUTION)", main)
+        self.assertIn("elapsed_ticks: u64", net)
+        self.assertNotIn("elapsed_ms: elapsed", net)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 DEFAULT_ISO = ROOT / "build" / "xavieros.iso"
 DEFAULT_OUTPUT = ROOT / "dist"
 
