@@ -160,20 +160,28 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.4.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.5.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
+    def test_timezone_accepts_compact_offset_without_colon(self) -> None:
+        clock = (ROOT / "src" / "clock.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("bytes.len() == 5", clock)
+        self.assertIn("+HHMM|-HHMM", main)
+        self.assertIn("TIMEZONE +0300", readme)
+
     def test_version_metadata_is_consistent(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.4"', cargo)
-        self.assertIn('VERSION = "0.1.4"', package)
-        self.assertIn("Version 0.1.4", readme)
+        self.assertIn('version = "0.1.5"', cargo)
+        self.assertIn('VERSION = "0.1.5"', package)
+        self.assertIn("Current version: `0.1.5`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -220,7 +228,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.4")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.5")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -262,7 +270,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.1.4', main)
+        self.assertIn('VERSION: 0.1.5', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -309,6 +317,39 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("<10 MS (PIT RESOLUTION)", main)
         self.assertIn("elapsed_ticks: u64", net)
         self.assertNotIn("elapsed_ms: elapsed", net)
+
+    def test_dhcp_client_and_static_fallback_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn('"DHCP" =>', main)
+        self.assertIn("pub fn acquire_dhcp()", net)
+        self.assertIn("make_dhcp_message(1, xid, mac, None, None)", net)
+        self.assertIn("make_dhcp_message(3, xid, mac, Some(offer.your_ip), Some(server))", net)
+        self.assertIn("CONFIG_DHCP.store(1, Ordering::Release)", net)
+        self.assertIn("NETWORK: REQUESTING DHCP LEASE", main)
+
+    def test_ntp_and_wall_clock_commands_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        clock = (ROOT / "src" / "clock.rs").read_text(encoding="utf-8")
+        self.assertIn("mod clock;", main)
+        self.assertIn('"NTP" =>', main)
+        self.assertIn('"DATE" => show_clock_date(console)', main)
+        self.assertIn('"TIME" => show_clock_time(console)', main)
+        self.assertIn('"DATETIME" => show_datetime(console)', main)
+        self.assertIn('"TIMEZONE" =>', main)
+        self.assertIn("pub fn ntp_query(server_name: &str)", net)
+        self.assertIn("pub fn synchronize(server: &str)", clock)
+        self.assertIn("fn read_stable_rtc()", clock)
+        self.assertIn("set a manual fixed UTC offset", (ROOT / "README.md").read_text(encoding="utf-8"))
+
+    def test_qemu_rtc_uses_utc_and_network_version_is_consistent(self) -> None:
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('"-rtc", "base=utc"', run)
+        self.assertIn('version = "0.1.5"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.1.5"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn("DHCP client and UDP NTP client", readme)
 
 
 if __name__ == "__main__":

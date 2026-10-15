@@ -89,7 +89,7 @@ def main() -> int:
         return 1
     print("Starting XavierOS in QEMU; close the emulator window to stop it.", flush=True)
     # Legacy PC/PIIX exposes ATA PIO; QEMU user-mode NAT adds an E1000 NIC, and -cpu max exposes RDRAND when TCG supports it.
-    command = [qemu, "-machine", "pc", "-cpu", "max", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d",
+    command = [qemu, "-machine", "pc", "-cpu", "max", "-rtc", "base=utc", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d",
                "-netdev", "user,id=xvnet0", "-device", "e1000,netdev=xvnet0"]
     if not args.no_disk:
         try:

@@ -12,6 +12,7 @@ mod task;
 mod crypto;
 mod users;
 mod net;
+mod clock;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -106,7 +107,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.4\r\n");
+    serial_write("\r\nXavierOS v0.1.5\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -406,7 +407,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.4 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.5 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -617,7 +618,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.4");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.5");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -634,12 +635,25 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         }
         None => console.write_line("MEMORY MANAGER: UNAVAILABLE"),
     }
+    interrupts::enable_interrupts();
+    console.write_line("");
+    console.write_line("NETWORK: REQUESTING DHCP LEASE...");
+    match net::acquire_dhcp() {
+        Ok(()) => {
+            console.write("DHCP LEASE ACQUIRED: ");
+            if let Some(info) = net::info() { write_ipv4(&mut console, info.local_ip); }
+            console.write_line("");
+        }
+        Err(error) => {
+            console.write("DHCP UNAVAILABLE; KEEPING FALLBACK CONFIGURATION: ");
+            console.write_line(error);
+        }
+    }
     console.write_line("");
     write_shell_prompt(&mut console);
     console.render();
 
     serial_write("Interactive shell ready. PIC/PIT active; type HELP for commands.\r\n");
-    interrupts::enable_interrupts();
 
     let mut history = CommandHistory::new();
     loop {
@@ -930,6 +944,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
     "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING",
+    "DATE", "DATETIME", "DHCP", "NTP", "TIMEZONE",
 ];
 
 fn prefix_matches(candidate: &str, prefix: &[u8]) -> bool {
@@ -1268,8 +1283,14 @@ fn process_command(
             console.write_line("DIAG        - RUN A SYSTEM DIAGNOSTIC");
             console.write_line("ECHO TEXT   - PRINT TEXT");
             console.write_line("HHDM        - SHOW DIRECT-MAP INFORMATION");
-            console.write_line("NET         - SHOW E1000 LINK / IPV4 CONFIGURATION");
+            console.write_line("NET         - SHOW E1000 / IPV4 CONFIGURATION");
+            console.write_line("DHCP        - ACQUIRE / RENEW IPV4 CONFIGURATION");
             console.write_line("PING HOST [COUNT] - ICMP ECHO TEST (DEFAULT 4, MAX 8)");
+            console.write_line("DATE        - SHOW CURRENT LOCAL DATE (RTC OR NTP)");
+            console.write_line("TIME        - SHOW CURRENT LOCAL CLOCK TIME");
+            console.write_line("DATETIME    - SHOW DATE, TIME, TIMEZONE AND SOURCE");
+            console.write_line("TIMEZONE [UTC|+HH:MM|-HH:MM|+HHMM|-HHMM] - SET FIXED UTC OFFSET");
+            console.write_line("NTP [SERVER] - SYNCHRONIZE WALL CLOCK (DEFAULT CLOUDFLARE)");
             console.write_line("HEAP        - SHOW KERNEL HEAP STATISTICS");
             console.write_line("LS [PATH]   - LIST A VFS DIRECTORY (ALIAS: DIR)");
             console.write_line("CAT PATH    - PRINT A FILE FROM ANY MOUNT");
@@ -1298,7 +1319,7 @@ fn process_command(
             console.write_line("FSTEST      - TEST THE EMBEDDED INITRAMFS");
             console.write_line("IDT         - SHOW IDT / EXCEPTION / IRQ STATUS");
             console.write_line("IRQ         - SHOW PIC, KEYBOARD IRQ AND TIMER STATUS");
-            console.write_line("TIME        - SHOW PIT TICKS AND UPTIME");
+            console.write_line("UPTIME      - SHOW PIT TICKS AND KERNEL UPTIME");
             console.write_line("INFO        - SHOW KERNEL INFORMATION");
             console.write_line("MEM         - SHOW MEMORY USAGE");
             console.write_line("PMM         - SHOW PHYSICAL PAGE ALLOCATOR");
@@ -1314,7 +1335,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.4");
+            console.write_line("PROJECT VERSION: 0.1.5");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -1323,7 +1344,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.4");
+            console.write_line("VERSION: 0.1.5");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1357,6 +1378,49 @@ fn process_command(
         "PMM" => show_pmm(console, memory_summary),
         "HHDM" => show_hhdm(console, memory_summary),
         "NET" => show_network(console),
+        "DHCP" => {
+            console.write_line("DHCP: REQUESTING IPV4 CONFIGURATION...");
+            match net::acquire_dhcp() {
+                Ok(()) => {
+                    console.write_line("DHCP: LEASE ACQUIRED.");
+                    show_network(console);
+                }
+                Err(error) => {
+                    console.write("DHCP FAILED: "); console.write_line(error);
+                    console.write_line("PREVIOUS NETWORK CONFIGURATION WAS KEPT.");
+                }
+            }
+        },
+        "NTP" => {
+            let server = if arguments.is_empty() { "time.cloudflare.com" } else { arguments };
+            if server.split_whitespace().count() != 1 {
+                console.write_line("USAGE: NTP [SERVER]");
+            } else {
+                console.write("NTP: SYNCHRONIZING WITH "); console.write_line(server);
+                match clock::synchronize(server) {
+                    Ok(_) => {
+                        console.write_line("NTP: CLOCK SYNCHRONIZED TO UTC.");
+                        show_datetime(console);
+                    }
+                    Err(error) => { console.write("NTP FAILED: "); console.write_line(error); }
+                }
+            }
+        },
+        "DATE" => show_clock_date(console),
+        "TIME" => show_clock_time(console),
+        "DATETIME" => show_datetime(console),
+        "TIMEZONE" => {
+            if arguments.is_empty() {
+                show_timezone(console);
+            } else if arguments.split_whitespace().count() != 1 {
+                console.write_line("USAGE: TIMEZONE [UTC|+HH:MM|-HH:MM|+HHMM|-HHMM]");
+            } else {
+                match clock::set_timezone(arguments) {
+                    Ok(_) => { console.write("TIMEZONE SET: "); write_timezone(console); console.write_line(""); show_datetime(console); }
+                    Err(error) => { console.write("TIMEZONE ERROR: "); console.write_line(error); }
+                }
+            }
+        },
         "PING" => {
             let mut ping_args = arguments.split_whitespace();
             let target = ping_args.next().unwrap_or("");
@@ -1649,14 +1713,13 @@ fn process_command(
         },
         "IDT" => show_idt(console),
         "IRQ" => show_irq(console),
-        "TIME" => show_time(console),
         "TRAP" => {
             console.write_line("TEST FAULT: EXECUTING UD2; CHECK THE SERIAL LOG.");
             console.render();
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.4"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.5"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1770,9 +1833,10 @@ fn show_network(console: &mut Console) {
             console.write("NETMASK: "); write_ipv4(console, info.netmask); console.write_line("");
             console.write("GATEWAY: "); write_ipv4(console, info.gateway); console.write_line("");
             console.write("DNS: "); write_ipv4(console, info.dns); console.write_line("");
-            console.write_line("PROFILE: QEMU USER NETWORK (10.0.2.0/24)");
-            console.write_line("SUPPORTED: ARP / IPV4 / ICMP PING / DNS A LOOKUPS");
-            console.write_line("NOT IMPLEMENTED: DHCP / TCP / IPV6 / E1000 IRQ MODE");
+            console.write("CONFIGURATION: "); console.write_line(if info.dhcp { "DHCP LEASE" } else { "STATIC FALLBACK" });
+            console.write_line("PROFILE: QEMU USER NETWORK");
+            console.write_line("SUPPORTED: DHCP / ARP / IPV4 / ICMP / DNS A / NTP UDP");
+            console.write_line("NOT IMPLEMENTED: TCP / IPV6 / E1000 IRQ MODE");
         }
         None => {
             console.write_line("NO READY E1000 DEVICE.");
@@ -1869,7 +1933,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.4 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.5 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -2003,6 +2067,75 @@ fn show_idt(console: &mut Console) {
     console.write_line("PAGE FAULT: CR2 ADDRESS + REGISTER DUMP");
     console.write_line(if interrupts::hardware_is_initialized() { "LEGACY PIC: REMAPPED / IRQ0 ENABLED" } else { "LEGACY PIC: NOT INITIALIZED" });
     console.write_line(if interrupts::keyboard_is_initialized() { "PS/2 KEYBOARD IRQ1: READY" } else { "PS/2 KEYBOARD IRQ1: UNAVAILABLE" });
+}
+
+fn show_clock_date(console: &mut Console) {
+    match clock::now_local() {
+        Ok(value) => {
+            console.write("DATE: "); write_four_digit_year(console, value.year);
+            console.write("-"); write_two_digits(console, value.month);
+            console.write("-"); write_two_digits(console, value.day);
+            console.write(" | SOURCE: "); console.write_line(clock::source_name());
+        }
+        Err(error) => { console.write("DATE UNAVAILABLE: "); console.write_line(error); }
+    }
+}
+
+fn show_clock_time(console: &mut Console) {
+    match clock::now_local() {
+        Ok(value) => {
+            console.write("TIME: "); write_two_digits(console, value.hour);
+            console.write(":"); write_two_digits(console, value.minute);
+            console.write(":"); write_two_digits(console, value.second);
+            console.write(" | TIMEZONE: "); write_timezone(console);
+            console.write(" | SOURCE: "); console.write_line(clock::source_name());
+        }
+        Err(error) => { console.write("TIME UNAVAILABLE: "); console.write_line(error); }
+    }
+}
+
+fn show_datetime(console: &mut Console) {
+    match clock::now_local() {
+        Ok(value) => {
+            console.write("DATETIME: "); write_four_digit_year(console, value.year);
+            console.write("-"); write_two_digits(console, value.month);
+            console.write("-"); write_two_digits(console, value.day);
+            console.write(" "); write_two_digits(console, value.hour);
+            console.write(":"); write_two_digits(console, value.minute);
+            console.write(":"); write_two_digits(console, value.second);
+            console.write(" "); write_timezone(console);
+            console.write(" (SOURCE: "); console.write(clock::source_name()); console.write_line(")");
+        }
+        Err(error) => { console.write("DATETIME UNAVAILABLE: "); console.write_line(error); }
+    }
+}
+
+fn show_timezone(console: &mut Console) {
+    console.write("TIMEZONE: "); write_timezone(console); console.write_line("");
+    console.write_line("TIMEZONE IS A MANUAL FIXED UTC OFFSET; DST/AUTO-LOCATION ARE NOT IMPLEMENTED.");
+}
+
+fn write_timezone(console: &mut Console) {
+    let offset = clock::timezone_offset_minutes();
+    if offset == 0 { console.write("UTC"); return; }
+    console.write(if offset < 0 { "UTC-" } else { "UTC+" });
+    let magnitude = offset.unsigned_abs();
+    write_two_digits(console, (magnitude / 60) as u32);
+    console.write(":");
+    write_two_digits(console, (magnitude % 60) as u32);
+}
+
+fn write_two_digits(console: &mut Console, value: u32) {
+    if value < 10 { console.write("0"); }
+    console.write_decimal(value as u64);
+}
+
+fn write_four_digit_year(console: &mut Console, year: i64) {
+    if year >= 0 && year < 1000 { console.write("0"); }
+    if year >= 0 && year < 100 { console.write("0"); }
+    if year >= 0 && year < 10 { console.write("0"); }
+    if year < 0 { console.write("-"); console.write_decimal(year.unsigned_abs()); }
+    else { console.write_decimal(year as u64); }
 }
 
 fn show_time(console: &mut Console) {
@@ -2141,9 +2274,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.4");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.5");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.4");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.5");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2199,7 +2332,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.1.4"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.1.5"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);

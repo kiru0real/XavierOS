@@ -1,14 +1,14 @@
 //! Minimal polled Intel E1000 networking for XavierOS/QEMU user-mode networking.
 //!
-//! The driver uses an HHDM MMIO pointer and a physically contiguous DMA region.
-//! The first implementation supports the common QEMU E1000 device, static
-//! 10.0.2.15/24 addressing, ARP, IPv4, ICMP echo, and a small DNS A-record client.
-//! It is single-core, polling-only, and intentionally has no TCP/DHCP/IPv6.
+//! The driver uses explicitly mapped HHDM MMIO and physically contiguous DMA.
+//! It targets QEMU's emulated E1000 and user-mode NAT: DHCPv4 with a static
+//! fallback, ARP, IPv4, ICMP echo, DNS A records, and UDP-based NTP. It is
+//! single-core and polling-only; TCP, IPv6, and physical NICs are not supported.
 
 use core::arch::asm;
 use core::mem::MaybeUninit;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU8, AtomicU32, Ordering};
 
 use crate::{interrupts, memory};
 
@@ -62,13 +62,23 @@ const TX_CMD_IFCS: u8 = 1 << 1;
 const TX_CMD_RS: u8 = 1 << 3;
 const DESC_STATUS_DD: u8 = 1;
 
-const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-const DNS_IP: [u8; 4] = [10, 0, 2, 3];
-const NETMASK: [u8; 4] = [255, 255, 255, 0];
+const DEFAULT_LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
+const DEFAULT_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+const DEFAULT_DNS_IP: [u8; 4] = [10, 0, 2, 3];
+const DEFAULT_NETMASK: [u8; 4] = [255, 255, 255, 0];
 const DNS_LOCAL_PORT: u16 = 53000;
+const NTP_LOCAL_PORT: u16 = 53123;
 const DNS_ID: u16 = 0x5841;
 const ICMP_ID: u16 = 0x5841;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
+const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+static CONFIG_LOCAL_IP: AtomicU32 = AtomicU32::new(u32::from_be_bytes(DEFAULT_LOCAL_IP));
+static CONFIG_GATEWAY_IP: AtomicU32 = AtomicU32::new(u32::from_be_bytes(DEFAULT_GATEWAY_IP));
+static CONFIG_DNS_IP: AtomicU32 = AtomicU32::new(u32::from_be_bytes(DEFAULT_DNS_IP));
+static CONFIG_NETMASK: AtomicU32 = AtomicU32::new(u32::from_be_bytes(DEFAULT_NETMASK));
+static CONFIG_DHCP: AtomicU8 = AtomicU8::new(0);
 
 const STATUS_UNINITIALIZED: u8 = 0;
 const STATUS_READY: u8 = 1;
@@ -117,6 +127,7 @@ pub struct NetworkInfo {
     pub netmask: [u8; 4],
     pub gateway: [u8; 4],
     pub dns: [u8; 4],
+    pub dhcp: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -330,10 +341,11 @@ pub fn info() -> Option<NetworkInfo> {
     Some(NetworkInfo {
         mac: state.mac,
         link_up: (unsafe { mmio_read(state.mmio, REG_STATUS) } & (1 << 1)) != 0,
-        local_ip: LOCAL_IP,
-        netmask: NETMASK,
-        gateway: GATEWAY_IP,
-        dns: DNS_IP,
+        local_ip: configured_ip(&CONFIG_LOCAL_IP),
+        netmask: configured_ip(&CONFIG_NETMASK),
+        gateway: configured_ip(&CONFIG_GATEWAY_IP),
+        dns: configured_ip(&CONFIG_DNS_IP),
+        dhcp: CONFIG_DHCP.load(Ordering::Acquire) != 0,
     })
 }
 
@@ -393,7 +405,7 @@ pub fn ping_address(address: [u8; 4], sequence: u16) -> Result<PingReply, &'stat
         spins += 1;
         if let Some(length) = receive_frame(&mut frame) {
             if let Some(ip) = parse_ipv4_frame(&frame, length) {
-                if ip.protocol != 1 || ip.destination != LOCAL_IP || ip.payload.len() < 8 {
+                if ip.protocol != 1 || ip.destination != configured_ip(&CONFIG_LOCAL_IP) || ip.payload.len() < 8 {
                     continue;
                 }
                 let icmp_packet = ip.payload;
@@ -479,7 +491,7 @@ fn quoted_echo_matches(icmp_error: &[u8], destination: [u8; 4], sequence: u16) -
     if quoted[0] >> 4 != 4 || quoted[9] != 1 { return false; }
     let header_len = ((quoted[0] & 0x0F) as usize) * 4;
     if header_len < 20 || quoted.len() < header_len + 8 { return false; }
-    if quoted[12..16] != LOCAL_IP || quoted[16..20] != destination { return false; }
+    if quoted[12..16] != configured_ip(&CONFIG_LOCAL_IP) || quoted[16..20] != destination { return false; }
     let echo = &quoted[header_len..];
     echo[0] == 8 && be16(echo, 4) == Some(ICMP_ID) && be16(echo, 6) == Some(sequence)
 }
@@ -503,7 +515,7 @@ fn resolve_mac(address: [u8; 4]) -> Result<[u8; 6], &'static str> {
     frame[19] = 4;
     put_be16(&mut frame, 20, 1); // ARP request.
     frame[22..28].copy_from_slice(&state_mac);
-    frame[28..32].copy_from_slice(&LOCAL_IP);
+    frame[28..32].copy_from_slice(&configured_ip(&CONFIG_LOCAL_IP));
     frame[32..38].fill(0);
     frame[38..42].copy_from_slice(&address);
     transmit_frame(&frame)?;
@@ -517,7 +529,7 @@ fn resolve_mac(address: [u8; 4]) -> Result<[u8; 6], &'static str> {
             if length >= 42 && be16(&response, 12) == Some(0x0806)
                 && be16(&response, 20) == Some(2)
                 && response[28..32] == address
-                && response[38..42] == LOCAL_IP
+                && response[38..42] == configured_ip(&CONFIG_LOCAL_IP)
             {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(&response[22..28]);
@@ -562,7 +574,7 @@ fn resolve_hostname(hostname: &str) -> Result<[u8; 4], &'static str> {
     put_be16(&mut query, offset, 1); offset += 2; // A record.
     put_be16(&mut query, offset, 1); offset += 2; // IN class.
 
-    send_udp(DNS_IP, DNS_LOCAL_PORT, 53, &query[..offset])?;
+    send_udp(configured_ip(&CONFIG_DNS_IP), DNS_LOCAL_PORT, 53, &query[..offset])?;
     let start = interrupts::timer_ticks();
     let mut frame = [0u8; MAX_PACKET_SIZE];
     let mut spins = 0usize;
@@ -570,7 +582,7 @@ fn resolve_hostname(hostname: &str) -> Result<[u8; 4], &'static str> {
         spins += 1;
         if let Some(length) = receive_frame(&mut frame) {
             if let Some(ip) = parse_ipv4_frame(&frame, length) {
-                if ip.protocol != 17 || ip.source != DNS_IP || ip.destination != LOCAL_IP || ip.payload.len() < 8 { continue; }
+                if ip.protocol != 17 || ip.source != configured_ip(&CONFIG_DNS_IP) || ip.destination != configured_ip(&CONFIG_LOCAL_IP) || ip.payload.len() < 8 { continue; }
                 if be16(ip.payload, 0) != Some(53) || be16(ip.payload, 2) != Some(DNS_LOCAL_PORT) { continue; }
                 let udp_len = be16(ip.payload, 4).unwrap_or(0) as usize;
                 if udp_len < 8 || udp_len > ip.payload.len() { continue; }
@@ -637,15 +649,27 @@ fn skip_dns_name(message: &[u8], start: usize) -> Option<usize> {
 }
 
 fn send_udp(destination: [u8; 4], source_port: u16, destination_port: u16, payload: &[u8]) -> Result<(), &'static str> {
+    let mac = resolve_mac(next_hop(destination))?;
+    send_udp_to_mac(configured_ip(&CONFIG_LOCAL_IP), destination, mac, source_port, destination_port, payload)
+}
+
+fn send_udp_to_mac(source_ip: [u8; 4], destination: [u8; 4], destination_mac: [u8; 6], source_port: u16, destination_port: u16, payload: &[u8]) -> Result<(), &'static str> {
     if payload.len() + 8 > 1480 { return Err("UDP payload too large"); }
-    let mut udp = [0u8; 512 + 8];
-    if payload.len() > 512 { return Err("UDP payload exceeds DNS buffer limit"); }
+    let mut udp = [0u8; 520];
+    if payload.len() > 512 { return Err("UDP payload exceeds 512-byte buffer limit"); }
     put_be16(&mut udp, 0, source_port);
     put_be16(&mut udp, 2, destination_port);
     put_be16(&mut udp, 4, (payload.len() + 8) as u16);
     put_be16(&mut udp, 6, 0); // Zero UDP checksum is legal for IPv4.
     udp[8..8 + payload.len()].copy_from_slice(payload);
-    send_ipv4(destination, 17, &udp[..8 + payload.len()])
+    send_ipv4_from_to_mac(source_ip, destination, destination_mac, 17, &udp[..8 + payload.len()])
+}
+
+fn parse_udp_payload(packet: &[u8], source_port: u16, destination_port: u16) -> Option<&[u8]> {
+    if packet.len() < 8 || be16(packet, 0)? != source_port || be16(packet, 2)? != destination_port { return None; }
+    let length = be16(packet, 4)? as usize;
+    if length < 8 || length > packet.len() { return None; }
+    Some(&packet[8..length])
 }
 
 fn send_ipv4(destination: [u8; 4], protocol: u8, payload: &[u8]) -> Result<(), &'static str> {
@@ -654,6 +678,10 @@ fn send_ipv4(destination: [u8; 4], protocol: u8, payload: &[u8]) -> Result<(), &
 }
 
 fn send_ipv4_to_mac(destination: [u8; 4], destination_mac: [u8; 6], protocol: u8, payload: &[u8]) -> Result<(), &'static str> {
+    send_ipv4_from_to_mac(configured_ip(&CONFIG_LOCAL_IP), destination, destination_mac, protocol, payload)
+}
+
+fn send_ipv4_from_to_mac(source_ip: [u8; 4], destination: [u8; 4], destination_mac: [u8; 6], protocol: u8, payload: &[u8]) -> Result<(), &'static str> {
     if payload.len() > 1480 { return Err("IPv4 payload too large"); }
     let source_mac = unsafe { &mut *state_ptr().ok_or("E1000 driver is not ready")? }.mac;
     let mut frame = [0u8; MAX_FRAME_SIZE];
@@ -669,7 +697,7 @@ fn send_ipv4_to_mac(destination: [u8; 4], destination_mac: [u8; 6], protocol: u8
     ip[8] = 64;
     ip[9] = protocol;
     put_be16(ip, 10, 0);
-    ip[12..16].copy_from_slice(&LOCAL_IP);
+    ip[12..16].copy_from_slice(&source_ip);
     ip[16..20].copy_from_slice(&destination);
     let header_sum = checksum(&ip[..20]);
     put_be16(ip, 10, header_sum);
@@ -678,11 +706,222 @@ fn send_ipv4_to_mac(destination: [u8; 4], destination_mac: [u8; 6], protocol: u8
 }
 
 fn next_hop(destination: [u8; 4]) -> [u8; 4] {
-    if destination[0] == LOCAL_IP[0] && destination[1] == LOCAL_IP[1] && destination[2] == LOCAL_IP[2] {
-        destination
-    } else {
-        GATEWAY_IP
+    let local = configured_ip(&CONFIG_LOCAL_IP);
+    let mask = configured_ip(&CONFIG_NETMASK);
+    let local_net = u32::from_be_bytes(local) & u32::from_be_bytes(mask);
+    let destination_net = u32::from_be_bytes(destination) & u32::from_be_bytes(mask);
+    if local_net == destination_net { destination } else { configured_ip(&CONFIG_GATEWAY_IP) }
+}
+
+fn configured_ip(value: &AtomicU32) -> [u8; 4] {
+    value.load(Ordering::Acquire).to_be_bytes()
+}
+
+pub fn dhcp_enabled() -> bool {
+    CONFIG_DHCP.load(Ordering::Acquire) != 0
+}
+
+/// Run a bounded DHCP DISCOVER/OFFER/REQUEST/ACK exchange. The existing
+/// address remains active unless a complete, validated ACK is received.
+pub fn acquire_dhcp() -> Result<(), &'static str> {
+    if !is_ready() { return Err("E1000 driver is not ready"); }
+    if info().map(|network| !network.link_up).unwrap_or(true) {
+        return Err("Ethernet link is down");
     }
+    let mac = unsafe { (&*state_ptr().ok_or("E1000 driver is not ready")?).mac };
+    let mut xid = (interrupts::timer_ticks() as u32) ^ (read_tsc() as u32)
+        ^ u32::from_be_bytes([mac[0], mac[1], mac[2], mac[3]])
+        ^ u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
+    if xid == 0 { xid = 0x5841_4552; }
+
+    let (discover, discover_len) = make_dhcp_message(1, xid, mac, None, None);
+    send_udp_to_mac([0; 4], [255; 4], [255; 6], DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &discover[..discover_len])?;
+    let offer = wait_for_dhcp_reply(xid, mac, 2)?;
+    if !valid_lease_ip(offer.your_ip) { return Err("DHCP offer contained an invalid IPv4 address"); }
+    let server = offer.server.ok_or("DHCP offer did not include a server identifier")?;
+
+    let (request, request_len) = make_dhcp_message(3, xid, mac, Some(offer.your_ip), Some(server));
+    send_udp_to_mac([0; 4], [255; 4], [255; 6], DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &request[..request_len])?;
+    let ack = wait_for_dhcp_reply(xid, mac, 5)?;
+    let assigned = if valid_lease_ip(ack.your_ip) { ack.your_ip } else { offer.your_ip };
+    if let Some(ack_server) = ack.server {
+        if ack_server != server { return Err("DHCP ACK came from a different server"); }
+    }
+    let mask = ack.subnet.or(offer.subnet).unwrap_or(DEFAULT_NETMASK);
+    if !valid_netmask(mask) { return Err("DHCP supplied an invalid subnet mask"); }
+    let gateway = ack.router.or(offer.router).unwrap_or(DEFAULT_GATEWAY_IP);
+    let dns = ack.dns.or(offer.dns).unwrap_or(DEFAULT_DNS_IP);
+    if gateway == [0; 4] || gateway[0] >= 224 || dns == [0; 4] || dns[0] >= 224 {
+        return Err("DHCP supplied an invalid gateway or DNS address");
+    }
+
+    CONFIG_LOCAL_IP.store(u32::from_be_bytes(assigned), Ordering::Release);
+    CONFIG_NETMASK.store(u32::from_be_bytes(mask), Ordering::Release);
+    CONFIG_GATEWAY_IP.store(u32::from_be_bytes(gateway), Ordering::Release);
+    CONFIG_DNS_IP.store(u32::from_be_bytes(dns), Ordering::Release);
+    CONFIG_DHCP.store(1, Ordering::Release);
+    if let Some(pointer) = state_ptr() {
+        let state = unsafe { &mut *pointer };
+        state.arp_valid = false;
+        state.arp_ip = [0; 4];
+        state.arp_mac = [0; 6];
+    }
+    Ok(())
+}
+
+/// Query an NTPv3/v4 server and return validated Unix UTC seconds.
+pub fn ntp_query(server_name: &str) -> Result<u64, &'static str> {
+    let server = resolve_target(server_name)?;
+    let server_mac = resolve_mac(next_hop(server))?;
+    let mut request = [0u8; 48];
+    request[0] = 0x23; // LI=0, VN=4, client mode.
+    let nonce_hi = (interrupts::timer_ticks() as u32) ^ 0x5841_4E54;
+    let nonce_lo = read_tsc() as u32;
+    request[40..44].copy_from_slice(&nonce_hi.to_be_bytes());
+    request[44..48].copy_from_slice(&nonce_lo.to_be_bytes());
+    send_udp_to_mac(configured_ip(&CONFIG_LOCAL_IP), server, server_mac, NTP_LOCAL_PORT, 123, &request)?;
+
+    let start = interrupts::timer_ticks();
+    let mut frame = [0u8; MAX_PACKET_SIZE];
+    let mut spins = 0usize;
+    while spins < MAX_POLL_SPINS {
+        spins += 1;
+        if let Some(length) = receive_frame(&mut frame) {
+            if let Some(ip) = parse_ipv4_frame(&frame, length) {
+                if ip.protocol != 17 || ip.source != server || ip.destination != configured_ip(&CONFIG_LOCAL_IP) { continue; }
+                if let Some(payload) = parse_udp_payload(ip.payload, 123, NTP_LOCAL_PORT) {
+                    if payload.len() < 48 { continue; }
+                    let mode = payload[0] & 0x07;
+                    let version = (payload[0] >> 3) & 0x07;
+                    let stratum = payload[1];
+                    if mode != 4 || !(3..=4).contains(&version) || payload[0] >> 6 == 3 || stratum == 0 || stratum > 15 { continue; }
+                    if payload[24..32] != request[40..48] { continue; }
+                    let ntp_seconds = u32::from_be_bytes([payload[40], payload[41], payload[42], payload[43]]) as u64;
+                    if ntp_seconds <= NTP_UNIX_EPOCH_DELTA { return Err("NTP server returned an invalid timestamp"); }
+                    return Ok(ntp_seconds - NTP_UNIX_EPOCH_DELTA);
+                }
+            }
+        }
+        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+            return Err("NTP query timed out after 3 seconds");
+        }
+        core::hint::spin_loop();
+    }
+    Err("NTP query timed out (poll limit reached)")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DhcpReply {
+    message_type: u8,
+    your_ip: [u8; 4],
+    subnet: Option<[u8; 4]>,
+    router: Option<[u8; 4]>,
+    dns: Option<[u8; 4]>,
+    server: Option<[u8; 4]>,
+}
+
+fn valid_lease_ip(ip: [u8; 4]) -> bool {
+    ip != [0; 4] && ip != [255; 4] && ip[0] < 224 && ip[0] != 127
+}
+
+fn valid_netmask(mask: [u8; 4]) -> bool {
+    let bits = u32::from_be_bytes(mask);
+    if bits == 0 { return false; }
+    let inverted = !bits;
+    (inverted & inverted.wrapping_add(1)) == 0
+}
+
+fn push_dhcp_option(buffer: &mut [u8], position: &mut usize, code: u8, data: &[u8]) -> bool {
+    if data.len() > 255 || (*position).saturating_add(2 + data.len()) > buffer.len() { return false; }
+    buffer[*position] = code;
+    buffer[*position + 1] = data.len() as u8;
+    buffer[*position + 2..*position + 2 + data.len()].copy_from_slice(data);
+    *position += 2 + data.len();
+    true
+}
+
+fn make_dhcp_message(message_type: u8, xid: u32, mac: [u8; 6], requested_ip: Option<[u8; 4]>, server: Option<[u8; 4]>) -> ([u8; 320], usize) {
+    let mut packet = [0u8; 320];
+    packet[0] = 1; // BOOTREQUEST.
+    packet[1] = 1; // Ethernet.
+    packet[2] = 6;
+    packet[4..8].copy_from_slice(&xid.to_be_bytes());
+    packet[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // Broadcast reply.
+    packet[28..34].copy_from_slice(&mac);
+    packet[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+    let mut position = 240usize;
+    let _ = push_dhcp_option(&mut packet, &mut position, 53, &[message_type]);
+    if let Some(ip) = requested_ip { let _ = push_dhcp_option(&mut packet, &mut position, 50, &ip); }
+    if let Some(server_ip) = server { let _ = push_dhcp_option(&mut packet, &mut position, 54, &server_ip); }
+    let _ = push_dhcp_option(&mut packet, &mut position, 55, &[1, 3, 6, 51, 54]);
+    let mut client_id = [0u8; 7];
+    client_id[0] = 1;
+    client_id[1..].copy_from_slice(&mac);
+    let _ = push_dhcp_option(&mut packet, &mut position, 61, &client_id);
+    let _ = push_dhcp_option(&mut packet, &mut position, 57, &576u16.to_be_bytes());
+    let _ = push_dhcp_option(&mut packet, &mut position, 12, b"xavieros");
+    packet[position] = 255;
+    position += 1;
+    (packet, position)
+}
+
+fn parse_dhcp_reply(packet: &[u8], xid: u32, mac: [u8; 6]) -> Option<DhcpReply> {
+    if packet.len() < 240 || packet[0] != 2 || packet[1] != 1 || packet[2] != 6 { return None; }
+    if u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]) != xid { return None; }
+    if packet[28..34] != mac || packet[236..240] != DHCP_MAGIC_COOKIE { return None; }
+    let your_ip = [packet[16], packet[17], packet[18], packet[19]];
+    let mut message_type = 0u8;
+    let mut subnet = None;
+    let mut router = None;
+    let mut dns = None;
+    let mut server = None;
+    let mut cursor = 240usize;
+    while cursor < packet.len() {
+        let code = packet[cursor];
+        cursor += 1;
+        if code == 255 { break; }
+        if code == 0 { continue; }
+        let length = *packet.get(cursor)? as usize;
+        cursor += 1;
+        let end = cursor.checked_add(length)?;
+        let value = packet.get(cursor..end)?;
+        match code {
+            53 if length == 1 => message_type = value[0],
+            1 if length == 4 => subnet = Some([value[0], value[1], value[2], value[3]]),
+            3 if length >= 4 => router = Some([value[0], value[1], value[2], value[3]]),
+            6 if length >= 4 => dns = Some([value[0], value[1], value[2], value[3]]),
+            54 if length == 4 => server = Some([value[0], value[1], value[2], value[3]]),
+            _ => {}
+        }
+        cursor = end;
+    }
+    if message_type == 0 { return None; }
+    Some(DhcpReply { message_type, your_ip, subnet, router, dns, server })
+}
+
+fn wait_for_dhcp_reply(xid: u32, mac: [u8; 6], expected_type: u8) -> Result<DhcpReply, &'static str> {
+    let start = interrupts::timer_ticks();
+    let mut frame = [0u8; MAX_PACKET_SIZE];
+    let mut spins = 0usize;
+    while spins < MAX_POLL_SPINS {
+        spins += 1;
+        if let Some(length) = receive_frame(&mut frame) {
+            if let Some(ip) = parse_ipv4_frame(&frame, length) {
+                if ip.protocol == 17 {
+                    if let Some(payload) = parse_udp_payload(ip.payload, DHCP_SERVER_PORT, DHCP_CLIENT_PORT) {
+                        if let Some(reply) = parse_dhcp_reply(payload, xid, mac) {
+                            if reply.message_type == expected_type { return Ok(reply); }
+                        }
+                    }
+                }
+            }
+        }
+        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+            return Err(if expected_type == 2 { "DHCP offer timed out" } else { "DHCP acknowledgement timed out" });
+        }
+        core::hint::spin_loop();
+    }
+    Err("DHCP timed out (poll limit reached)")
 }
 
 fn transmit_frame(frame: &[u8]) -> Result<(), &'static str> {
@@ -858,7 +1097,7 @@ unsafe fn outw(port: u16, value: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, is_supported_e1000, parse_dns_a_response, parse_ipv4, skip_dns_name};
+    use super::{checksum, is_supported_e1000, make_dhcp_message, parse_dhcp_reply, parse_dns_a_response, parse_ipv4, skip_dns_name, valid_netmask, DHCP_MAGIC_COOKIE};
 
     #[test]
     fn recognizes_qemu_e1000_device_id() { assert!(is_supported_e1000(0x100E)); }
@@ -872,6 +1111,64 @@ mod tests {
         assert_eq!(parse_ipv4("1.2.3"), None);
         assert_eq!(parse_ipv4("1..2.3"), None);
     }
+    #[test]
+    fn builds_and_parses_dhcp_discover_message_safely() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let (discover, len) = make_dhcp_message(1, 0x1234_5678, mac, None, None);
+        assert_eq!(discover[0], 1);
+        assert_eq!(u32::from_be_bytes([discover[4], discover[5], discover[6], discover[7]]), 0x1234_5678);
+        assert_eq!(&discover[28..34], &mac);
+        assert_eq!(&discover[236..240], &DHCP_MAGIC_COOKIE);
+        assert_eq!(discover[len - 1], 255);
+        assert!(parse_dhcp_reply(&discover[..len], 0x1234_5678, mac).is_none());
+    }
+
+    #[test]
+    fn parses_dhcp_offer_identity_and_basic_options() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let xid = 0x1020_3040;
+        let (mut packet, mut len) = make_dhcp_message(1, xid, mac, None, None);
+        packet[0] = 2;
+        packet[16..20].copy_from_slice(&[10, 0, 2, 15]);
+        let mut cursor = 240usize;
+        while cursor < len && packet[cursor] != 255 {
+            if packet[cursor] == 0 { cursor += 1; continue; }
+            let option_len = packet[cursor + 1] as usize;
+            if packet[cursor] == 53 { packet[cursor + 2] = 2; }
+            cursor += 2 + option_len;
+        }
+        assert_eq!(packet[cursor], 255);
+        let options = [
+            (1u8, [255u8, 255, 255, 0]),
+            (3u8, [10u8, 0, 2, 2]),
+            (6u8, [10u8, 0, 2, 3]),
+            (54u8, [10u8, 0, 2, 2]),
+        ];
+        for (code, value) in options {
+            packet[cursor] = code;
+            packet[cursor + 1] = 4;
+            packet[cursor + 2..cursor + 6].copy_from_slice(&value);
+            cursor += 6;
+        }
+        packet[cursor] = 255;
+        len = cursor + 1;
+        let parsed = parse_dhcp_reply(&packet[..len], xid, mac).unwrap();
+        assert_eq!(parsed.message_type, 2);
+        assert_eq!(parsed.your_ip, [10, 0, 2, 15]);
+        assert_eq!(parsed.subnet, Some([255, 255, 255, 0]));
+        assert_eq!(parsed.router, Some([10, 0, 2, 2]));
+        assert_eq!(parsed.dns, Some([10, 0, 2, 3]));
+        assert_eq!(parsed.server, Some([10, 0, 2, 2]));
+    }
+
+    #[test]
+    fn validates_subnet_masks() {
+        assert!(valid_netmask([255, 255, 255, 0]));
+        assert!(valid_netmask([255, 255, 0, 0]));
+        assert!(!valid_netmask([255, 0, 255, 0]));
+        assert!(!valid_netmask([0, 0, 0, 0]));
+    }
+
     #[test]
     fn ipv4_checksum_is_zero_after_inserted_checksum() {
         let mut header = [0u8; 20];
