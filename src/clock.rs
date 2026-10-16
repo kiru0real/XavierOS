@@ -87,7 +87,20 @@ pub fn set_timezone(value: &str) -> Result<i32, &'static str> {
 
 /// Synchronize from an NTP server and retain a monotonic baseline in RAM.
 pub fn synchronize(server: &str) -> Result<u64, &'static str> {
-    let epoch = crate::net::ntp_query(server)?;
+    // Preserve the last good time if an NTP attempt fails. Retry once for transient packet loss/timeouts.
+    let epoch = match crate::net::ntp_query(server) {
+        Ok(value) => value,
+        Err(first_error) if !first_error.contains("invalid timestamp") => {
+            let start = interrupts::timer_ticks();
+            let mut spins = 0usize;
+            while interrupts::timer_ticks().wrapping_sub(start) < 10 && spins < 2_000_000 {
+                spins += 1;
+                core::hint::spin_loop();
+            }
+            crate::net::ntp_query(server).map_err(|_| first_error)?
+        }
+        Err(error) => return Err(error),
+    };
     NTP_BASE_EPOCH.store(epoch, Ordering::Relaxed);
     NTP_BASE_TICK.store(interrupts::timer_ticks(), Ordering::Relaxed);
     NTP_SYNCED.store(1, Ordering::Release);

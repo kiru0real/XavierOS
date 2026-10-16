@@ -3,12 +3,12 @@
 //! The driver uses explicitly mapped HHDM MMIO and physically contiguous DMA.
 //! It targets QEMU's emulated E1000 and user-mode NAT: DHCPv4 with a static
 //! fallback, ARP, IPv4, ICMP echo, DNS A records, and UDP-based NTP. It is
-//! single-core and polling-only; TCP, IPv6, and physical NICs are not supported.
+//! single-core and polling-only; one-shot HTTP/1.0 over TCP is supported. TLS, IPv6, and physical NICs are not supported.
 
 use core::arch::asm;
 use core::mem::MaybeUninit;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{compiler_fence, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::{interrupts, memory};
 
@@ -68,6 +68,10 @@ const DEFAULT_DNS_IP: [u8; 4] = [10, 0, 2, 3];
 const DEFAULT_NETMASK: [u8; 4] = [255, 255, 255, 0];
 const DNS_LOCAL_PORT: u16 = 53000;
 const NTP_LOCAL_PORT: u16 = 53123;
+const TCP_LOCAL_PORT_BASE: u16 = 49152;
+const TCP_MAX_PAYLOAD: usize = 1400;
+const HTTP_MAX_REQUEST: usize = 768;
+const HTTP_TIMEOUT_TICKS: u64 = 500; // 5 seconds per synchronous request.
 const DNS_ID: u16 = 0x5841;
 const ICMP_ID: u16 = 0x5841;
 const DHCP_CLIENT_PORT: u16 = 68;
@@ -85,6 +89,10 @@ const STATUS_READY: u8 = 1;
 const STATUS_NOT_FOUND: u8 = 2;
 const STATUS_FAILED: u8 = 3;
 static DRIVER_STATUS: AtomicU8 = AtomicU8::new(STATUS_UNINITIALIZED);
+static TX_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static RX_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static TX_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static RX_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 static TSC_FREQUENCY_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static mut DRIVER_STATE: MaybeUninit<DriverState> = MaybeUninit::uninit();
 
@@ -128,6 +136,40 @@ pub struct NetworkInfo {
     pub gateway: [u8; 4],
     pub dns: [u8; 4],
     pub dhcp: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetworkStats {
+    pub tx_frames: u64,
+    pub rx_frames: u64,
+    pub tx_errors: u64,
+    pub rx_drops: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HttpResponseInfo {
+    pub bytes_received: usize,
+    pub body_offset: usize,
+    pub status_code: u16,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HttpUrl<'a> {
+    host: &'a str,
+    host_header: &'a str,
+    path: &'a str,
+    port: u16,
+}
+
+#[derive(Clone, Copy)]
+struct TcpView<'a> {
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u8,
+    payload: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -347,6 +389,26 @@ pub fn info() -> Option<NetworkInfo> {
         dns: configured_ip(&CONFIG_DNS_IP),
         dhcp: CONFIG_DHCP.load(Ordering::Acquire) != 0,
     })
+}
+
+pub fn statistics() -> NetworkStats {
+    NetworkStats {
+        tx_frames: TX_FRAME_COUNT.load(Ordering::Relaxed),
+        rx_frames: RX_FRAME_COUNT.load(Ordering::Relaxed),
+        tx_errors: TX_ERROR_COUNT.load(Ordering::Relaxed),
+        rx_drops: RX_DROP_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+pub fn check_gateway() -> Result<(), &'static str> {
+    if !is_ready() { return Err("E1000 driver is not ready"); }
+    let network = info().ok_or("network information is unavailable")?;
+    if !network.link_up { return Err("Ethernet link is down"); }
+    resolve_mac(network.gateway).map(|_| ())
+}
+
+pub fn check_dns() -> Result<[u8; 4], &'static str> {
+    resolve_target("example.com")
 }
 
 /// Resolve an IPv4 literal or DNS hostname once before issuing repeated probes.
@@ -769,6 +831,235 @@ pub fn acquire_dhcp() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Parse and fetch a small plain-HTTP resource over one synchronous TCP connection.
+/// HTTPS/TLS, redirects, chunked transfer decoding and persistent connections are not supported.
+pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'static str> {
+    if !is_ready() { return Err("E1000 driver is not ready"); }
+    if output.len() < 128 { return Err("HTTP response buffer must be at least 128 bytes"); }
+    let parsed = parse_http_url(url)?;
+    let destination = resolve_target(parsed.host)?;
+    let destination_mac = resolve_mac(next_hop(destination))?;
+
+    let local_port = TCP_LOCAL_PORT_BASE + (interrupts::timer_ticks() as u16 % 16000);
+    let initial_sequence = (read_tsc() as u32) ^ (interrupts::timer_ticks() as u32) ^ 0x5841_1600;
+    send_tcp_segment(destination, destination_mac, local_port, parsed.port, initial_sequence, 0, 0x02, &[])?;
+
+    let handshake_start = interrupts::timer_ticks();
+    let mut frame = [0u8; MAX_PACKET_SIZE];
+    let mut spins = 0usize;
+    let mut remote_next = 0u32;
+    let mut connected = false;
+    while spins < MAX_POLL_SPINS {
+        spins += 1;
+        if let Some(length) = receive_frame(&mut frame) {
+            if let Some(ip) = parse_ipv4_frame(&frame, length) {
+                if ip.source != destination || ip.destination != configured_ip(&CONFIG_LOCAL_IP) { continue; }
+                if let Some(tcp) = parse_tcp_view(&ip) {
+                    if tcp.source_port != parsed.port || tcp.destination_port != local_port { continue; }
+                    if tcp.flags & 0x04 != 0 { return Err("HTTP TCP connection was reset during handshake"); }
+                    if tcp.flags & 0x12 == 0x12 && tcp.acknowledgement == initial_sequence.wrapping_add(1) {
+                        remote_next = tcp.sequence.wrapping_add(1);
+                        send_tcp_segment(destination, destination_mac, local_port, parsed.port,
+                            initial_sequence.wrapping_add(1), remote_next, 0x10, &[])?;
+                        connected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if interrupts::timer_ticks().wrapping_sub(handshake_start) >= HTTP_TIMEOUT_TICKS {
+            return Err("HTTP TCP handshake timed out");
+        }
+        core::hint::spin_loop();
+    }
+    if !connected { return Err("HTTP TCP handshake hit the polling limit"); }
+
+    let mut request = [0u8; HTTP_MAX_REQUEST];
+    let mut request_len = 0usize;
+    append_bytes(&mut request, &mut request_len, b"GET ")?;
+    append_bytes(&mut request, &mut request_len, parsed.path.as_bytes())?;
+    append_bytes(&mut request, &mut request_len, b" HTTP/1.0\r\nHost: ")?;
+    append_bytes(&mut request, &mut request_len, parsed.host_header.as_bytes())?;
+    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.1.6\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
+    if request_len > TCP_MAX_PAYLOAD { return Err("HTTP request exceeds supported TCP payload size"); }
+
+    let mut local_next = initial_sequence.wrapping_add(1);
+    send_tcp_segment(destination, destination_mac, local_port, parsed.port,
+        local_next, remote_next, 0x18, &request[..request_len])?;
+    local_next = local_next.wrapping_add(request_len as u32);
+
+    let response_start = interrupts::timer_ticks();
+    let mut used = 0usize;
+    let mut truncated = false;
+    let mut peer_closed = false;
+    spins = 0;
+    while spins < MAX_POLL_SPINS {
+        spins += 1;
+        if let Some(length) = receive_frame(&mut frame) {
+            if let Some(ip) = parse_ipv4_frame(&frame, length) {
+                if ip.protocol != 6 || ip.source != destination || ip.destination != configured_ip(&CONFIG_LOCAL_IP) { continue; }
+                let tcp = match parse_tcp_view(&ip) { Some(value) => value, None => continue };
+                if tcp.source_port != parsed.port || tcp.destination_port != local_port { continue; }
+                if tcp.flags & 0x04 != 0 { return Err("HTTP TCP connection was reset by the server"); }
+                if tcp.flags & 0x10 == 0 || tcp.acknowledgement != local_next { continue; }
+
+                let mut ack_needed = false;
+                let payload_len = tcp.payload.len();
+                if payload_len != 0 {
+                    if tcp.sequence == remote_next {
+                        let remaining = output.len().saturating_sub(used);
+                        let copy_len = payload_len.min(remaining);
+                        if copy_len > 0 {
+                            output[used..used + copy_len].copy_from_slice(&tcp.payload[..copy_len]);
+                            used += copy_len;
+                        }
+                        if copy_len < payload_len { truncated = true; }
+                        remote_next = remote_next.wrapping_add(payload_len as u32);
+                        ack_needed = true;
+                    } else {
+                        // Duplicate or out-of-order data: ACK the next expected byte.
+                        ack_needed = true;
+                    }
+                }
+                if tcp.flags & 0x01 != 0 {
+                    let fin_sequence = tcp.sequence.wrapping_add(payload_len as u32);
+                    if fin_sequence == remote_next {
+                        remote_next = remote_next.wrapping_add(1);
+                        peer_closed = true;
+                    }
+                    // A FIN outside the expected sequence is not accepted; ACK the
+                    // current receive edge and keep waiting for in-order data.
+                    ack_needed = true;
+                }
+                if ack_needed {
+                    send_tcp_segment(destination, destination_mac, local_port, parsed.port,
+                        local_next, remote_next, 0x10, &[])?;
+                }
+                if peer_closed {
+                    // Close our half of the connection without waiting indefinitely for the final ACK.
+                    let _ = send_tcp_segment(destination, destination_mac, local_port, parsed.port,
+                        local_next, remote_next, 0x11, &[]);
+                    break;
+                }
+            }
+        }
+        if interrupts::timer_ticks().wrapping_sub(response_start) >= HTTP_TIMEOUT_TICKS {
+            return Err(if used == 0 { "HTTP response timed out" } else { "HTTP response timed out after partial data" });
+        }
+        core::hint::spin_loop();
+    }
+    if spins >= MAX_POLL_SPINS && !peer_closed {
+        return Err("HTTP response hit the polling limit");
+    }
+    if used == 0 { return Err("HTTP server closed without a response"); }
+    let header_end = find_subslice(&output[..used], b"\r\n\r\n").ok_or("HTTP response headers are incomplete or malformed")?;
+    let status_code = parse_http_status(&output[..header_end]).ok_or("HTTP response status line is invalid")?;
+    Ok(HttpResponseInfo { bytes_received: used, body_offset: header_end + 4, status_code, truncated })
+}
+
+fn parse_http_url(url: &str) -> Result<HttpUrl<'_>, &'static str> {
+    let scheme_end = url.find("://").ok_or("URL must start with http:// (HTTPS is not implemented)")?;
+    if !url[..scheme_end].eq_ignore_ascii_case("http") {
+        return Err("only plain HTTP is supported; HTTPS/TLS is not implemented");
+    }
+    let rest = &url[scheme_end + 3..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path = if authority_end == rest.len() { "/" } else { &rest[authority_end..] };
+    if authority.is_empty() || authority.contains('@') || authority.len() > 260 {
+        return Err("invalid HTTP URL authority");
+    }
+    if path.len() > 384 || !path.starts_with('/') || path.bytes().any(|byte| byte < 0x20 || byte == b' ') {
+        return Err("invalid HTTP path or path exceeds 384 bytes");
+    }
+    let (host, port) = if let Some((host, port_text)) = authority.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') || port_text.is_empty() || !port_text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("invalid HTTP host or port");
+        }
+        let mut port = 0u32;
+        for byte in port_text.bytes() { port = port.saturating_mul(10).saturating_add((byte - b'0') as u32); }
+        if port == 0 || port > u16::MAX as u32 { return Err("HTTP port must be between 1 and 65535"); }
+        (host, port as u16)
+    } else { (authority, 80u16) };
+    if host.is_empty() || host.len() > 253 || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return Err("invalid HTTP hostname; IPv6 literals are not supported");
+    }
+    Ok(HttpUrl { host, host_header: authority, path, port })
+}
+
+fn append_bytes(target: &mut [u8], used: &mut usize, bytes: &[u8]) -> Result<(), &'static str> {
+    let end = used.checked_add(bytes.len()).ok_or("buffer length overflow")?;
+    if end > target.len() { return Err("HTTP request is too long"); }
+    target[*used..end].copy_from_slice(bytes);
+    *used = end;
+    Ok(())
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() { return None; }
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn parse_http_status(headers: &[u8]) -> Option<u16> {
+    let end = headers.iter().position(|b| *b == b'\n').unwrap_or(headers.len());
+    let line = headers.get(..end)?.strip_suffix(b"\r").unwrap_or(&headers[..end]);
+    if !line.starts_with(b"HTTP/1.") || line.len() < 12 || line[8] != b' ' { return None; }
+    let digits = line.get(9..12)?;
+    if !digits.iter().all(|b| b.is_ascii_digit()) { return None; }
+    Some(((digits[0] - b'0') as u16) * 100 + ((digits[1] - b'0') as u16) * 10 + (digits[2] - b'0') as u16)
+}
+
+fn parse_tcp_view<'a>(ip: &Ipv4View<'a>) -> Option<TcpView<'a>> {
+    if ip.protocol != 6 || ip.payload.len() < 20 { return None; }
+    let segment = ip.payload;
+    let header_len = ((segment[12] >> 4) as usize).checked_mul(4)?;
+    if header_len < 20 || header_len > segment.len() { return None; }
+    if tcp_checksum_ipv4(ip.source, ip.destination, segment) != 0 { return None; }
+    Some(TcpView {
+        source_port: be16(segment, 0)?,
+        destination_port: be16(segment, 2)?,
+        sequence: u32::from_be_bytes([segment[4], segment[5], segment[6], segment[7]]),
+        acknowledgement: u32::from_be_bytes([segment[8], segment[9], segment[10], segment[11]]),
+        flags: segment[13],
+        payload: &segment[header_len..],
+    })
+}
+
+fn tcp_checksum_ipv4(source: [u8; 4], destination: [u8; 4], segment: &[u8]) -> u16 {
+    if segment.len() > u16::MAX as usize { return 0xFFFF; }
+    let mut sum = 0u32;
+    sum += u16::from_be_bytes([source[0], source[1]]) as u32;
+    sum += u16::from_be_bytes([source[2], source[3]]) as u32;
+    sum += u16::from_be_bytes([destination[0], destination[1]]) as u32;
+    sum += u16::from_be_bytes([destination[2], destination[3]]) as u32;
+    sum += 6; // zero + IP protocol TCP
+    sum += segment.len() as u32;
+    let mut chunks = segment.chunks_exact(2);
+    for pair in &mut chunks { sum += u16::from_be_bytes([pair[0], pair[1]]) as u32; }
+    if let Some(last) = chunks.remainder().first() { sum += (*last as u32) << 8; }
+    while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+    !(sum as u16)
+}
+
+fn send_tcp_segment(destination: [u8; 4], destination_mac: [u8; 6], source_port: u16, destination_port: u16,
+                    sequence: u32, acknowledgement: u32, flags: u8, payload: &[u8]) -> Result<(), &'static str> {
+    if payload.len() > TCP_MAX_PAYLOAD { return Err("TCP payload exceeds supported frame size"); }
+    let mut segment = [0u8; 20 + TCP_MAX_PAYLOAD];
+    put_be16(&mut segment, 0, source_port);
+    put_be16(&mut segment, 2, destination_port);
+    segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+    segment[12] = 5 << 4;
+    segment[13] = flags;
+    put_be16(&mut segment, 14, 64240);
+    put_be16(&mut segment, 16, 0);
+    put_be16(&mut segment, 18, 0);
+    segment[20..20 + payload.len()].copy_from_slice(payload);
+    let checksum_value = tcp_checksum_ipv4(configured_ip(&CONFIG_LOCAL_IP), destination, &segment[..20 + payload.len()]);
+    put_be16(&mut segment, 16, checksum_value);
+    send_ipv4_to_mac(destination, destination_mac, 6, &segment[..20 + payload.len()])
+}
+
 /// Query an NTPv3/v4 server and return validated Unix UTC seconds.
 pub fn ntp_query(server_name: &str) -> Result<u64, &'static str> {
     let server = resolve_target(server_name)?;
@@ -796,9 +1087,16 @@ pub fn ntp_query(server_name: &str) -> Result<u64, &'static str> {
                     let stratum = payload[1];
                     if mode != 4 || !(3..=4).contains(&version) || payload[0] >> 6 == 3 || stratum == 0 || stratum > 15 { continue; }
                     if payload[24..32] != request[40..48] { continue; }
-                    let ntp_seconds = u32::from_be_bytes([payload[40], payload[41], payload[42], payload[43]]) as u64;
-                    if ntp_seconds <= NTP_UNIX_EPOCH_DELTA { return Err("NTP server returned an invalid timestamp"); }
-                    return Ok(ntp_seconds - NTP_UNIX_EPOCH_DELTA);
+                    // Reject unsynchronized or obviously malformed timestamps before changing the clock.
+                    let receive_seconds = u32::from_be_bytes([payload[32], payload[33], payload[34], payload[35]]) as u64;
+                    let transmit_seconds = u32::from_be_bytes([payload[40], payload[41], payload[42], payload[43]]) as u64;
+                    if receive_seconds == 0 || transmit_seconds == 0 || transmit_seconds <= NTP_UNIX_EPOCH_DELTA {
+                        return Err("NTP server returned an invalid timestamp");
+                    }
+                    if transmit_seconds < receive_seconds {
+                        return Err("NTP server returned an invalid timestamp");
+                    }
+                    return Ok(transmit_seconds - NTP_UNIX_EPOCH_DELTA);
                 }
             }
         }
@@ -925,8 +1223,8 @@ fn wait_for_dhcp_reply(xid: u32, mac: [u8; 6], expected_type: u8) -> Result<Dhcp
 }
 
 fn transmit_frame(frame: &[u8]) -> Result<(), &'static str> {
-    if frame.len() < 14 || frame.len() > MAX_FRAME_SIZE { return Err("invalid Ethernet frame size"); }
-    let state_pointer = state_ptr().ok_or("E1000 driver is not ready")?;
+    if frame.len() < 14 || frame.len() > MAX_FRAME_SIZE { TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed); return Err("invalid Ethernet frame size"); }
+    let state_pointer = match state_ptr() { Some(value) => value, None => { TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed); return Err("E1000 driver is not ready"); } };
     let state = unsafe { &mut *state_pointer };
     let index = state.tx_next;
     let desc = unsafe { state.dma_virtual.add(TX_RING_OFFSET + index * DESC_SIZE) };
@@ -937,7 +1235,7 @@ fn transmit_frame(frame: &[u8]) -> Result<(), &'static str> {
         status = unsafe { read_volatile(desc.add(12)) };
         core::hint::spin_loop();
     }
-    if status & DESC_STATUS_DD == 0 { return Err("E1000 transmit descriptor stayed busy"); }
+    if status & DESC_STATUS_DD == 0 { TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed); return Err("E1000 transmit descriptor stayed busy"); }
 
     let buffer = unsafe { state.dma_virtual.add(TX_BUFFERS_OFFSET + index * RX_BUFFER_SIZE) };
     let wire_len = frame.len().max(60);
@@ -959,10 +1257,14 @@ fn transmit_frame(frame: &[u8]) -> Result<(), &'static str> {
 
     let mut spins = 0usize;
     while spins < 2_000_000 {
-        if unsafe { read_volatile(desc.add(12)) } & DESC_STATUS_DD != 0 { return Ok(()); }
+        if unsafe { read_volatile(desc.add(12)) } & DESC_STATUS_DD != 0 {
+            TX_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         spins += 1;
         core::hint::spin_loop();
     }
+    TX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
     Err("E1000 transmit timed out")
 }
 
@@ -978,8 +1280,10 @@ fn receive_frame(output: &mut [u8; MAX_PACKET_SIZE]) -> Option<usize> {
     let packet = unsafe { state.dma_virtual.add(RX_BUFFERS_OFFSET + index * RX_BUFFER_SIZE) };
     let result = if errors == 0 && (14..=RX_BUFFER_SIZE).contains(&length) && length <= output.len() {
         unsafe { core::ptr::copy_nonoverlapping(packet, output.as_mut_ptr(), length); }
+        RX_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
         Some(length)
     } else {
+        RX_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
         None
     };
     unsafe {
@@ -1007,6 +1311,9 @@ fn parse_ipv4_frame(frame: &[u8], frame_len: usize) -> Option<Ipv4View<'_>> {
     let header_len = ((packet[0] & 0x0F) as usize).checked_mul(4)?;
     if header_len < 20 || header_len > packet.len() { return None; }
     let total_len = be16(packet, 2)? as usize;
+    let fragment_field = be16(packet, 6)?;
+    // We do not reassemble fragmented IPv4 datagrams; reject both nonzero offsets and MF.
+    if fragment_field & 0x3FFF != 0 { return None; }
     if total_len < header_len || total_len > packet.len() || checksum(&packet[..header_len]) != 0 { return None; }
     let mut source = [0u8; 4];
     let mut destination = [0u8; 4];
@@ -1097,7 +1404,7 @@ unsafe fn outw(port: u16, value: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, is_supported_e1000, make_dhcp_message, parse_dhcp_reply, parse_dns_a_response, parse_ipv4, skip_dns_name, valid_netmask, DHCP_MAGIC_COOKIE};
+    use super::{checksum, is_supported_e1000, make_dhcp_message, parse_dhcp_reply, parse_dns_a_response, parse_http_status, parse_http_url, parse_ipv4, skip_dns_name, tcp_checksum_ipv4, valid_netmask, DHCP_MAGIC_COOKIE};
 
     #[test]
     fn recognizes_qemu_e1000_device_id() { assert!(is_supported_e1000(0x100E)); }
@@ -1207,4 +1514,40 @@ mod tests {
         message[i..i+4].copy_from_slice(&[93, 184, 216, 34]);
         assert_eq!(parse_dns_a_response(&message), Some([93, 184, 216, 34]));
     }
+    #[test]
+    fn parses_only_supported_safe_http_urls() {
+        let parsed = parse_http_url("http://example.com/path?q=1").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.path, "/path?q=1");
+        assert_eq!(parsed.port, 80);
+        let custom = parse_http_url("http://example.com:8080/").unwrap();
+        assert_eq!(custom.port, 8080);
+        assert_eq!(parse_http_url("https://example.com/"), Err("only plain HTTP is supported; HTTPS/TLS is not implemented"));
+        assert!(parse_http_url("http://user@example.com/").is_err());
+        assert!(parse_http_url("http://example.com:0/").is_err());
+    }
+
+    #[test]
+    fn parses_http_status_line_and_rejects_malformed_status() {
+        assert_eq!(parse_http_status(b"HTTP/1.0 200 OK\r\nContent-Type: text/plain"), Some(200));
+        assert_eq!(parse_http_status(b"HTTP/1.1 404 Not Found\r\n"), Some(404));
+        assert_eq!(parse_http_status(b"NOT HTTP\r\n"), None);
+        assert_eq!(parse_http_status(b"HTTP/1.1 ABC Nope"), None);
+    }
+
+    #[test]
+    fn tcp_checksum_is_zero_when_inserted() {
+        let source = [10, 0, 2, 15];
+        let destination = [93, 184, 216, 34];
+        let mut segment = [0u8; 21];
+        segment[0..2].copy_from_slice(&49152u16.to_be_bytes());
+        segment[2..4].copy_from_slice(&80u16.to_be_bytes());
+        segment[12] = 0x50;
+        segment[13] = 0x10;
+        segment[20] = b'x';
+        let value = tcp_checksum_ipv4(source, destination, &segment);
+        segment[16..18].copy_from_slice(&value.to_be_bytes());
+        assert_eq!(tcp_checksum_ipv4(source, destination, &segment), 0);
+    }
+
 }

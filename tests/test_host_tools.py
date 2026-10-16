@@ -160,7 +160,7 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.5.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.6.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
@@ -179,9 +179,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.5"', cargo)
-        self.assertIn('VERSION = "0.1.5"', package)
-        self.assertIn("Current version: `0.1.5`", readme)
+        self.assertIn('version = "0.1.6"', cargo)
+        self.assertIn('VERSION = "0.1.6"', package)
+        self.assertIn("Current version: `0.1.6`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -228,7 +228,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.5")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.6")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -270,7 +270,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.1.5', main)
+        self.assertIn('VERSION: 0.1.6', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -347,10 +347,62 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.1.5"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.1.5"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
-        self.assertIn("DHCP client and UDP NTP client", readme)
+        self.assertIn('version = "0.1.6"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.1.6"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn("DHCP client", readme)
+        self.assertIn("UDP NTP client", readme)
 
+
+    def test_tcp_http_client_is_bounded_and_documents_tls_limit(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("pub fn http_get(url: &str, output: &mut [u8])", net)
+        self.assertIn("fn parse_http_url(url: &str)", net)
+        self.assertIn("fn parse_tcp_view", net)
+        self.assertIn("tcp_checksum_ipv4", net)
+        self.assertIn("HTTP_TIMEOUT_TICKS", net)
+        self.assertIn('"HTTPGET" =>', main)
+        self.assertIn("HTTPS/TLS IS NOT IMPLEMENTED", main)
+
+    def test_network_diagnostics_and_packet_counters_are_wired(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        for command in ('"NETSTAT" =>', '"NETCHECK" =>'):
+            self.assertIn(command, main)
+        for field in ("TX_FRAME_COUNT", "RX_FRAME_COUNT", "TX_ERROR_COUNT", "RX_DROP_COUNT"):
+            self.assertIn(field, net)
+        self.assertIn("pub fn check_gateway()", net)
+        self.assertIn("pub fn check_dns()", net)
+        self.assertIn("NETCHECK: ALL CHECKS PASSED", main)
+
+    def test_http_url_parser_rejects_https_bad_ports_and_userinfo(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn('"only plain HTTP is supported; HTTPS/TLS is not implemented"', net)
+        self.assertIn("authority.contains('@')", net)
+        self.assertIn('port == 0 || port > u16::MAX as u32', net)
+        self.assertIn('path.len() > 384', net)
+
+    def test_ipv4_fragmented_packets_are_rejected(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("fragment_field & 0x3FFF != 0", net)
+        self.assertIn("We do not reassemble fragmented IPv4 datagrams", net)
+
+    def test_ntp_retries_transient_failures_and_validates_timestamps(self) -> None:
+        clock = (ROOT / "src" / "clock.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("Retry once for transient packet loss/timeouts", clock)
+        self.assertIn("transmit_seconds < receive_seconds", net)
+        self.assertIn("NTP server returned an invalid timestamp", net)
+
+    def test_version_016_includes_http_features_and_release_metadata(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        release = (ROOT / "package_release.py").read_text(encoding="utf-8")
+        cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn("HTTPGET", readme)
+        self.assertIn("NETSTAT", readme)
+        self.assertIn("Current version: `0.1.6`", readme)
+        self.assertIn('VERSION = "0.1.6"', release)
+        self.assertIn('version = "0.1.6"', cargo)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
