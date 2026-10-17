@@ -11,4 +11,4 @@ Try these shell commands:
   FSINFO
   SELFTEST
 
-Version: 0.1.6
+Version: 0.1.7

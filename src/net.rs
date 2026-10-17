@@ -93,6 +93,11 @@ static TX_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static RX_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 static TX_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 static RX_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+static TCP_RETRANSMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static HTTP_REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static HTTP_SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static HTTP_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HTTP_RESPONSE_BYTE_COUNT: AtomicU64 = AtomicU64::new(0);
 static TSC_FREQUENCY_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static mut DRIVER_STATE: MaybeUninit<DriverState> = MaybeUninit::uninit();
 
@@ -144,6 +149,11 @@ pub struct NetworkStats {
     pub rx_frames: u64,
     pub tx_errors: u64,
     pub rx_drops: u64,
+    pub tcp_retransmits: u64,
+    pub http_requests: u64,
+    pub http_successes: u64,
+    pub http_failures: u64,
+    pub http_response_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +407,11 @@ pub fn statistics() -> NetworkStats {
         rx_frames: RX_FRAME_COUNT.load(Ordering::Relaxed),
         tx_errors: TX_ERROR_COUNT.load(Ordering::Relaxed),
         rx_drops: RX_DROP_COUNT.load(Ordering::Relaxed),
+        tcp_retransmits: TCP_RETRANSMIT_COUNT.load(Ordering::Relaxed),
+        http_requests: HTTP_REQUEST_COUNT.load(Ordering::Relaxed),
+        http_successes: HTTP_SUCCESS_COUNT.load(Ordering::Relaxed),
+        http_failures: HTTP_FAILURE_COUNT.load(Ordering::Relaxed),
+        http_response_bytes: HTTP_RESPONSE_BYTE_COUNT.load(Ordering::Relaxed),
     }
 }
 
@@ -831,9 +846,61 @@ pub fn acquire_dhcp() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Parse and fetch a small plain-HTTP resource over one synchronous TCP connection.
-/// HTTPS/TLS, redirects, chunked transfer decoding and persistent connections are not supported.
+/// Fetch a bounded plain-HTTP resource. Follows up to three HTTP redirects; HTTPS/TLS is rejected.
+/// It uses bounded SYN/request retries and validates Content-Length/chunk framing. The client is synchronous and deliberately small, not a general-purpose TCP implementation.
 pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'static str> {
+    HTTP_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+    let result = http_get_follow_redirects(url, output);
+    match result {
+        Ok(info) => {
+            HTTP_SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+            HTTP_RESPONSE_BYTE_COUNT.fetch_add(info.bytes_received as u64, Ordering::Relaxed);
+            Ok(info)
+        }
+        Err(error) => {
+            HTTP_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+    }
+}
+
+const HTTP_MAX_REDIRECTS: usize = 3;
+const HTTP_URL_CAPACITY: usize = 512;
+const TCP_RETRY_INTERVAL_TICKS: u64 = 100; // 1 second at 100 Hz.
+const TCP_SYN_RETRIES: usize = 3;
+const TCP_DATA_RETRIES: usize = 2;
+
+fn http_get_follow_redirects(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'static str> {
+    if url.is_empty() || url.len() >= HTTP_URL_CAPACITY { return Err("HTTP URL is empty or too long"); }
+    let mut current = [0u8; HTTP_URL_CAPACITY];
+    current[..url.len()].copy_from_slice(url.as_bytes());
+    let mut current_len = url.len();
+    for redirect_count in 0..=HTTP_MAX_REDIRECTS {
+        let current_url = core::str::from_utf8(&current[..current_len]).map_err(|_| "HTTP URL is not valid UTF-8")?;
+        let info = http_get_once(current_url, output)?;
+        if !matches!(info.status_code, 301 | 302 | 303 | 307 | 308) {
+            return Ok(info);
+        }
+        let header_end = info.body_offset.checked_sub(4).ok_or("HTTP header boundary is invalid")?;
+        let headers = output.get(..header_end).ok_or("HTTP headers exceed response buffer")?;
+        if count_http_headers(headers, b"location") > 1 {
+            return Err("HTTP redirect contains multiple Location headers");
+        }
+        let location = match find_http_header(headers, b"location") {
+            Some(value) if !value.is_empty() => value,
+            _ => return Ok(info),
+        };
+        if redirect_count == HTTP_MAX_REDIRECTS { return Err("HTTP redirect limit exceeded"); }
+        let mut next = [0u8; HTTP_URL_CAPACITY];
+        let next_len = build_redirect_url(current_url, location, &mut next)?;
+        current = next;
+        current_len = next_len;
+    }
+    Err("HTTP redirect processing failed")
+}
+
+/// Single HTTP/1.0 transaction. Redirect handling is owned by `http_get` above.
+fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'static str> {
     if !is_ready() { return Err("E1000 driver is not ready"); }
     if output.len() < 128 { return Err("HTTP response buffer must be at least 128 bytes"); }
     let parsed = parse_http_url(url)?;
@@ -845,6 +912,8 @@ pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'stat
     send_tcp_segment(destination, destination_mac, local_port, parsed.port, initial_sequence, 0, 0x02, &[])?;
 
     let handshake_start = interrupts::timer_ticks();
+    let mut last_syn_tick = handshake_start;
+    let mut syn_retries = 0usize;
     let mut frame = [0u8; MAX_PACKET_SIZE];
     let mut spins = 0usize;
     let mut remote_next = 0u32;
@@ -867,8 +936,15 @@ pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'stat
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(handshake_start) >= HTTP_TIMEOUT_TICKS {
-            return Err("HTTP TCP handshake timed out");
+        let now = interrupts::timer_ticks();
+        if now.wrapping_sub(handshake_start) >= HTTP_TIMEOUT_TICKS {
+            return Err("HTTP TCP handshake timed out after SYN retries");
+        }
+        if now.wrapping_sub(last_syn_tick) >= TCP_RETRY_INTERVAL_TICKS && syn_retries < TCP_SYN_RETRIES {
+            send_tcp_segment(destination, destination_mac, local_port, parsed.port, initial_sequence, 0, 0x02, &[])?;
+            TCP_RETRANSMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            syn_retries += 1;
+            last_syn_tick = now;
         }
         core::hint::spin_loop();
     }
@@ -880,15 +956,17 @@ pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'stat
     append_bytes(&mut request, &mut request_len, parsed.path.as_bytes())?;
     append_bytes(&mut request, &mut request_len, b" HTTP/1.0\r\nHost: ")?;
     append_bytes(&mut request, &mut request_len, parsed.host_header.as_bytes())?;
-    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.1.6\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
+    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.1.7\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
     if request_len > TCP_MAX_PAYLOAD { return Err("HTTP request exceeds supported TCP payload size"); }
 
-    let mut local_next = initial_sequence.wrapping_add(1);
+    let request_sequence = initial_sequence.wrapping_add(1);
     send_tcp_segment(destination, destination_mac, local_port, parsed.port,
-        local_next, remote_next, 0x18, &request[..request_len])?;
-    local_next = local_next.wrapping_add(request_len as u32);
+        request_sequence, remote_next, 0x18, &request[..request_len])?;
+    let local_next = request_sequence.wrapping_add(request_len as u32);
 
     let response_start = interrupts::timer_ticks();
+    let mut last_request_tick = response_start;
+    let mut request_retries = 0usize;
     let mut used = 0usize;
     let mut truncated = false;
     let mut peer_closed = false;
@@ -943,8 +1021,17 @@ pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'stat
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(response_start) >= HTTP_TIMEOUT_TICKS {
-            return Err(if used == 0 { "HTTP response timed out" } else { "HTTP response timed out after partial data" });
+        let now = interrupts::timer_ticks();
+        if now.wrapping_sub(response_start) >= HTTP_TIMEOUT_TICKS {
+            return Err(if used == 0 { "HTTP response timed out after bounded TCP retries" } else { "HTTP response timed out after partial data" });
+        }
+        if used == 0 && !peer_closed && request_retries < TCP_DATA_RETRIES
+            && now.wrapping_sub(last_request_tick) >= TCP_RETRY_INTERVAL_TICKS {
+            send_tcp_segment(destination, destination_mac, local_port, parsed.port,
+                request_sequence, remote_next, 0x18, &request[..request_len])?;
+            TCP_RETRANSMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            request_retries += 1;
+            last_request_tick = now;
         }
         core::hint::spin_loop();
     }
@@ -954,7 +1041,156 @@ pub fn http_get(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'stat
     if used == 0 { return Err("HTTP server closed without a response"); }
     let header_end = find_subslice(&output[..used], b"\r\n\r\n").ok_or("HTTP response headers are incomplete or malformed")?;
     let status_code = parse_http_status(&output[..header_end]).ok_or("HTTP response status line is invalid")?;
-    Ok(HttpResponseInfo { bytes_received: used, body_offset: header_end + 4, status_code, truncated })
+    let body_offset = header_end + 4;
+    let headers = &output[..header_end];
+    if count_http_headers(headers, b"transfer-encoding") > 1 {
+        return Err("duplicate HTTP Transfer-Encoding headers are rejected");
+    }
+    let transfer_encoding = find_http_header(headers, b"transfer-encoding");
+    let content_length = parse_content_length_header(headers)?;
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err("HTTP response contains both Transfer-Encoding and Content-Length");
+    }
+    let body_available = used.saturating_sub(body_offset);
+    if let Some(encoding) = transfer_encoding {
+        if !encoding.eq_ignore_ascii_case(b"chunked") {
+            return Err("unsupported HTTP Transfer-Encoding");
+        }
+        let decoded = decode_chunked_body(&mut output[body_offset..used])?;
+        used = body_offset + decoded;
+        truncated = false;
+    } else if let Some(expected) = content_length {
+        if expected <= body_available {
+            used = body_offset + expected;
+            truncated = false;
+        } else if used == output.len() {
+            truncated = true;
+        } else if !truncated {
+            return Err("HTTP body ended before Content-Length bytes arrived");
+        }
+    }
+    Ok(HttpResponseInfo { bytes_received: used, body_offset, status_code, truncated })
+}
+
+fn find_http_header<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    for raw_line in headers.split(|byte| *byte == b'\n').skip(1) {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else { continue; };
+        if line[..colon].eq_ignore_ascii_case(name) {
+            let value = &line[colon + 1..];
+            let start = value.iter().position(|byte| *byte != b' ' && *byte != b'\t').unwrap_or(value.len());
+            let end = value.iter().rposition(|byte| *byte != b' ' && *byte != b'\t').map(|index| index + 1).unwrap_or(start);
+            return Some(&value[start..end]);
+        }
+    }
+    None
+}
+
+fn count_http_headers(headers: &[u8], name: &[u8]) -> usize {
+    headers.split(|byte| *byte == b'\n').skip(1).filter(|raw_line| {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        line.iter().position(|byte| *byte == b':')
+            .map(|colon| line[..colon].eq_ignore_ascii_case(name)).unwrap_or(false)
+    }).count()
+}
+
+fn parse_content_length_header(headers: &[u8]) -> Result<Option<usize>, &'static str> {
+    if count_http_headers(headers, b"content-length") > 1 {
+        return Err("duplicate HTTP Content-Length headers are rejected");
+    }
+    let Some(value) = find_http_header(headers, b"content-length") else { return Ok(None); };
+    if value.is_empty() || !value.iter().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid HTTP Content-Length header");
+    }
+    let mut length = 0usize;
+    for byte in value {
+        length = length.checked_mul(10).and_then(|n| n.checked_add((*byte - b'0') as usize))
+            .ok_or("HTTP Content-Length overflow")?;
+    }
+    Ok(Some(length))
+}
+
+fn decode_chunked_body(body: &mut [u8]) -> Result<usize, &'static str> {
+    let mut read = 0usize;
+    let mut written = 0usize;
+    loop {
+        let remaining = body.get(read..).ok_or("invalid chunked body cursor")?;
+        let line_length = find_subslice(remaining, b"\r\n").ok_or("incomplete HTTP chunk-size line")?;
+        let line = &remaining[..line_length];
+        let token_end = line.iter().position(|byte| *byte == b';').unwrap_or(line.len());
+        let token = &line[..token_end];
+        if token.is_empty() || token.len() > 8 || !token.iter().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid HTTP chunk size");
+        }
+        let mut chunk_size = 0usize;
+        for byte in token {
+            let digit = match *byte {
+                b'0'..=b'9' => (*byte - b'0') as usize,
+                b'a'..=b'f' => (*byte - b'a' + 10) as usize,
+                b'A'..=b'F' => (*byte - b'A' + 10) as usize,
+                _ => return Err("invalid HTTP chunk size"),
+            };
+            chunk_size = chunk_size.checked_mul(16).and_then(|n| n.checked_add(digit))
+                .ok_or("HTTP chunk size overflow")?;
+        }
+        read = read.checked_add(line_length + 2).ok_or("HTTP chunk offset overflow")?;
+        if chunk_size == 0 {
+            // Consume the terminating empty trailer line, or bounded trailer fields ending in CRLFCRLF.
+            loop {
+                let tail = body.get(read..).ok_or("invalid HTTP chunk trailer cursor")?;
+                let trailer_length = find_subslice(tail, b"\r\n").ok_or("incomplete HTTP chunk trailer")?;
+                read = read.checked_add(trailer_length + 2).ok_or("HTTP trailer offset overflow")?;
+                if trailer_length == 0 { return Ok(written); }
+            }
+        }
+        let chunk_end = read.checked_add(chunk_size).ok_or("HTTP chunk offset overflow")?;
+        let terminator_end = chunk_end.checked_add(2).ok_or("HTTP chunk offset overflow")?;
+        let data = body.get(read..chunk_end).ok_or("truncated HTTP chunk data")?;
+        if body.get(chunk_end..terminator_end) != Some(&b"\r\n"[..]) {
+            return Err("HTTP chunk data is not followed by CRLF");
+        }
+        let write_end = written.checked_add(data.len()).ok_or("HTTP decoded body overflow")?;
+        if write_end > body.len() { return Err("HTTP decoded body exceeds response buffer"); }
+        body.copy_within(read..chunk_end, written);
+        written = write_end;
+        read = terminator_end;
+    }
+}
+
+fn build_redirect_url(current_url: &str, location: &[u8], output: &mut [u8; HTTP_URL_CAPACITY]) -> Result<usize, &'static str> {
+    if location.is_empty() || location.len() >= output.len()
+        || !location.iter().all(|byte| (0x21..=0x7E).contains(byte))
+        || location.contains(&b'#') {
+        return Err("invalid or unsupported HTTP redirect Location");
+    }
+    let is_absolute_http = location.get(..7).map(|scheme| scheme.eq_ignore_ascii_case(b"http://")).unwrap_or(false);
+    if find_subslice(location, b"://").is_some() && !is_absolute_http {
+        return Err("redirects to HTTPS or unsupported URL schemes are rejected");
+    }
+    let mut used = 0usize;
+    if is_absolute_http {
+        output[..location.len()].copy_from_slice(location);
+        used = location.len();
+    } else {
+        let current = parse_http_url(current_url)?;
+        append_bytes(output, &mut used, b"http://")?;
+        append_bytes(output, &mut used, current.host_header.as_bytes())?;
+        if location.starts_with(b"/") {
+            append_bytes(output, &mut used, location)?;
+        } else if location.starts_with(b"?") {
+            let path = current.path.split('?').next().unwrap_or("/");
+            append_bytes(output, &mut used, path.as_bytes())?;
+            append_bytes(output, &mut used, location)?;
+        } else {
+            let path = current.path.split('?').next().unwrap_or("/");
+            let directory_end = path.rfind('/').map(|index| index + 1).unwrap_or(1);
+            append_bytes(output, &mut used, &path[..directory_end])?;
+            append_bytes(output, &mut used, location)?;
+        }
+    }
+    let text = core::str::from_utf8(&output[..used]).map_err(|_| "redirect URL is not valid UTF-8")?;
+    let _ = parse_http_url(text)?;
+    Ok(used)
 }
 
 fn parse_http_url(url: &str) -> Result<HttpUrl<'_>, &'static str> {
@@ -969,7 +1205,7 @@ fn parse_http_url(url: &str) -> Result<HttpUrl<'_>, &'static str> {
     if authority.is_empty() || authority.contains('@') || authority.len() > 260 {
         return Err("invalid HTTP URL authority");
     }
-    if path.len() > 384 || !path.starts_with('/') || path.bytes().any(|byte| byte < 0x20 || byte == b' ') {
+    if path.len() > 384 || !path.starts_with('/') || path.bytes().any(|byte| byte < 0x20 || byte == b' ' || byte == b'#') {
         return Err("invalid HTTP path or path exceeds 384 bytes");
     }
     let (host, port) = if let Some((host, port_text)) = authority.rsplit_once(':') {
@@ -1404,7 +1640,7 @@ unsafe fn outw(port: u16, value: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, is_supported_e1000, make_dhcp_message, parse_dhcp_reply, parse_dns_a_response, parse_http_status, parse_http_url, parse_ipv4, skip_dns_name, tcp_checksum_ipv4, valid_netmask, DHCP_MAGIC_COOKIE};
+    use super::{build_redirect_url, checksum, decode_chunked_body, find_http_header, is_supported_e1000, make_dhcp_message, parse_content_length_header, parse_dhcp_reply, parse_dns_a_response, parse_http_status, parse_http_url, parse_ipv4, skip_dns_name, tcp_checksum_ipv4, valid_netmask, DHCP_MAGIC_COOKIE};
 
     #[test]
     fn recognizes_qemu_e1000_device_id() { assert!(is_supported_e1000(0x100E)); }
@@ -1548,6 +1784,50 @@ mod tests {
         let value = tcp_checksum_ipv4(source, destination, &segment);
         segment[16..18].copy_from_slice(&value.to_be_bytes());
         assert_eq!(tcp_checksum_ipv4(source, destination, &segment), 0);
+    }
+
+    #[test]
+    fn parses_content_length_without_overflow() {
+        assert_eq!(parse_content_length_header(b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n").unwrap(), Some(12));
+        assert!(parse_content_length_header(b"HTTP/1.0 200 OK\r\nContent-Length: 184467440737095516160\r\n").is_err());
+        assert!(parse_content_length_header(b"HTTP/1.0 200 OK\r\nContent-Length: +1\r\n").is_err());
+    }
+
+    #[test]
+    fn decodes_chunked_body_in_place_and_rejects_truncation() {
+        let mut body = *b"4\r\ntest\r\n0\r\n\r\nxxxxxxxx";
+        let length = decode_chunked_body(&mut body).unwrap();
+        assert_eq!(&body[..length], b"test");
+        let mut truncated = *b"5\r\nno\r\n";
+        let mut invalid_size = *b"Z\r\n";
+        assert!(decode_chunked_body(&mut truncated).is_err());
+        assert!(decode_chunked_body(&mut invalid_size).is_err());
+    }
+
+    #[test]
+    fn follows_only_bounded_http_redirect_targets() {
+        let mut output = [0u8; super::HTTP_URL_CAPACITY];
+        let length = build_redirect_url("http://example.com/a/old", b"/next", &mut output).unwrap();
+        assert_eq!(&output[..length], b"http://example.com/next");
+        assert!(parse_http_url(core::str::from_utf8(&output[..length]).unwrap()).is_ok());
+        assert!(build_redirect_url("http://example.com/", b"https://example.com/", &mut output).is_err());
+    }
+
+    #[test]
+    fn finds_headers_case_insensitively_and_trims_whitespace() {
+        assert_eq!(find_http_header(b"HTTP/1.0 302 Found\r\nLocation:  /next \t\r\n", b"location"), Some(&b"/next"[..]));
+    }
+
+    #[test]
+    fn rejects_ambiguous_duplicate_content_length() {
+        assert!(parse_content_length_header(b"HTTP/1.0 200 OK\r\nContent-Length: 4\r\ncontent-length: 5\r\n").is_err());
+    }
+
+    #[test]
+    fn decodes_chunk_extensions_and_trailers() {
+        let mut body = *b"4;foo=bar\r\ntest\r\n0\r\nX-Test: yes\r\n\r\n";
+        let length = decode_chunked_body(&mut body).unwrap();
+        assert_eq!(&body[..length], b"test");
     }
 
 }

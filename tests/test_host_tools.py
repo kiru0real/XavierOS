@@ -160,7 +160,7 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.6.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.7.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
@@ -179,9 +179,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.6"', cargo)
-        self.assertIn('VERSION = "0.1.6"', package)
-        self.assertIn("Current version: `0.1.6`", readme)
+        self.assertIn('version = "0.1.7"', cargo)
+        self.assertIn('VERSION = "0.1.7"', package)
+        self.assertIn("Current version: `0.1.7`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -228,7 +228,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.6")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.7")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -270,7 +270,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.1.6', main)
+        self.assertIn('VERSION: 0.1.7', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -347,8 +347,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.1.6"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.1.6"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.1.7"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.1.7"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -394,15 +394,49 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("transmit_seconds < receive_seconds", net)
         self.assertIn("NTP server returned an invalid timestamp", net)
 
-    def test_version_016_includes_http_features_and_release_metadata(self) -> None:
+    def test_version_017_includes_fetch_and_release_metadata(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         release = (ROOT / "package_release.py").read_text(encoding="utf-8")
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.1.6`", readme)
-        self.assertIn('VERSION = "0.1.6"', release)
-        self.assertIn('version = "0.1.6"', cargo)
+        self.assertIn("Current version: `0.1.7`", readme)
+        self.assertIn('VERSION = "0.1.7"', release)
+        self.assertIn('version = "0.1.7"', cargo)
+
+
+    def test_http_017_retries_redirects_and_safe_body_decoding_are_wired(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("const HTTP_MAX_REDIRECTS: usize = 3", net)
+        self.assertIn("const TCP_SYN_RETRIES: usize = 3", net)
+        self.assertIn("const TCP_DATA_RETRIES: usize = 2", net)
+        self.assertIn("TCP_RETRANSMIT_COUNT.fetch_add(1, Ordering::Relaxed)", net)
+        self.assertIn("fn decode_chunked_body(body: &mut [u8])", net)
+        self.assertIn("fn parse_content_length_header", net)
+        self.assertIn("duplicate HTTP Content-Length headers are rejected", net)
+        self.assertIn("HTTP response contains both Transfer-Encoding and Content-Length", net)
+        self.assertIn("HTTP redirect limit exceeded", net)
+
+    def test_fetch_is_bounded_user_scoped_and_never_saves_partial_responses(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn('"FETCH" =>', main)
+        self.assertIn("const FETCH_RESPONSE_CAPACITY: usize = 16 * 1024", main)
+        fetch_start = main.index('"FETCH" =>')
+        fetch_end = main.index('"DHCP" =>', fetch_start)
+        fetch = main[fetch_start:fetch_end]
+        self.assertIn("vfs::disk_path(destination).is_none()", fetch)
+        self.assertIn("users::may_access_path(destination)", fetch)
+        self.assertIn("Ok(info) if info.truncated", fetch)
+        self.assertLess(fetch.index("Ok(info) if info.truncated"), fetch.index("vfs::write_file(destination, body)"))
+        self.assertIn("200..300", fetch)
+
+    def test_netstat_reports_http_and_tcp_retry_counters(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        for field in ("tcp_retransmits", "http_requests", "http_successes", "http_failures", "http_response_bytes"):
+            self.assertIn(field, net)
+        for label in ("TCP RETRANSMITS:", "HTTP REQUESTS:", "HTTP SUCCEEDED:", "HTTP FAILED:", "HTTP RESPONSE BYTES:"):
+            self.assertIn(label, main)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

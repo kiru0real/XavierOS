@@ -107,7 +107,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.6\r\n");
+    serial_write("\r\nXavierOS v0.1.7\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -244,6 +244,9 @@ fn halt_forever() -> ! {
 
 const CONSOLE_MAX_COLS: usize = 120;
 const CONSOLE_MAX_LINES: usize = 64;
+const FETCH_RESPONSE_CAPACITY: usize = 16 * 1024;
+static mut FETCH_RESPONSE_BUFFER: [u8; FETCH_RESPONSE_CAPACITY] = [0; FETCH_RESPONSE_CAPACITY];
+
 const CONSOLE_INPUT_CAPACITY: usize = 128;
 const CONSOLE_TEXT_X: usize = 40;
 const CONSOLE_TEXT_Y: usize = 116;
@@ -407,7 +410,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.6 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.7 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -618,7 +621,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.6");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.7");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -939,7 +942,7 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
 }
 
 const COMMAND_COMPLETIONS: &[&str] = &[
-    "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CPU", "DIAG", "DIR", "DISK", "ECHO",
+    "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CPU", "DIAG", "DIR", "DISK", "ECHO", "FETCH",
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "HTTPGET", "IDT",
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
@@ -1288,7 +1291,8 @@ fn process_command(
             console.write_line("NETCHECK    - CHECK LINK, GATEWAY ARP, AND DNS");
             console.write_line("DHCP        - ACQUIRE / RENEW IPV4 CONFIGURATION");
             console.write_line("PING HOST [COUNT] - ICMP ECHO TEST (DEFAULT 4, MAX 8)");
-            console.write_line("HTTPGET URL - FETCH PLAIN HTTP/1.0 (NO TLS/REDIRECT FOLLOWING)");
+            console.write_line("HTTPGET URL - FETCH PLAIN HTTP (BOUNDED REDIRECTS / CHUNKED)");
+            console.write_line("FETCH URL PATH - DOWNLOAD A SMALL HTTP FILE TO /DISK");
             console.write_line("DATE        - SHOW CURRENT LOCAL DATE (RTC OR NTP)");
             console.write_line("TIME        - SHOW CURRENT LOCAL CLOCK TIME");
             console.write_line("DATETIME    - SHOW DATE, TIME, TIMEZONE AND SOURCE");
@@ -1338,7 +1342,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.6");
+            console.write_line("PROJECT VERSION: 0.1.7");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -1347,7 +1351,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.6");
+            console.write_line("VERSION: 0.1.7");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1401,6 +1405,47 @@ fn process_command(
                         write_http_body(console, &response[info.body_offset..info.bytes_received]);
                     }
                     Err(error) => { console.write("HTTPGET FAILED: "); console.write_line(error); }
+                }
+            }
+        },
+        "FETCH" => {
+            let mut parts = arguments.split_whitespace();
+            let url = parts.next().unwrap_or("");
+            let destination = parts.next().unwrap_or("");
+            if url.is_empty() || destination.is_empty() || parts.next().is_some() {
+                console.write_line("USAGE: FETCH http://example.com/file.txt /DISK/HOME/USER/file.txt");
+                console.write_line("ONLY PLAIN HTTP IS SUPPORTED. MAXIMUM RESPONSE BUFFER IS 16 KIB.");
+            } else if vfs::disk_path(destination).is_none() {
+                console.write_line("FETCH DESTINATION MUST BE UNDER /DISK.");
+            } else if !users::may_access_path(destination) {
+                console.write_line("ACCESS DENIED: DESTINATION IS OUTSIDE YOUR HOME.");
+            } else {
+                console.write("FETCH: "); console.write(url); console.write(" -> "); console.write_line(destination);
+                let response = unsafe { &mut *core::ptr::addr_of_mut!(FETCH_RESPONSE_BUFFER) };
+                match net::http_get(url, response) {
+                    Ok(info) if !(200..300).contains(&info.status_code) => {
+                        console.write("FETCH FAILED: HTTP STATUS "); console.write_decimal(info.status_code as u64); console.write_line("");
+                    }
+                    Ok(info) if info.truncated => {
+                        console.write_line("FETCH FAILED: RESPONSE EXCEEDED THE 16 KIB BUFFER; NO FILE WAS WRITTEN.");
+                    }
+                    Ok(info) => {
+                        let body_end = info.body_offset.saturating_add(info.bytes_received.saturating_sub(info.body_offset));
+                        if body_end > response.len() || info.body_offset > body_end {
+                            console.write_line("FETCH FAILED: RESPONSE BOUNDS ARE INVALID; NO FILE WAS WRITTEN.");
+                        } else if !users::may_access_path(destination) {
+                            console.write_line("ACCESS DENIED: DESTINATION IS OUTSIDE YOUR HOME.");
+                        } else {
+                            let body = &response[info.body_offset..body_end];
+                            match vfs::write_file(destination, body) {
+                                Ok(()) => {
+                                    console.write("FETCH COMPLETE: "); console.write_decimal(body.len() as u64); console.write_line(" BYTES SAVED.");
+                                }
+                                Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
+                            }
+                        }
+                    }
+                    Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
                 }
             }
         },
@@ -1745,7 +1790,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.6"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.7"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1861,8 +1906,8 @@ fn show_network(console: &mut Console) {
             console.write("DNS: "); write_ipv4(console, info.dns); console.write_line("");
             console.write("CONFIGURATION: "); console.write_line(if info.dhcp { "DHCP LEASE" } else { "STATIC FALLBACK" });
             console.write_line("PROFILE: QEMU USER NETWORK");
-            console.write_line("SUPPORTED: DHCP / ARP / IPV4 / ICMP / DNS A / NTP / TCP HTTP/1.0");
-            console.write_line("LIMITS: NO HTTPS/TLS, TCP REUSE, IPV6, OR E1000 IRQ MODE");
+            console.write_line("SUPPORTED: DHCP / ARP / IPV4 / ICMP / DNS A / NTP / TCP HTTP");
+            console.write_line("LIMITS: NO HTTPS/TLS, CHUNKED REQUESTS, TCP REUSE, IPV6, OR E1000 IRQ MODE");
         }
         None => {
             console.write_line("NO READY E1000 DEVICE.");
@@ -1886,7 +1931,12 @@ fn show_netstat(console: &mut Console) {
     console.write("RX FRAMES: "); console.write_decimal(stats.rx_frames); console.write_line("");
     console.write("TX ERRORS: "); console.write_decimal(stats.tx_errors); console.write_line("");
     console.write("RX DROPS: "); console.write_decimal(stats.rx_drops); console.write_line("");
-    console.write_line("TCP: ONE-SHOT HTTP/1.0 CLIENT; NO TLS OR PERSISTENT CONNECTIONS");
+    console.write("TCP RETRANSMITS: "); console.write_decimal(stats.tcp_retransmits); console.write_line("");
+    console.write("HTTP REQUESTS: "); console.write_decimal(stats.http_requests); console.write_line("");
+    console.write("HTTP SUCCEEDED: "); console.write_decimal(stats.http_successes); console.write_line("");
+    console.write("HTTP FAILED: "); console.write_decimal(stats.http_failures); console.write_line("");
+    console.write("HTTP RESPONSE BYTES: "); console.write_decimal(stats.http_response_bytes); console.write_line("");
+    console.write_line("TCP: BOUNDED SYN/REQUEST RETRIES; NO TLS OR CONNECTION REUSE");
 }
 
 fn show_netcheck(console: &mut Console) {
@@ -2026,7 +2076,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.6 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.7 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -2367,9 +2417,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.6");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.7");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.6");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.7");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2425,7 +2475,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.1.6"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.1.7"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
