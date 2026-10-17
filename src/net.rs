@@ -1184,7 +1184,7 @@ fn build_redirect_url(current_url: &str, location: &[u8], output: &mut [u8; HTTP
         } else {
             let path = current.path.split('?').next().unwrap_or("/");
             let directory_end = path.rfind('/').map(|index| index + 1).unwrap_or(1);
-            append_bytes(output, &mut used, &path[..directory_end])?;
+            append_bytes(output, &mut used, path[..directory_end].as_bytes())?;
             append_bytes(output, &mut used, location)?;
         }
     }

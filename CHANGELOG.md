@@ -8,6 +8,7 @@
 - Added `FETCH` to save a completed small HTTP response body under `/DISK`, subject to user path permissions.
 - Expanded `NETSTAT` with TCP retries and HTTP request/success/failure/byte counters.
 - Added regression coverage for chunk parsing, redirect target construction, duplicate headers, and FETCH permission/size checks.
+- Fixed a Rust type mismatch when appending relative redirect paths to the HTTP URL buffer.
 - Bumped source and packaging metadata to `0.1.7`.
 
 ## 0.1.6 — Networking and Diagnostics

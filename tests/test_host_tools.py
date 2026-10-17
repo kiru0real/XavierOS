@@ -405,6 +405,11 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('version = "0.1.7"', cargo)
 
 
+    def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("append_bytes(output, &mut used, path[..directory_end].as_bytes())?;", net)
+        self.assertNotIn("append_bytes(output, &mut used, &path[..directory_end])?;", net)
+
     def test_http_017_retries_redirects_and_safe_body_decoding_are_wired(self) -> None:
         net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
         self.assertIn("const HTTP_MAX_REDIRECTS: usize = 3", net)
@@ -416,6 +421,11 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("duplicate HTTP Content-Length headers are rejected", net)
         self.assertIn("HTTP response contains both Transfer-Encoding and Content-Length", net)
         self.assertIn("HTTP redirect limit exceeded", net)
+
+    def test_relative_redirect_path_is_converted_to_bytes_before_append(self) -> None:
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("path[..directory_end].as_bytes()", net)
+        self.assertNotIn("append_bytes(output, &mut used, &path[..directory_end])?", net)
 
     def test_fetch_is_bounded_user_scoped_and_never_saves_partial_responses(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
