@@ -13,6 +13,7 @@ mod crypto;
 mod users;
 mod net;
 mod clock;
+mod config;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -107,7 +108,7 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.7\r\n");
+    serial_write("\r\nXavierOS v0.1.8\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -205,6 +206,15 @@ pub extern "C" fn _start() -> ! {
             serial_write("\r\n");
         }
     }
+    match config::initialize() {
+        Ok(true) => serial_write("Persistent XavierOS configuration loaded.\r\n"),
+        Ok(false) => serial_write("No saved configuration found; defaults are active.\r\n"),
+        Err(error) => {
+            serial_write("Configuration unavailable; safe defaults are active: ");
+            serial_write(error);
+            serial_write("\r\n");
+        }
+    }
     match users::initialize() {
         Ok(()) => {
             serial_write("Local user database ready; initial console identity is live.\r\n");
@@ -218,7 +228,24 @@ pub extern "C" fn _start() -> ! {
     }
 
     match net::initialize() {
-        Ok(()) => serial_write("E1000 network driver initialized (QEMU user-mode network profile 10.0.2.15/24).\r\n"),
+        Ok(()) => {
+            serial_write("E1000 network driver initialized.\r\n");
+            let settings = config::current();
+            if settings.use_dhcp {
+                serial_write("Saved network mode is DHCP; requesting a lease...\r\n");
+                match net::acquire_dhcp() {
+                    Ok(()) => serial_write("DHCP lease acquired during startup.\r\n"),
+                    Err(error) => {
+                        serial_write("DHCP startup request failed; retaining the QEMU fallback profile: ");
+                        serial_write(error);
+                        serial_write("\r\n");
+                    }
+                }
+            } else {
+                net::use_static_fallback();
+                serial_write("Saved network mode is STATIC; using QEMU fallback profile.\r\n");
+            }
+        }
         Err(error) => {
             serial_write("Network unavailable: ");
             serial_write(error);
@@ -410,7 +437,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.7 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.1.8 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -621,7 +648,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.7");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.8");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -640,17 +667,20 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
     }
     interrupts::enable_interrupts();
     console.write_line("");
-    console.write_line("NETWORK: REQUESTING DHCP LEASE...");
-    match net::acquire_dhcp() {
-        Ok(()) => {
-            console.write("DHCP LEASE ACQUIRED: ");
-            if let Some(info) = net::info() { write_ipv4(&mut console, info.local_ip); }
-            console.write_line("");
-        }
-        Err(error) => {
-            console.write("DHCP UNAVAILABLE; KEEPING FALLBACK CONFIGURATION: ");
-            console.write_line(error);
-        }
+    // Network configuration was applied once during kernel startup. Do not blindly
+    // request DHCP again here: a saved STATIC mode must survive entering the shell.
+    let network_settings = config::current();
+    if network_settings.use_dhcp {
+        console.write_line("NETWORK MODE: DHCP (STARTUP RESULT ABOVE; STATIC PROFILE IS THE FALLBACK).");
+    } else {
+        console.write_line("NETWORK MODE: STATIC QEMU PROFILE.");
+    }
+    if let Some(info) = net::info() {
+        console.write("CURRENT IPV4: ");
+        write_ipv4(&mut console, info.local_ip);
+        console.write_line("");
+    } else {
+        console.write_line("NETWORK DEVICE UNAVAILABLE; USE NET FOR DETAILS.");
     }
     console.write_line("");
     write_shell_prompt(&mut console);
@@ -942,11 +972,11 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
 }
 
 const COMMAND_COMPLETIONS: &[&str] = &[
-    "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CPU", "DIAG", "DIR", "DISK", "ECHO", "FETCH",
+    "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CONFIG", "CPU", "DIAG", "DIR", "DISK", "ECHO", "FETCH",
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "HTTPGET", "IDT",
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
-    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING",
+    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING", "REPORT", "SETTINGS",
     "DATE", "DATETIME", "DHCP", "NTP", "TIMEZONE", "NETSTAT", "NETCHECK",
 ];
 
@@ -1289,6 +1319,8 @@ fn process_command(
             console.write_line("NET         - SHOW E1000 / IPV4 CONFIGURATION");
             console.write_line("NETSTAT     - SHOW NETWORK FRAME COUNTERS");
             console.write_line("NETCHECK    - CHECK LINK, GATEWAY ARP, AND DNS");
+            console.write_line("CONFIG      - SHOW/SET/SAVE PERSISTENT OS SETTINGS");
+            console.write_line("REPORT [SAVE PATH] - PRINT OR SAVE A DIAGNOSTIC REPORT");
             console.write_line("DHCP        - ACQUIRE / RENEW IPV4 CONFIGURATION");
             console.write_line("PING HOST [COUNT] - ICMP ECHO TEST (DEFAULT 4, MAX 8)");
             console.write_line("HTTPGET URL - FETCH PLAIN HTTP (BOUNDED REDIRECTS / CHUNKED)");
@@ -1297,7 +1329,7 @@ fn process_command(
             console.write_line("TIME        - SHOW CURRENT LOCAL CLOCK TIME");
             console.write_line("DATETIME    - SHOW DATE, TIME, TIMEZONE AND SOURCE");
             console.write_line("TIMEZONE [UTC|+HH:MM|-HH:MM|+HHMM|-HHMM] - SET FIXED UTC OFFSET");
-            console.write_line("NTP [SERVER] - SYNCHRONIZE WALL CLOCK (DEFAULT CLOUDFLARE)");
+            console.write_line("NTP [SERVER] - SYNCHRONIZE WALL CLOCK (DEFAULT FROM CONFIG)");
             console.write_line("HEAP        - SHOW KERNEL HEAP STATISTICS");
             console.write_line("LS [PATH]   - LIST A VFS DIRECTORY (ALIAS: DIR)");
             console.write_line("CAT PATH    - PRINT A FILE FROM ANY MOUNT");
@@ -1342,7 +1374,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.7");
+            console.write_line("PROJECT VERSION: 0.1.8");
             console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
         }
         "BANNER" => show_banner(console),
@@ -1351,7 +1383,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.7");
+            console.write_line("VERSION: 0.1.8");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1387,6 +1419,8 @@ fn process_command(
         "NET" => show_network(console),
         "NETSTAT" => show_netstat(console),
         "NETCHECK" => show_netcheck(console),
+        "CONFIG" | "SETTINGS" => command_config(console, arguments),
+        "REPORT" => command_report(console, arguments, memory_summary),
         "HTTPGET" => {
             if arguments.is_empty() || arguments.split_whitespace().count() != 1 {
                 console.write_line("USAGE: HTTPGET http://example.com/");
@@ -1418,34 +1452,61 @@ fn process_command(
             } else if vfs::disk_path(destination).is_none() {
                 console.write_line("FETCH DESTINATION MUST BE UNDER /DISK.");
             } else if !users::may_access_path(destination) {
-                console.write_line("ACCESS DENIED: DESTINATION IS OUTSIDE YOUR HOME.");
+                console.write_line("ACCESS DENIED: DESTINATION IS OUTSIDE YOUR HOME OR CONTAINS INVALID PATH COMPONENTS.");
+            } else if vfs::exists(destination) {
+                console.write_line("FETCH REFUSED: DESTINATION ALREADY EXISTS. REMOVE OR RENAME IT FIRST.");
             } else {
-                console.write("FETCH: "); console.write(url); console.write(" -> "); console.write_line(destination);
-                let response = unsafe { &mut *core::ptr::addr_of_mut!(FETCH_RESPONSE_BUFFER) };
-                match net::http_get(url, response) {
-                    Ok(info) if !(200..300).contains(&info.status_code) => {
-                        console.write("FETCH FAILED: HTTP STATUS "); console.write_decimal(info.status_code as u64); console.write_line("");
+                let mut temporary_buffer = [0u8; 800];
+                match fetch_temporary_path(destination, &mut temporary_buffer) {
+                    Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
+                    Ok(temporary_path) if temporary_path.eq_ignore_ascii_case(destination) => {
+                        console.write_line("FETCH FAILED: DESTINATION NAME IS RESERVED FOR TEMPORARY DOWNLOADS.");
                     }
-                    Ok(info) if info.truncated => {
-                        console.write_line("FETCH FAILED: RESPONSE EXCEEDED THE 16 KIB BUFFER; NO FILE WAS WRITTEN.");
+                    Ok(temporary_path) if !users::may_access_path(temporary_path) => {
+                        console.write_line("FETCH FAILED: TEMPORARY PATH IS OUTSIDE YOUR HOME.");
                     }
-                    Ok(info) => {
-                        let body_end = info.body_offset.saturating_add(info.bytes_received.saturating_sub(info.body_offset));
-                        if body_end > response.len() || info.body_offset > body_end {
-                            console.write_line("FETCH FAILED: RESPONSE BOUNDS ARE INVALID; NO FILE WAS WRITTEN.");
-                        } else if !users::may_access_path(destination) {
-                            console.write_line("ACCESS DENIED: DESTINATION IS OUTSIDE YOUR HOME.");
-                        } else {
-                            let body = &response[info.body_offset..body_end];
-                            match vfs::write_file(destination, body) {
-                                Ok(()) => {
-                                    console.write("FETCH COMPLETE: "); console.write_decimal(body.len() as u64); console.write_line(" BYTES SAVED.");
-                                }
-                                Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
+                    Ok(temporary_path) if vfs::exists(temporary_path) => {
+                        console.write("FETCH BLOCKED: TEMPORARY FILE EXISTS: "); console.write_line(temporary_path);
+                        console.write_line("INSPECT OR REMOVE THE LEFTOVER TEMP FILE BEFORE RETRYING.");
+                    }
+                    Ok(temporary_path) => {
+                        console.write("FETCH: "); console.write(url); console.write(" -> "); console.write_line(destination);
+                        console.write_line("DOWNLOAD IS BUFFERED; THE DESTINATION IS NOT CREATED UNTIL THE COMPLETE RESPONSE ARRIVES.");
+                        let response = unsafe { &mut *core::ptr::addr_of_mut!(FETCH_RESPONSE_BUFFER) };
+                        match net::http_get(url, response) {
+                            Ok(info) if !(200..300).contains(&info.status_code) => {
+                                console.write("FETCH FAILED: HTTP STATUS "); console.write_decimal(info.status_code as u64); console.write_line("");
                             }
+                            Ok(info) if info.truncated => {
+                                console.write_line("FETCH FAILED: RESPONSE EXCEEDED THE 16 KIB BUFFER; NO FILE WAS WRITTEN.");
+                            }
+                            Ok(info) => {
+                                let body_end = info.bytes_received;
+                                if info.body_offset <= body_end && body_end <= response.len() {
+                                        if !users::may_access_path(destination) || !users::may_access_path(temporary_path) {
+                                            console.write_line("ACCESS DENIED: PATH PERMISSIONS CHANGED; NO FILE WAS WRITTEN.");
+                                        } else {
+                                            let body = &response[info.body_offset..body_end];
+                                            match vfs::write_file(temporary_path, body) {
+                                                Err(error) => { console.write("FETCH FAILED WHILE WRITING TEMP FILE: "); console.write_line(error); }
+                                                Ok(()) => match vfs::rename_file(temporary_path, destination) {
+                                                    Ok(()) => {
+                                                        console.write("FETCH COMPLETE: "); console.write_decimal(body.len() as u64); console.write_line(" BYTES SAVED.");
+                                                    }
+                                                    Err(error) => {
+                                                        console.write("FETCH COMMIT FAILED: "); console.write_line(error);
+                                                        console.write("COMPLETE TEMP FILE KEPT AT: "); console.write_line(temporary_path);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                    console.write_line("FETCH FAILED: RESPONSE BOUNDS ARE INVALID; NO FILE WAS WRITTEN.");
+                                }
+                            }
+                            Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
                         }
                     }
-                    Err(error) => { console.write("FETCH FAILED: "); console.write_line(error); }
                 }
             }
         },
@@ -1463,7 +1524,8 @@ fn process_command(
             }
         },
         "NTP" => {
-            let server = if arguments.is_empty() { "time.cloudflare.com" } else { arguments };
+            let settings = config::current();
+            let server = if arguments.is_empty() { settings.ntp_server_str() } else { arguments };
             if server.split_whitespace().count() != 1 {
                 console.write_line("USAGE: NTP [SERVER]");
             } else {
@@ -1487,7 +1549,7 @@ fn process_command(
                 console.write_line("USAGE: TIMEZONE [UTC|+HH:MM|-HH:MM|+HHMM|-HHMM]");
             } else {
                 match clock::set_timezone(arguments) {
-                    Ok(_) => { console.write("TIMEZONE SET: "); write_timezone(console); console.write_line(""); show_datetime(console); }
+                    Ok(_) => { let _ = config::set_timezone_minutes(clock::timezone_offset_minutes()); console.write("TIMEZONE SET: "); write_timezone(console); console.write_line(""); show_datetime(console); }
                     Err(error) => { console.write("TIMEZONE ERROR: "); console.write_line(error); }
                 }
             }
@@ -1790,7 +1852,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.7"),
+        "VERSION" => console.write_line("XAVIEROS V0.1.8"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -1872,6 +1934,10 @@ fn process_command(
             if !interrupts::keyboard_is_initialized() { failed = true; }
             console.write_line(if interrupts::timer_ticks() > 0 { "PIT TICK DELIVERY: PASS" } else { "PIT TICK DELIVERY: FAIL" });
             if interrupts::timer_ticks() == 0 { failed = true; }
+            match config::self_test() {
+                Ok(()) => console.write_line("SYSTEM CONFIGURATION SELF-TEST: PASS"),
+                Err(error) => { failed = true; console.write("CONFIG SELF-TEST: FAIL: "); console.write_line(error); }
+            }
             if !failed { console.write_line("ALL SELF-TESTS: PASS"); } else { console.write_line("SELFTEST: ONE OR MORE CHECKS FAILED"); }
         },
         "REBOOT" => reboot_machine(),
@@ -1885,6 +1951,212 @@ fn process_command(
             console.write_line(command);
             console.write_line("TYPE HELP FOR AVAILABLE COMMANDS.");
         }
+    }
+}
+
+fn fetch_temporary_path<'a>(destination: &str, output: &'a mut [u8; 800]) -> Result<&'a str, &'static str> {
+    const TEMP_LEAF: &[u8] = b".XVRFETCH.TMP";
+    if destination.len() > output.len() { return Err("DESTINATION PATH IS TOO LONG"); }
+    let slash = destination.rfind('/').ok_or("DESTINATION MUST BE AN ABSOLUTE /DISK PATH")?;
+    let prefix = &destination.as_bytes()[..slash + 1];
+    let end = prefix.len().checked_add(TEMP_LEAF.len()).ok_or("TEMPORARY PATH LENGTH OVERFLOW")?;
+    if end > output.len() { return Err("TEMPORARY PATH IS TOO LONG"); }
+    output[..prefix.len()].copy_from_slice(prefix);
+    output[prefix.len()..end].copy_from_slice(TEMP_LEAF);
+    core::str::from_utf8(&output[..end]).map_err(|_| "TEMPORARY PATH IS INVALID UTF-8")
+}
+
+fn command_config(console: &mut Console, arguments: &str) {
+    let mut parts = arguments.split_whitespace();
+    let action = parts.next().unwrap_or("SHOW");
+    if action.eq_ignore_ascii_case("SHOW") {
+        if parts.next().is_some() { console.write_line("USAGE: CONFIG [SHOW|SET KEY VALUE|SAVE|RESET]"); return; }
+        show_config(console);
+        return;
+    }
+    if !users::can_manage_accounts() {
+        console.write_line("ACCESS DENIED: CONFIGURATION CHANGES REQUIRE ADMINISTRATOR ACCESS.");
+        return;
+    }
+    if action.eq_ignore_ascii_case("SAVE") {
+        if parts.next().is_some() { console.write_line("USAGE: CONFIG SAVE"); return; }
+        match config::save() {
+            Ok(()) => console.write_line("CONFIGURATION SAVED TO /DISK/SYSTEM (ALTERNATING CHECKSUMMED SLOTS)."),
+            Err(error) => { console.write("CONFIG SAVE FAILED: "); console.write_line(error); }
+        }
+        return;
+    }
+    if action.eq_ignore_ascii_case("RESET") {
+        if parts.next().is_some() { console.write_line("USAGE: CONFIG RESET"); return; }
+        match config::reset_to_defaults() {
+            Ok(()) => {
+                console.write_line("CONFIGURATION RESET TO DEFAULTS AND SAVED.");
+                let settings = config::current();
+                if settings.use_dhcp && net::is_ready() {
+                    match net::acquire_dhcp() {
+                        Ok(()) => console.write_line("DHCP LEASE ACQUIRED."),
+                        Err(error) => { console.write("DHCP FAILED; FALLBACK RETAINED: "); console.write_line(error); }
+                    }
+                } else if net::is_ready() {
+                    net::use_static_fallback();
+                }
+                show_config(console);
+            }
+            Err(error) => { console.write("CONFIG RESET FAILED: "); console.write_line(error); }
+        }
+        return;
+    }
+    if !action.eq_ignore_ascii_case("SET") {
+        console.write_line("USAGE: CONFIG [SHOW|SET KEY VALUE|SAVE|RESET]");
+        return;
+    }
+    let key = parts.next().unwrap_or("");
+    let value = parts.next().unwrap_or("");
+    if key.is_empty() || value.is_empty() || parts.next().is_some() {
+        console.write_line("USAGE: CONFIG SET TIMEZONE +0300 | NTP time.cloudflare.com | NETWORK DHCP|STATIC | TIMEOUT 1-120");
+        return;
+    }
+    let result: Result<(), &'static str> = if key.eq_ignore_ascii_case("TIMEZONE") {
+        clock::set_timezone(value).and_then(|_| config::set_timezone_minutes(clock::timezone_offset_minutes()))
+    } else if key.eq_ignore_ascii_case("NTP") {
+        config::set_ntp_server(value)
+    } else if key.eq_ignore_ascii_case("NETWORK") {
+        if value.eq_ignore_ascii_case("DHCP") {
+            config::set_dhcp(true);
+            if net::is_ready() {
+                match net::acquire_dhcp() {
+                    Ok(()) => Ok(()),
+                    Err(error) => { console.write("DHCP REQUEST FAILED; FALLBACK PROFILE IS STILL ACTIVE: "); console.write_line(error); Ok(()) }
+                }
+            } else { Ok(()) }
+        } else if value.eq_ignore_ascii_case("STATIC") {
+            config::set_dhcp(false);
+            net::use_static_fallback();
+            Ok(())
+        } else {
+            Err("NETWORK MODE MUST BE DHCP OR STATIC")
+        }
+    } else if key.eq_ignore_ascii_case("TIMEOUT") {
+        match value.parse::<u16>() {
+            Ok(seconds) => config::set_timeout(seconds),
+            Err(_) => Err("TIMEOUT MUST BE A NUMBER BETWEEN 1 AND 120"),
+        }
+    } else {
+        Err("UNKNOWN SETTING; USE TIMEZONE, NTP, NETWORK, OR TIMEOUT")
+    };
+    match result {
+        Ok(()) => {
+            console.write("SETTING UPDATED IN MEMORY: "); console.write(key); console.write(" = "); console.write_line(value);
+            console.write_line("RUN CONFIG SAVE TO KEEP THIS CHANGE AFTER REBOOT.");
+        }
+        Err(error) => { console.write("CONFIG SET FAILED: "); console.write_line(error); }
+    }
+}
+
+fn show_config(console: &mut Console) {
+    let settings = config::current();
+    console.write_line("XAVIEROS SYSTEM CONFIGURATION");
+    console.write("NETWORK MODE: "); console.write_line(if settings.use_dhcp { "DHCP (STATIC FALLBACK IF LEASE FAILS)" } else { "STATIC QEMU PROFILE" });
+    console.write("TIMEZONE: "); write_timezone(console); console.write_line("");
+    console.write("PREFERRED NTP SERVER: "); console.write_line(settings.ntp_server_str());
+    console.write("NETWORK TIMEOUT: "); console.write_decimal(settings.timeout_seconds as u64); console.write_line(" SECONDS");
+    console.write("CONFIG GENERATION: "); console.write_decimal(settings.sequence); console.write_line("");
+    if settings.dirty {
+        console.write_line("PERSISTENCE: UNSAVED CHANGES (USE CONFIG SAVE)");
+    } else if settings.loaded_from_disk {
+        console.write_line("PERSISTENCE: LOADED FROM CHECKSUMMED DISK SLOT");
+    } else {
+        console.write_line("PERSISTENCE: DEFAULTS IN USE; NOT YET SAVED");
+    }
+    console.write_line("NOTE: SETTINGS ARE SAVED ONLY WHEN CONFIG SAVE SUCCEEDS.");
+}
+
+struct ReportBuffer<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+    overflow: bool,
+}
+
+impl core::fmt::Write for ReportBuffer<'_> {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let Some(end) = self.len.checked_add(value.len()) else {
+            self.overflow = true;
+            return Err(core::fmt::Error);
+        };
+        if end > self.bytes.len() {
+            self.overflow = true;
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'static str> {
+    use core::fmt::Write as _;
+    let mut out = ReportBuffer { bytes: storage, len: 0, overflow: false };
+    let settings = config::current();
+    let mut name_buffer = [0u8; 16];
+    let username = users::current_name(&mut name_buffer);
+    let (total_tasks, runnable_tasks, switches) = task::stats();
+    let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
+    let _ = writeln!(&mut out, "Version: 0.1.8");
+    let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
+    let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
+    let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
+    if let Some(stats) = heap::stats() { let _ = writeln!(&mut out, "Heap free: {} / {} bytes", stats.free_bytes, stats.capacity_bytes); } else { let _ = writeln!(&mut out, "Heap: unavailable"); }
+    let _ = writeln!(&mut out, "PMM free pages: {}", memory::free_page_count());
+    if let Some(info) = diskfs::info() {
+        let _ = writeln!(&mut out, "Disk: {} | mounted: {} | files: {} | dirs: {}", if info.available { "available" } else { "unavailable" }, info.mounted, info.files, info.directories);
+        let _ = writeln!(&mut out, "Disk data: {} used sectors / {} free sectors", info.used_sectors, info.free_sectors);
+    } else { let _ = writeln!(&mut out, "Disk: statistics unavailable"); }
+    let _ = writeln!(&mut out, "User database: {}", if users::is_initialized() { "ready" } else { "unavailable" });
+    let _ = writeln!(&mut out, "Config: generation {} | {} | timezone {} minutes | NTP {} | timeout {}s", settings.sequence, if settings.use_dhcp { "DHCP" } else { "STATIC" }, settings.timezone_minutes, settings.ntp_server_str(), settings.timeout_seconds);
+    if let Some(info) = net::info() {
+        let _ = write!(&mut out, "Network: {} | IP {}.{}.{}.{} | gateway {}.{}.{}.{} | DNS {}.{}.{}.{}\n", net::status_text(), info.local_ip[0], info.local_ip[1], info.local_ip[2], info.local_ip[3], info.gateway[0], info.gateway[1], info.gateway[2], info.gateway[3], info.dns[0], info.dns[1], info.dns[2], info.dns[3]);
+    } else { let _ = writeln!(&mut out, "Network: unavailable"); }
+    let stats = net::statistics();
+    let _ = writeln!(&mut out, "Network counters: TX {} RX {} TXERR {} RXDROP {}", stats.tx_frames, stats.rx_frames, stats.tx_errors, stats.rx_drops);
+    let _ = writeln!(&mut out, "TCP retransmits: {} | HTTP: {} requests / {} succeeded / {} failed / {} response bytes", stats.tcp_retransmits, stats.http_requests, stats.http_successes, stats.http_failures, stats.http_response_bytes);
+    let _ = writeln!(&mut out, "Scheduler: {} tasks / {} runnable / {} context switches", total_tasks, runnable_tasks, switches);
+    match clock::now_local() {
+        Ok(now) => { let _ = writeln!(&mut out, "Clock: {:04}-{:02}-{:02} {:02}:{:02}:{:02} | source {}", now.year, now.month, now.day, now.hour, now.minute, now.second, clock::source_name()); }
+        Err(_) => { let _ = writeln!(&mut out, "Clock: unavailable"); }
+    }
+    let len = out.len;
+    let overflow = out.overflow;
+    drop(out);
+    if overflow { return Err("REPORT EXCEEDED ITS FIXED BUFFER; NO FILE WAS WRITTEN"); }
+    core::str::from_utf8(&storage[..len]).map_err(|_| "REPORT CONTAINS INVALID UTF-8")
+}
+
+fn command_report(console: &mut Console, arguments: &str, _memory_summary: Option<(MemoryStats, bool)>) {
+    let mut storage = [0u8; 2048];
+    if arguments.is_empty() {
+        match build_diagnostic_report(&mut storage) {
+            Ok(report) => { console.write(report); if !report.ends_with('\n') { console.write_line(""); } }
+            Err(error) => { console.write("REPORT FAILED: "); console.write_line(error); }
+        }
+        return;
+    }
+    let mut parts = arguments.split_whitespace();
+    let action = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    if !action.eq_ignore_ascii_case("SAVE") || path.is_empty() || parts.next().is_some() {
+        console.write_line("USAGE: REPORT  OR  REPORT SAVE /DISK/HOME/USER/REPORT.TXT");
+        return;
+    }
+    if vfs::disk_path(path).is_none() || !users::may_access_path(path) {
+        console.write_line("REPORT SAVE DENIED: USE AN ACCESSIBLE PATH UNDER /DISK.");
+        return;
+    }
+    match build_diagnostic_report(&mut storage) {
+        Ok(report) => match vfs::write_file(path, report.as_bytes()) {
+            Ok(()) => { console.write("DIAGNOSTIC REPORT SAVED TO "); console.write_line(path); }
+            Err(error) => { console.write("REPORT SAVE FAILED: "); console.write_line(error); }
+        },
+        Err(error) => { console.write("REPORT FAILED: "); console.write_line(error); }
     }
 }
 
@@ -2076,7 +2348,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.7 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.1.8 | NO DESKTOP. NO SHORTCUTS.");
     console.write_line("");
 }
 
@@ -2417,9 +2689,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.7");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.8");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.7");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.8");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2475,7 +2747,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.1.7"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.1.8"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);

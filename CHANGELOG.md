@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8 — Persistence and Reliability
+
+- Added a checksummed persistent configuration file with alternating slots to preserve the previous valid copy when a save fails.
+- Added `CONFIG`/`SETTINGS` commands for timezone, preferred NTP server, DHCP/static mode, network timeout, saving, and resetting settings.
+- Added `REPORT` to print a diagnostic report or save it to an accessible disk path.
+- Changed `FETCH` to write to a temporary file and rename it only after receiving a complete valid response; existing destination files are not overwritten.
+- Tightened disk-path traversal rejection before administrator/live-session permission shortcuts.
+- Ensured the console respects the saved DHCP/static mode instead of unconditionally requesting DHCP a second time when the shell starts.
+- Added regression tests for configuration, report generation, transactional fetch, and path traversal.
+- Automatic update notifications are deferred until HTTPS/TLS with certificate validation is implemented; the OS does not contact GitHub over insecure HTTP.
+
 ## 0.1.7 — HTTP Downloads and Network Hardening
 
 - Added bounded TCP SYN and HTTP request retries with retry counters.
@@ -9,7 +20,6 @@
 - Expanded `NETSTAT` with TCP retries and HTTP request/success/failure/byte counters.
 - Added regression coverage for chunk parsing, redirect target construction, duplicate headers, and FETCH permission/size checks.
 - Fixed a Rust type mismatch when appending relative redirect paths to the HTTP URL buffer.
-- Bumped source and packaging metadata to `0.1.7`.
 
 ## 0.1.6 — Networking and Diagnostics
 

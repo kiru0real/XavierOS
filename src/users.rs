@@ -244,6 +244,10 @@ pub fn change_password(old_password: &[u8], new_password: &[u8]) -> Result<(), &
 
 /// Non-live sessions can access the read-only embedded system and their own writable home only.
 pub fn may_access_path(path: &str) -> bool {
+    // Reject traversal before privileged-session shortcuts too.
+    if path.len() > 768 || path.contains("//") || path.split('/').any(|part| part == "." || part == "..") {
+        return false;
+    }
     if vfs::disk_path(path).is_none() { return true; }
     let state = unsafe { &*STATE.get() };
     if !state.initialized { return false; } // fail closed when the account database is unavailable
@@ -253,7 +257,6 @@ pub fn may_access_path(path: &str) -> bool {
     let current_index = state.current as usize;
     if current_index >= state.count || current_index >= MAX_USERS { return false; }
     let clean = path.trim_matches('/');
-    if clean.split('/').any(|part| part == "." || part == "..") { return false; }
     let mut pieces = clean.split('/');
     let Some(mount) = pieces.next() else { return false; };
     let Some(home) = pieces.next() else { return false; };

@@ -48,6 +48,13 @@ pub fn timezone_offset_minutes() -> i32 {
     TIMEZONE_OFFSET_MINUTES.load(Ordering::Acquire)
 }
 
+/// Set an already validated fixed UTC offset in minutes.
+pub fn set_timezone_minutes(minutes: i32) -> Result<(), &'static str> {
+    if !(-840..=840).contains(&minutes) { return Err("timezone offset must be between -14:00 and +14:00"); }
+    TIMEZONE_OFFSET_MINUTES.store(minutes, Ordering::Release);
+    Ok(())
+}
+
 /// Set a manual fixed offset: UTC, +HH:MM or -HH:MM. DST is not inferred.
 pub fn set_timezone(value: &str) -> Result<i32, &'static str> {
     let trimmed = value.trim();
@@ -81,7 +88,7 @@ pub fn set_timezone(value: &str) -> Result<i32, &'static str> {
     }
     let magnitude = hours * 60 + minutes;
     let offset = if bytes[0] == b'-' { -magnitude } else { magnitude };
-    TIMEZONE_OFFSET_MINUTES.store(offset, Ordering::Release);
+    set_timezone_minutes(offset)?;
     Ok(offset)
 }
 

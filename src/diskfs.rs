@@ -524,6 +524,37 @@ pub fn write_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Rename a file within the same directory by committing a single metadata sector.
+/// It refuses to overwrite an existing destination, making it suitable for committing
+/// a fully-downloaded temporary file while preserving an older destination.
+pub fn rename_file(from: &str, to: &str) -> Result<(), &'static str> {
+    let source_path = clean_path(from)?;
+    let destination_path = clean_path(to)?;
+    if source_path.is_empty() || destination_path.is_empty() { return Err("ROOT IS NOT A FILE"); }
+    let (source_parent_path, source_leaf) = split_parent(source_path)?;
+    let (destination_parent_path, destination_leaf) = split_parent(destination_path)?;
+    validate_leaf(destination_leaf)?;
+    let state_ptr = STATE.get();
+    let state = unsafe { &mut *state_ptr };
+    ensure_mounted(state)?;
+    let source_parent = resolve(state, source_parent_path)?;
+    let destination_parent = resolve(state, destination_parent_path)?;
+    if source_parent != destination_parent { return Err("RENAME MUST STAY IN THE SAME DIRECTORY"); }
+    let index = find_child(state, source_parent, source_leaf).ok_or("SOURCE PATH NOT FOUND")?;
+    if state.entries[index].kind != KIND_FILE { return Err("RENAME SOURCE MUST BE A FILE"); }
+    if find_child(state, destination_parent, destination_leaf).is_some() { return Err("DESTINATION ALREADY EXISTS; REFUSING TO OVERWRITE"); }
+    let previous = state.entries[index];
+    let entry = &mut state.entries[index];
+    entry.name.fill(0);
+    entry.name[..destination_leaf.len()].copy_from_slice(destination_leaf.as_bytes());
+    entry.name_len = destination_leaf.len() as u8;
+    if let Err(error) = write_metadata_sector(index / ENTRIES_PER_SECTOR, state) {
+        state.entries[index] = previous;
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn touch(path: &str) -> Result<(), &'static str> {
     let exists = {
         let state = state_ref()?;

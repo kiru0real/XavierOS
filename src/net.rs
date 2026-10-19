@@ -28,7 +28,8 @@ const RX_BUFFER_SIZE: usize = 2048;
 const TX_BUFFERS_OFFSET: usize = RX_BUFFERS_OFFSET + RX_COUNT * RX_BUFFER_SIZE;
 const MAX_FRAME_SIZE: usize = 1518;
 const MAX_PACKET_SIZE: usize = 2048;
-const POLL_TIMEOUT_TICKS: u64 = 300; // 3 seconds at the 100 Hz PIT rate.
+const DEFAULT_NETWORK_TIMEOUT_TICKS: u64 = 500; // 5 seconds at the 100 Hz PIT rate.
+static NETWORK_TIMEOUT_TICKS: AtomicU64 = AtomicU64::new(DEFAULT_NETWORK_TIMEOUT_TICKS);
 const MAX_POLL_SPINS: usize = 40_000_000;
 
 const REG_CTRL: usize = 0x0000;
@@ -71,7 +72,6 @@ const NTP_LOCAL_PORT: u16 = 53123;
 const TCP_LOCAL_PORT_BASE: u16 = 49152;
 const TCP_MAX_PAYLOAD: usize = 1400;
 const HTTP_MAX_REQUEST: usize = 768;
-const HTTP_TIMEOUT_TICKS: u64 = 500; // 5 seconds per synchronous request.
 const DNS_ID: u16 = 0x5841;
 const ICMP_ID: u16 = 0x5841;
 const DHCP_CLIENT_PORT: u16 = 68;
@@ -378,6 +378,15 @@ pub fn is_ready() -> bool {
     DRIVER_STATUS.load(Ordering::Acquire) == STATUS_READY
 }
 
+/// Configure bounded polling timeouts. Values are restricted to 1-120 seconds.
+pub fn set_timeout_seconds(seconds: u16) -> Result<(), &'static str> {
+    if !(1..=120).contains(&seconds) { return Err("network timeout must be between 1 and 120 seconds"); }
+    NETWORK_TIMEOUT_TICKS.store(seconds as u64 * 100, Ordering::Release);
+    Ok(())
+}
+
+fn network_timeout_ticks() -> u64 { NETWORK_TIMEOUT_TICKS.load(Ordering::Acquire) }
+
 pub fn status_text() -> &'static str {
     match DRIVER_STATUS.load(Ordering::Acquire) {
         STATUS_READY => "READY",
@@ -524,7 +533,7 @@ pub fn ping_address(address: [u8; 4], sequence: u16) -> Result<PingReply, &'stat
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(start_tick) >= POLL_TIMEOUT_TICKS {
+        if interrupts::timer_ticks().wrapping_sub(start_tick) >= network_timeout_ticks() {
             return Err("request timed out after 3 seconds");
         }
         core::hint::spin_loop();
@@ -620,7 +629,7 @@ fn resolve_mac(address: [u8; 4]) -> Result<[u8; 6], &'static str> {
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+        if interrupts::timer_ticks().wrapping_sub(start) >= network_timeout_ticks() {
             return Err("ARP resolution timed out; check QEMU user networking");
         }
         core::hint::spin_loop();
@@ -667,7 +676,7 @@ fn resolve_hostname(hostname: &str) -> Result<[u8; 4], &'static str> {
                 if let Some(address) = parse_dns_a_response(dns) { return Ok(address); }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+        if interrupts::timer_ticks().wrapping_sub(start) >= network_timeout_ticks() {
             return Err("DNS query timed out; name resolution failed");
         }
         core::hint::spin_loop();
@@ -796,6 +805,16 @@ fn configured_ip(value: &AtomicU32) -> [u8; 4] {
 
 pub fn dhcp_enabled() -> bool {
     CONFIG_DHCP.load(Ordering::Acquire) != 0
+}
+
+/// Restore the default QEMU user-network IPv4 profile without restarting E1000.
+pub fn use_static_fallback() {
+    CONFIG_LOCAL_IP.store(u32::from_be_bytes(DEFAULT_LOCAL_IP), Ordering::Release);
+    CONFIG_GATEWAY_IP.store(u32::from_be_bytes(DEFAULT_GATEWAY_IP), Ordering::Release);
+    CONFIG_DNS_IP.store(u32::from_be_bytes(DEFAULT_DNS_IP), Ordering::Release);
+    CONFIG_NETMASK.store(u32::from_be_bytes(DEFAULT_NETMASK), Ordering::Release);
+    CONFIG_DHCP.store(0, Ordering::Release);
+    if let Some(pointer) = state_ptr() { unsafe { (*pointer).arp_valid = false; } }
 }
 
 /// Run a bounded DHCP DISCOVER/OFFER/REQUEST/ACK exchange. The existing
@@ -937,7 +956,7 @@ fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'sta
             }
         }
         let now = interrupts::timer_ticks();
-        if now.wrapping_sub(handshake_start) >= HTTP_TIMEOUT_TICKS {
+        if now.wrapping_sub(handshake_start) >= network_timeout_ticks() {
             return Err("HTTP TCP handshake timed out after SYN retries");
         }
         if now.wrapping_sub(last_syn_tick) >= TCP_RETRY_INTERVAL_TICKS && syn_retries < TCP_SYN_RETRIES {
@@ -956,7 +975,7 @@ fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'sta
     append_bytes(&mut request, &mut request_len, parsed.path.as_bytes())?;
     append_bytes(&mut request, &mut request_len, b" HTTP/1.0\r\nHost: ")?;
     append_bytes(&mut request, &mut request_len, parsed.host_header.as_bytes())?;
-    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.1.7\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
+    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.1.8\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
     if request_len > TCP_MAX_PAYLOAD { return Err("HTTP request exceeds supported TCP payload size"); }
 
     let request_sequence = initial_sequence.wrapping_add(1);
@@ -1022,7 +1041,7 @@ fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'sta
             }
         }
         let now = interrupts::timer_ticks();
-        if now.wrapping_sub(response_start) >= HTTP_TIMEOUT_TICKS {
+        if now.wrapping_sub(response_start) >= network_timeout_ticks() {
             return Err(if used == 0 { "HTTP response timed out after bounded TCP retries" } else { "HTTP response timed out after partial data" });
         }
         if used == 0 && !peer_closed && request_retries < TCP_DATA_RETRIES
@@ -1336,7 +1355,7 @@ pub fn ntp_query(server_name: &str) -> Result<u64, &'static str> {
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+        if interrupts::timer_ticks().wrapping_sub(start) >= network_timeout_ticks() {
             return Err("NTP query timed out after 3 seconds");
         }
         core::hint::spin_loop();
@@ -1450,7 +1469,7 @@ fn wait_for_dhcp_reply(xid: u32, mac: [u8; 6], expected_type: u8) -> Result<Dhcp
                 }
             }
         }
-        if interrupts::timer_ticks().wrapping_sub(start) >= POLL_TIMEOUT_TICKS {
+        if interrupts::timer_ticks().wrapping_sub(start) >= network_timeout_ticks() {
             return Err(if expected_type == 2 { "DHCP offer timed out" } else { "DHCP acknowledgement timed out" });
         }
         core::hint::spin_loop();

@@ -48,6 +48,14 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), &'static str> {
     diskfs::write_file(disk_path, contents)
 }
 
+pub fn rename_file(from: &str, to: &str) -> Result<(), &'static str> {
+    let source = disk_path(from).ok_or("RENAME IS ONLY SUPPORTED UNDER /DISK")?;
+    let destination = disk_path(to).ok_or("RENAME IS ONLY SUPPORTED UNDER /DISK")?;
+    diskfs::rename_file(source, destination)
+}
+
+pub fn exists(path: &str) -> bool { stat(path).is_ok() }
+
 pub fn touch(path: &str) -> Result<(), &'static str> {
     let disk_path = disk_path(path).ok_or("TOUCH IS ONLY SUPPORTED UNDER /DISK")?;
     diskfs::touch(disk_path)

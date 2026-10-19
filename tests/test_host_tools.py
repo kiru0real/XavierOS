@@ -160,7 +160,7 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.1.7.iso")
+            self.assertEqual(iso.name, "xavieros-0.1.8.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
@@ -179,9 +179,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.1.7"', cargo)
-        self.assertIn('VERSION = "0.1.7"', package)
-        self.assertIn("Current version: `0.1.7`", readme)
+        self.assertIn('version = "0.1.8"', cargo)
+        self.assertIn('VERSION = "0.1.8"', package)
+        self.assertIn("Current version: `0.1.8`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -228,7 +228,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.7")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.8")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -270,7 +270,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.1.7', main)
+        self.assertIn('VERSION: 0.1.8', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -279,12 +279,12 @@ class RepositoryShapeTests(unittest.TestCase):
         check_body = diskfs[start:end]
         self.assertIn("ata::read_sector", check_body)
         self.assertNotIn("ata::write_sector", check_body)
-        self.assertIn("read-only metadata check", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("FSCK` is a read-only metadata check", (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_fsck_and_df_document_their_safety_boundary(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("does not repair", readme)
-        self.assertIn("read-only metadata check", readme)
+        self.assertIn("FSCK` is a read-only metadata check", readme)
         self.assertIn("DF", readme)
 
     def test_account_auth_is_throttled_and_weak_salt_fallback_removed(self) -> None:
@@ -326,7 +326,8 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("make_dhcp_message(1, xid, mac, None, None)", net)
         self.assertIn("make_dhcp_message(3, xid, mac, Some(offer.your_ip), Some(server))", net)
         self.assertIn("CONFIG_DHCP.store(1, Ordering::Release)", net)
-        self.assertIn("NETWORK: REQUESTING DHCP LEASE", main)
+        self.assertIn("Saved network mode is DHCP; requesting a lease", main)
+        self.assertIn("let network_settings = config::current();", main)
 
     def test_ntp_and_wall_clock_commands_are_wired(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
@@ -341,14 +342,14 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("pub fn ntp_query(server_name: &str)", net)
         self.assertIn("pub fn synchronize(server: &str)", clock)
         self.assertIn("fn read_stable_rtc()", clock)
-        self.assertIn("set a manual fixed UTC offset", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("manual fixed UTC offset", (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_qemu_rtc_uses_utc_and_network_version_is_consistent(self) -> None:
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.1.7"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.1.7"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.1.8"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.1.8"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -360,7 +361,8 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("fn parse_http_url(url: &str)", net)
         self.assertIn("fn parse_tcp_view", net)
         self.assertIn("tcp_checksum_ipv4", net)
-        self.assertIn("HTTP_TIMEOUT_TICKS", net)
+        self.assertIn("network_timeout_ticks()", net)
+        self.assertIn("pub fn set_timeout_seconds", net)
         self.assertIn('"HTTPGET" =>', main)
         self.assertIn("HTTPS/TLS IS NOT IMPLEMENTED", main)
 
@@ -400,9 +402,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.1.7`", readme)
-        self.assertIn('VERSION = "0.1.7"', release)
-        self.assertIn('version = "0.1.7"', cargo)
+        self.assertIn("Current version: `0.1.8`", readme)
+        self.assertIn('VERSION = "0.1.8"', release)
+        self.assertIn('version = "0.1.8"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
@@ -437,7 +439,7 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("vfs::disk_path(destination).is_none()", fetch)
         self.assertIn("users::may_access_path(destination)", fetch)
         self.assertIn("Ok(info) if info.truncated", fetch)
-        self.assertLess(fetch.index("Ok(info) if info.truncated"), fetch.index("vfs::write_file(destination, body)"))
+        self.assertLess(fetch.index("Ok(info) if info.truncated"), fetch.index("vfs::write_file(temporary_path, body)"))
         self.assertIn("200..300", fetch)
 
     def test_netstat_reports_http_and_tcp_retry_counters(self) -> None:
@@ -447,6 +449,62 @@ class RepositoryShapeTests(unittest.TestCase):
             self.assertIn(field, net)
         for label in ("TCP RETRANSMITS:", "HTTP REQUESTS:", "HTTP SUCCEEDED:", "HTTP FAILED:", "HTTP RESPONSE BYTES:"):
             self.assertIn(label, main)
+
+
+    def test_persistent_configuration_is_wired_and_checksummed(self) -> None:
+        config = (ROOT / "src" / "config.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        self.assertIn("XVCFG018", config)
+        self.assertIn("CONFIG.A", config)
+        self.assertIn("CONFIG.B", config)
+        self.assertIn("fn checksum32", config)
+        self.assertIn('"CONFIG" | "SETTINGS" => command_config', main)
+        self.assertIn("CONFIG SET TIMEZONE", main)
+        self.assertIn("CONFIG SET NETWORK", (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("pub fn set_timeout_seconds", net)
+
+    def test_fetch_commits_only_complete_payload_via_temp_rename(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
+        vfs = (ROOT / "src" / "vfs.rs").read_text(encoding="utf-8")
+        self.assertIn(".XVRFETCH.TMP", main)
+        fetch_start = main.index('"FETCH" =>')
+        fetch_end = main.index('"DHCP" =>', fetch_start)
+        fetch = main[fetch_start:fetch_end]
+        self.assertIn("if info.body_offset <= body_end && body_end <= response.len()", fetch)
+        self.assertIn("vfs::write_file(temporary_path, body)", fetch)
+        self.assertIn("vfs::rename_file(temporary_path, destination)", fetch)
+        self.assertIn("DESTINATION ALREADY EXISTS; REFUSING TO OVERWRITE", diskfs)
+        self.assertIn("pub fn rename_file(from: &str, to: &str)", vfs)
+
+    def test_all_disk_paths_reject_traversal_before_privilege_shortcut(self) -> None:
+        users = (ROOT / "src" / "users.rs").read_text(encoding="utf-8")
+        validation = users.index("path.split('/').any(|part| part == \".\" || part == \"..\")")
+        disk_shortcut = users.index('if vfs::disk_path(path).is_none() { return true; }', validation)
+        self.assertLess(validation, disk_shortcut)
+
+    def test_report_and_compact_configuration_docs_are_present(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn('"REPORT" => command_report', main)
+        self.assertIn('"CONFIG" | "SETTINGS" => command_config', main)
+        self.assertIn("REPORT SAVE", readme)
+        self.assertIn("HTTPS/TLS", readme)
+
+    def test_shell_does_not_override_saved_static_network_mode(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        start = main.index("fn run_console(")
+        end = main.index("fn redraw_input(", start)
+        console = main[start:end]
+        self.assertIn("let network_settings = config::current();", console)
+        self.assertIn("if network_settings.use_dhcp", console)
+        self.assertNotIn("net::acquire_dhcp()", console)
+
+    def test_update_check_is_not_claimed_without_https_tls(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Automatic GitHub release checking is not implemented yet", readme)
+        self.assertIn("HTTPS/TLS support is required", readme)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
