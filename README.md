@@ -10,7 +10,7 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
 [![Status](https://img.shields.io/badge/Status-Desktop%20Preview%20Beta-orange)](#status-and-limitations)
 
-**Current version: `0.2.0-beta.1` · First desktop preview**
+**Current version: `0.2.0-beta.1` · First desktop preview(available as pre-release)**
 
 [Русская версия README](README.ru.md)
 
