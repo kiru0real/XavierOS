@@ -10,7 +10,7 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
 [![Status](https://img.shields.io/badge/Status-Desktop%20Preview%20Beta-orange)](#status-and-limitations)
 
-**Current version: `0.2.0-beta.1` · First desktop preview(available as pre-release)**
+**Current version: `0.2.0-beta.2` · Custom cursor and desktop polish**
 
 [Русская версия README](README.ru.md)
 
@@ -20,12 +20,12 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 
 ## About
 
-XavierOS is a small `no_std` Rust kernel for learning low-level systems programming. It boots through Limine, draws directly to the framebuffer, handles PS/2 input, manages physical pages and a kernel heap, and includes an experimental storage and networking stack. Version `0.2.0-beta.1` introduces the first interactive desktop preview with a dock inspired by desktop operating systems.
+XavierOS is a small `no_std` Rust kernel for learning low-level systems programming. It boots through Limine, draws directly to the framebuffer, handles PS/2 input, manages physical pages and a kernel heap, and includes an experimental storage and networking stack. Version `0.2.0-beta.2` refines the existing desktop preview with a transparent custom cursor and more reliable asset-triggered rebuilds.
 
 ## What's included
 
 - **Bare-metal Rust kernel** for `x86_64-unknown-none`, booted with Limine.
-- **Framebuffer UI** with a custom bitmap font, a dark gradient wallpaper, a top menu bar, and a macOS-inspired app dock.
+- **Framebuffer UI** with a custom bitmap font, a full-screen cover-scaled scenic wallpaper, a top menu bar, and a redesigned glass-style app dock with custom vector icons and a transparent 64×64 PNG mouse pointer with alpha blending and a contrast halo.
 - **Mouse and keyboard interaction:** polled PS/2 mouse when available, keyboard dock navigation as a fallback, selectable app icons, Escape to close preview windows, and a Terminal app that opens the existing shell.
 - **Preview apps:** Files lists VFS entries, Network shows the E1000/IPv4 configuration, Clock displays the wall clock, Settings summarizes current config, and About describes the build. These app windows are early in-kernel preview panels, not independent user processes.
 - **Interactive shell:** command history, line editing, Up/Down history, Tab completion, user accounts, filesystem tools, diagnostics, and the neofetch-style `SYSINFO` screen. The shell keeps draining the polled mouse stream so keyboard input is not blocked while Terminal is open. Type `DESKTOP` in Terminal to return to the desktop.
@@ -59,6 +59,10 @@ The build produces `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB d
 
 The desktop is intentionally a preview: Terminal is the real shell; the other apps are simple framebuffer panels backed by existing kernel subsystems. Keyboard shortcuts supplement dock navigation: `T`, `F`, `N`, `C`, `S`, and `A` open Terminal, Files, Network, Clock, Settings, and About.
 
+### Display resolution
+
+Limine chooses the framebuffer mode before the kernel starts. During startup, use the arrow keys and Enter to choose `1024x768`, `1280x720`, or `1366x768`; the first mode boots automatically after 5 seconds. Settings shows the active mode. Resolution cannot be switched live from the in-kernel Settings panel yet because the kernel does not include a runtime video-mode driver. The supplied scenic wallpaper is scaled with a centered cover crop to fill the selected display without distortion or letterboxing.
+
 
 ## Console commands
 
@@ -91,6 +95,7 @@ Commands are currently entered as ASCII text. Use `HELP` for the built-in list. 
 XavierOS/
 ├── .cargo/config.toml
 ├── src/                 # Kernel, memory, storage, network, clock and desktop modules
+├── assets/              # Source wallpaper and embedded RGB bitmap
 ├── tests/               # Host-side build/tooling regression tests
 ├── rootfs/              # Read-only initramfs content
 ├── setup.py

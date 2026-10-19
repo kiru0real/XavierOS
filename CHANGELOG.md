@@ -1,12 +1,23 @@
 # XavierOS Changelog
 
+## 0.2.0-beta.2 — Custom Cursor Polish
+
+- Added the supplied 64×64 transparent PNG pointer and embedded alpha-preserving RGBA data for the no_std framebuffer renderer.
+- Added a light contrast halo so the black pointer remains visible on dark wallpaper and bright windows.
+- Expanded cursor save/restore to cover the sprite, including clipping at the framebuffer edges, while preserving incremental redraw to avoid desktop flicker.
+- Updated all current build, shell, diagnostics, package and documentation version metadata to `0.2.0-beta.2`.
+- Updated build invalidation so changes to `assets/` trigger a rebuild instead of accidentally reusing an older ISO.
+- Preserved the original PNG in `assets/cursor.png`; its transparent background was already present and did not need removal.
+- This release is prepared for local testing only; Rust build and QEMU runtime still need confirmation on the development host.
+
 ## 0.2.0-beta.1 — Desktop Preview
 
-- Added the first framebuffer desktop with a dark gradient wallpaper, menu bar, glass-style dock and six app icons.
+- Added the first framebuffer desktop with a menu bar, full-screen cover-scaled scenic wallpaper, redesigned glass-style dock and six custom vector app icons.
 - Added a polled PS/2 mouse path with keyboard navigation as a fallback.
 - Fixed desktop flicker during mouse movement by restoring/redrawing only the cursor region instead of repainting the full desktop for every mouse packet.
 - Fixed Terminal keyboard starvation by draining the polled PS/2 mouse stream while the shell and password prompts wait for keyboard input.
-- Added Files, Network, Clock, Settings and About preview windows; Terminal opens the existing shell.
+- Added Files, Network, Clock, Settings and About preview windows; Terminal opens the existing shell. Settings displays the active framebuffer resolution.
+- Added Limine startup entries for 1024x768, 1280x720 and 1366x768. Live in-kernel resolution switching remains unsupported until a runtime video-mode driver exists.
 - Added `DESKTOP` to return from Terminal to the desktop.
 - Updated version metadata and documentation for `0.2.0-beta.1`.
 - This is an early in-kernel UI prototype; desktop apps are not isolated user processes.

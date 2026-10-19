@@ -44,6 +44,9 @@ def needs_rebuild() -> bool:
     src_dir = ROOT / "src"
     if src_dir.exists():
         inputs.extend(path for path in src_dir.rglob("*") if path.is_file())
+    assets_dir = ROOT / "assets"
+    if assets_dir.exists():
+        inputs.extend(path for path in assets_dir.rglob("*") if path.is_file())
     rootfs_dir = ROOT / "rootfs"
     if rootfs_dir.exists():
         inputs.extend(path for path in rootfs_dir.rglob("*") if path.is_file())

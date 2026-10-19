@@ -1,4 +1,4 @@
-//! XavierOS Desktop Preview for v0.2.0-beta.1.
+//! XavierOS Desktop Preview for v0.2.0-beta.2.
 //!
 //! A small framebuffer compositor with a macOS-inspired dock. This is an in-kernel
 //! preview: non-terminal apps are information windows, while Terminal opens the
@@ -8,8 +8,13 @@
 use crate::{clock, config, interrupts, net, users, Framebuffer, KeyboardKey, MemoryStats};
 
 const APP_COUNT: usize = 6;
-const CURSOR_SAVE_WIDTH: usize = 16;
-const CURSOR_SAVE_HEIGHT: usize = 22;
+const CURSOR_WIDTH: usize = 64;
+const CURSOR_HEIGHT: usize = 64;
+const CURSOR_SAVE_WIDTH: usize = CURSOR_WIDTH;
+const CURSOR_SAVE_HEIGHT: usize = CURSOR_HEIGHT;
+const CURSOR_HOTSPOT_X: i32 = 16;
+const CURSOR_HOTSPOT_Y: i32 = 6;
+const CURSOR_RGBA: &[u8] = include_bytes!("../assets/cursor.rgba");
 const DOCK_LABEL_SAVE_WIDTH: usize = 64;
 const DOCK_LABEL_SAVE_HEIGHT: usize = 21;
 const APP_FILES: usize = 0;
@@ -18,7 +23,12 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.1";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.2";
+const WALLPAPER_WIDTH: usize = 735;
+const WALLPAPER_HEIGHT: usize = 452;
+// RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
+// raw RGB avoids needing a JPEG decoder inside this no_std kernel.
+const WALLPAPER_RGB: &[u8] = include_bytes!("../assets/wallpaper.rgb");
 const APP_NAMES: [&str; APP_COUNT] = ["FILES", "TERMINAL", "NETWORK", "CLOCK", "SETTINGS", "ABOUT"];
 
 struct DesktopState {
@@ -215,7 +225,6 @@ fn render_desktop(
     dock_label_background: &mut DockLabelBackground,
 ) {
     draw_wallpaper(fb);
-    draw_welcome(fb);
     if let Some(app) = state.open_window {
         draw_app_window(fb, app, memory_summary);
     }
@@ -227,66 +236,49 @@ fn render_desktop(
 fn draw_wallpaper(fb: &Framebuffer) {
     let width = fb.width as usize;
     let height = fb.height as usize;
-    let safe_height = height.max(1);
-    // Deep midnight gradient.
+    if width == 0 || height == 0 || WALLPAPER_RGB.len() < WALLPAPER_WIDTH * WALLPAPER_HEIGHT * 3 {
+        return;
+    }
+
+    // "Cover" scaling: preserve the photo's aspect ratio and crop the centered
+    // excess so every framebuffer pixel is covered (no stretching or black bars).
+    let width_u = width as u64;
+    let height_u = height as u64;
+    let source_w = WALLPAPER_WIDTH as u64;
+    let source_h = WALLPAPER_HEIGHT as u64;
+    let target_is_wider = width_u * source_h >= height_u * source_w;
+    let step_fp: u64;
+    let start_x_fp: u64;
+    let start_y_fp: u64;
+    if target_is_wider {
+        step_fp = (source_w << 16) / width_u;
+        start_x_fp = 0;
+        start_y_fp = ((width_u * source_h - height_u * source_w) << 15) / width_u;
+    } else {
+        step_fp = (source_h << 16) / height_u;
+        start_x_fp = ((height_u * source_w - width_u * source_h) << 15) / height_u;
+        start_y_fp = 0;
+    }
+
     for y in 0..height {
-        let t = (y * 255 / safe_height) as u8;
-        let red = lerp(10, 24, t);
-        let green = lerp(16, 22, t);
-        let blue = lerp(39, 65, t);
-        crate::fill_rect(fb, 0, y, width, 1, color(fb, red, green, blue));
-    }
-
-    let short = width.min(height);
-    let radius = (short * 38 / 100).max(36);
-    let cx = (width * 73 / 100) as i32;
-    let cy = (height * 53 / 100) as i32;
-    fill_circle(fb, cx, cy, radius as i32, color(fb, 47, 37, 112));
-    fill_circle(fb, cx + (radius / 4) as i32, cy - (radius / 7) as i32, (radius * 3 / 4) as i32, color(fb, 31, 35, 88));
-    fill_circle(fb, (width * 36 / 100) as i32, (height * 67 / 100) as i32, (radius * 2 / 3) as i32, color(fb, 22, 104, 139));
-    fill_circle(fb, (width * 36 / 100 + short / 22) as i32, (height * 67 / 100 - short / 36) as i32, (radius / 2) as i32, color(fb, 28, 49, 110));
-
-    // Muted geometric X ribbons, deliberately behind foreground content.
-    let x_center = (width * 70 / 100) as i32;
-    let y_center = (height * 48 / 100) as i32;
-    let span = (short * 24 / 100) as i32;
-    draw_thick_line(fb, x_center - span, y_center - span, x_center + span, y_center + span, 5, color(fb, 66, 75, 147));
-    draw_thick_line(fb, x_center - span, y_center + span, x_center + span, y_center - span, 5, color(fb, 42, 115, 159));
-
-    let stars: [(usize, usize, usize); 18] = [
-        (7, 13, 2), (17, 31, 1), (24, 8, 1), (38, 24, 2), (49, 10, 1), (61, 19, 1),
-        (82, 11, 2), (91, 27, 1), (13, 51, 1), (29, 43, 2), (43, 58, 1), (55, 39, 1),
-        (69, 61, 2), (87, 52, 1), (95, 44, 1), (8, 73, 1), (47, 77, 1), (78, 82, 1),
-    ];
-    for (sx, sy, size) in stars {
-        let x = width * sx / 100;
-        let y = height * sy / 100;
-        crate::fill_rect(fb, x, y, size, size, color(fb, 110, 164, 220));
+        let source_y_fp = start_y_fp + y as u64 * step_fp;
+        let source_y = ((source_y_fp >> 16) as usize).min(WALLPAPER_HEIGHT - 1);
+        let row = unsafe { fb.address.add(y * fb.pitch as usize) as *mut u32 };
+        for x in 0..width {
+            let source_x_fp = start_x_fp + x as u64 * step_fp;
+            let source_x = ((source_x_fp >> 16) as usize).min(WALLPAPER_WIDTH - 1);
+            let source_index = (source_y * WALLPAPER_WIDTH + source_x) * 3;
+            let pixel = color(
+                fb,
+                WALLPAPER_RGB[source_index],
+                WALLPAPER_RGB[source_index + 1],
+                WALLPAPER_RGB[source_index + 2],
+            );
+            unsafe { core::ptr::write_volatile(row.add(x), pixel); }
+        }
     }
 }
 
-fn draw_welcome(fb: &Framebuffer) {
-    let width = fb.width as usize;
-    let scale = if width >= 900 { 3 } else if width >= 600 { 2 } else { 1 };
-    let heading = "HELLO, XAVIER.";
-    crate::draw_text(fb, 54, 134, heading, scale, color(fb, 237, 243, 255));
-    crate::draw_text(fb, 56, 134 + 10 * scale + 16, "YOUR SYSTEM. YOUR SPACE.", if scale > 1 { scale - 1 } else { 1 }, color(fb, 173, 195, 226));
-
-    let card_y = 134 + 10 * scale + 48;
-    let card_w = if width >= 900 { 204 } else if width >= 600 { 154 } else { width.saturating_sub(132) / 2 };
-    let card_h = if width >= 900 { 74 } else { 60 };
-    draw_status_card(fb, 54, card_y, card_w, card_h, "SYSTEM", "DESKTOP PREVIEW", color(fb, 67, 197, 255));
-    let mem_text = "MEMORY READY";
-    draw_status_card(fb, 54 + card_w + 12, card_y, card_w, card_h, "KERNEL", mem_text, color(fb, 117, 224, 185));
-}
-
-fn draw_status_card(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, title: &str, value: &str, accent: u32) {
-    rounded_rect(fb, x + 3, y + 4, w, h, 10, color(fb, 8, 12, 30));
-    rounded_rect(fb, x, y, w, h, 10, color(fb, 20, 29, 58));
-    rounded_rect(fb, x + 10, y + 11, 3, h.saturating_sub(22), 1, accent);
-    crate::draw_text(fb, x + 22, y + 11, title, 1, color(fb, 144, 171, 214));
-    crate::draw_text(fb, x + 22, y + 31, value, if w >= 190 { 2 } else { 1 }, color(fb, 234, 242, 255));
-}
 
 fn draw_menu_bar(fb: &Framebuffer, mouse_ready: bool) {
     let width = fb.width as usize;
@@ -391,31 +383,35 @@ fn draw_dock(fb: &Framebuffer, selected: usize) {
     let dock_x = width.saturating_sub(dock_w) / 2;
     let dock_y = height.saturating_sub(dock_h + 18);
 
-    // Glassy dock surface: opaque midnight glass with a quiet top highlight.
-    rounded_rect(fb, dock_x + 2, dock_y + 5, dock_w, dock_h, 18, color(fb, 5, 8, 22));
-    rounded_rect(fb, dock_x, dock_y, dock_w, dock_h, 18, color(fb, 25, 32, 55));
-    crate::fill_rect(fb, dock_x + 20, dock_y + 2, dock_w.saturating_sub(40), 1, color(fb, 78, 91, 130));
+    // Layered dark glass, a subtle cool rim, and a fine top-edge reflection.
+    rounded_rect(fb, dock_x + 3, dock_y + 6, dock_w, dock_h, 19, color(fb, 2, 5, 13));
+    rounded_rect(fb, dock_x, dock_y, dock_w, dock_h, 18, color(fb, 12, 19, 34));
+    rounded_rect(fb, dock_x + 2, dock_y + 2, dock_w.saturating_sub(4), dock_h.saturating_sub(4), 16, color(fb, 25, 35, 53));
+    crate::fill_rect(fb, dock_x + 22, dock_y + 3, dock_w.saturating_sub(44), 1, color(fb, 101, 137, 169));
+    crate::fill_rect(fb, dock_x + 18, dock_y + dock_h - 3, dock_w.saturating_sub(36), 1, color(fb, 40, 62, 85));
 
     for index in 0..APP_COUNT {
         let slot_x = dock_x + padding + index * slot_w;
-        let icon_size = if !compact && index == selected { 52 } else if compact && index == selected { 33 } else if compact { 28 } else { 44 };
+        let icon_size = if !compact && index == selected { 48 } else if compact && index == selected { 32 } else if compact { 27 } else { 42 };
         let center_x = slot_x + slot_w / 2;
         let icon_x = center_x.saturating_sub(icon_size / 2);
         let icon_y = dock_y + (dock_h.saturating_sub(icon_size)) / 2 - 2;
         if index == selected {
-            rounded_rect(fb, center_x.saturating_sub((slot_w - 5) / 2), dock_y + 7, slot_w - 5, dock_h - 14, 12, color(fb, 45, 57, 87));
+            rounded_rect(fb, center_x.saturating_sub((slot_w - 6) / 2), dock_y + 7, slot_w - 6, dock_h - 14, 12, color(fb, 43, 62, 86));
+            crate::fill_rect(fb, center_x.saturating_sub(10), dock_y + dock_h - 7, 20, 2, color(fb, 98, 221, 255));
         }
         draw_app_icon(fb, index, icon_x, icon_y, icon_size);
         if index == selected {
             let label = APP_NAMES[index];
             let label_w = label.len() * 6;
             let label_x = center_x.saturating_sub(label_w / 2);
-            rounded_rect(fb, label_x.saturating_sub(8), dock_y.saturating_sub(28), label_w + 16, 21, 7, color(fb, 11, 15, 30));
-            crate::draw_text(fb, label_x, dock_y.saturating_sub(22), label, 1, color(fb, 238, 245, 255));
+            rounded_rect(fb, label_x.saturating_sub(8), dock_y.saturating_sub(28), label_w + 16, 21, 7, color(fb, 10, 17, 30));
+            crate::fill_rect(fb, label_x.saturating_sub(3), dock_y.saturating_sub(28), label_w + 6, 1, color(fb, 63, 111, 143));
+            crate::draw_text(fb, label_x, dock_y.saturating_sub(22), label, 1, color(fb, 240, 247, 255));
         }
-        // Small cyan running dot under the terminal icon, even while the shell is hidden.
+        // Cyan status dot marks the Terminal as available in the dock.
         if index == APP_TERMINAL {
-            fill_circle(fb, center_x as i32, (dock_y + dock_h - 4) as i32, 2, color(fb, 93, 220, 255));
+            fill_circle(fb, center_x as i32, (dock_y + dock_h - 4) as i32, 2, color(fb, 99, 227, 204));
         }
     }
 }
@@ -424,55 +420,73 @@ fn draw_app_icon(fb: &Framebuffer, app: usize, x: usize, y: usize, size: usize) 
     let r = (size / 5).max(4);
     match app {
         APP_FILES => {
-            rounded_rect(fb, x + 2, y + size / 4, size.saturating_sub(4), size * 2 / 3, r, color(fb, 54, 137, 232));
-            rounded_rect(fb, x + 3, y + size / 5, size / 2, size / 3, r / 2, color(fb, 102, 191, 255));
-            rounded_rect(fb, x + 3, y + size / 3, size.saturating_sub(6), size / 2, r / 2, color(fb, 66, 165, 250));
-            crate::fill_rect(fb, x + size / 5, y + size / 2, size * 3 / 5, 2, color(fb, 196, 232, 255));
+            // Blue folder with a raised tab and a bright front edge.
+            rounded_rect(fb, x + 1, y + size / 4, size.saturating_sub(2), size * 2 / 3, r, color(fb, 41, 117, 180));
+            rounded_rect(fb, x + 4, y + size / 6, size * 3 / 5, size / 3, r / 2, color(fb, 119, 213, 245));
+            rounded_rect(fb, x + 3, y + size / 3, size.saturating_sub(6), size / 2, r / 2, color(fb, 54, 171, 224));
+            crate::fill_rect(fb, x + size / 5, y + size / 2, size * 3 / 5, 2, color(fb, 194, 242, 255));
         }
         APP_TERMINAL => {
-            rounded_rect(fb, x, y, size, size, r, color(fb, 15, 21, 37));
-            rounded_rect(fb, x + 2, y + 2, size.saturating_sub(4), size.saturating_sub(4), r.saturating_sub(2), color(fb, 27, 39, 57));
+            rounded_rect(fb, x, y, size, size, r, color(fb, 7, 13, 25));
+            rounded_rect(fb, x + 2, y + 2, size.saturating_sub(4), size.saturating_sub(4), r.saturating_sub(2), color(fb, 25, 41, 58));
+            crate::fill_rect(fb, x + 4, y + 6, size.saturating_sub(8), 1, color(fb, 64, 88, 109));
+            for (i, shade) in [color(fb, 255, 112, 120), color(fb, 255, 202, 102), color(fb, 113, 231, 170)].iter().enumerate() {
+                fill_circle(fb, (x + 7 + i * 6) as i32, (y + 7) as i32, 1, *shade);
+            }
             let text_scale = if size >= 44 { 2 } else { 1 };
-            crate::draw_text(fb, x + size / 4, y + size / 3, ">_", text_scale, color(fb, 105, 237, 187));
+            crate::draw_text(fb, x + size / 4, y + size / 2 - 3, ">", text_scale, color(fb, 111, 238, 202));
+            crate::fill_rect(fb, x + size / 2, y + size * 2 / 3, size / 4, 2, color(fb, 111, 238, 202));
         }
         APP_NETWORK => {
-            let node = (size / 7).max(3) as i32;
-            let p1 = (x as i32 + size as i32 / 2, y as i32 + size as i32 / 4);
-            let p2 = (x as i32 + size as i32 / 4, y as i32 + size as i32 * 3 / 4);
-            let p3 = (x as i32 + size as i32 * 3 / 4, y as i32 + size as i32 * 3 / 4);
-            draw_thick_line(fb, p1.0, p1.1, p2.0, p2.1, 3, color(fb, 103, 233, 204));
-            draw_thick_line(fb, p1.0, p1.1, p3.0, p3.1, 3, color(fb, 103, 233, 204));
-            draw_thick_line(fb, p2.0, p2.1, p3.0, p3.1, 3, color(fb, 103, 233, 204));
-            fill_circle(fb, p1.0, p1.1, node, color(fb, 123, 251, 225));
-            fill_circle(fb, p2.0, p2.1, node, color(fb, 123, 251, 225));
-            fill_circle(fb, p3.0, p3.1, node, color(fb, 123, 251, 225));
+            let cx = (x + size / 2) as i32;
+            let cy = (y + size / 2) as i32;
+            fill_circle(fb, cx, cy, (size / 2) as i32, color(fb, 17, 109, 124));
+            fill_circle(fb, cx, cy, (size / 2).saturating_sub(3) as i32, color(fb, 21, 62, 83));
+            let points = [
+                (cx, y as i32 + size as i32 / 4),
+                (x as i32 + size as i32 / 4, y as i32 + size as i32 * 3 / 4),
+                (x as i32 + size as i32 * 3 / 4, y as i32 + size as i32 * 3 / 4),
+            ];
+            draw_thick_line(fb, points[0].0, points[0].1, points[1].0, points[1].1, 2, color(fb, 109, 246, 222));
+            draw_thick_line(fb, points[0].0, points[0].1, points[2].0, points[2].1, 2, color(fb, 109, 246, 222));
+            draw_thick_line(fb, points[1].0, points[1].1, points[2].0, points[2].1, 2, color(fb, 109, 246, 222));
+            for (px, py) in points { fill_circle(fb, px, py, (size / 10).max(2) as i32, color(fb, 171, 255, 239)); }
         }
         APP_CLOCK => {
             let cx = (x + size / 2) as i32;
             let cy = (y + size / 2) as i32;
-            fill_circle(fb, cx, cy, (size / 2) as i32, color(fb, 77, 111, 216));
-            fill_circle(fb, cx, cy, (size / 2).saturating_sub(3) as i32, color(fb, 226, 239, 255));
-            draw_thick_line(fb, cx, cy, cx, cy - (size as i32 / 4), 2, color(fb, 39, 55, 93));
-            draw_thick_line(fb, cx, cy, cx + (size as i32 / 5), cy + (size as i32 / 6), 2, color(fb, 39, 55, 93));
-            fill_circle(fb, cx, cy, (size / 14).max(2) as i32, color(fb, 63, 113, 220));
+            fill_circle(fb, cx, cy, (size / 2) as i32, color(fb, 8, 23, 48));
+            fill_circle(fb, cx, cy, (size / 2).saturating_sub(3) as i32, color(fb, 170, 219, 246));
+            fill_circle(fb, cx, cy, (size / 2).saturating_sub(6) as i32, color(fb, 234, 246, 255));
+            for (dx, dy) in [(0, -1), (1, 0), (0, 1), (-1, 0)] {
+                crate::fill_rect(fb, (cx + dx * (size as i32 / 3)).max(0) as usize, (cy + dy * (size as i32 / 3)).max(0) as usize, 2, 2, color(fb, 49, 93, 127));
+            }
+            draw_thick_line(fb, cx, cy, cx, cy - (size as i32 / 4), 3, color(fb, 27, 68, 105));
+            draw_thick_line(fb, cx, cy, cx + (size as i32 / 5), cy + (size as i32 / 7), 3, color(fb, 24, 143, 177));
+            fill_circle(fb, cx, cy, (size / 12).max(2) as i32, color(fb, 37, 173, 203));
         }
         APP_SETTINGS => {
             let cx = (x + size / 2) as i32;
             let cy = (y + size / 2) as i32;
-            rounded_rect(fb, x, y, size, size, r, color(fb, 104, 117, 143));
-            fill_circle(fb, cx, cy, (size * 3 / 10) as i32, color(fb, 223, 231, 245));
-            fill_circle(fb, cx, cy, (size / 8).max(2) as i32, color(fb, 80, 94, 119));
+            rounded_rect(fb, x, y, size, size, r, color(fb, 48, 65, 91));
+            // Eight teeth around the hub produce a clear gear silhouette.
             for (dx, dy) in [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)] {
-                crate::fill_rect(fb,
-                    (cx + dx * (size as i32 / 3) - 2).max(0) as usize,
-                    (cy + dy * (size as i32 / 3) - 2).max(0) as usize, 4, 4, color(fb, 182, 194, 216));
+                let tooth_size = (size / 6).max(3);
+                let tx = (cx + dx * (size as i32 / 3) - tooth_size as i32 / 2).max(0) as usize;
+                let ty = (cy + dy * (size as i32 / 3) - tooth_size as i32 / 2).max(0) as usize;
+                rounded_rect(fb, tx, ty, tooth_size, tooth_size, 2, color(fb, 185, 208, 230));
             }
+            fill_circle(fb, cx, cy, (size * 3 / 10) as i32, color(fb, 207, 226, 243));
+            fill_circle(fb, cx, cy, (size / 8).max(2) as i32, color(fb, 46, 66, 95));
         }
         _ => {
-            rounded_rect(fb, x, y, size, size, r, color(fb, 51, 170, 224));
-            rounded_rect(fb, x + 2, y + 2, size.saturating_sub(4), size.saturating_sub(4), r.saturating_sub(1), color(fb, 33, 99, 168));
-            let scale = if size >= 44 { 4 } else { 2 };
-            crate::draw_text(fb, x + size / 2 - (6 * scale) / 2, y + size / 2 - (7 * scale) / 2, "X", scale, color(fb, 245, 251, 255));
+            rounded_rect(fb, x, y, size, size, r, color(fb, 12, 52, 89));
+            rounded_rect(fb, x + 2, y + 2, size.saturating_sub(4), size.saturating_sub(4), r.saturating_sub(1), color(fb, 27, 125, 167));
+            let span = (size * 23 / 100) as i32;
+            let cx = x as i32 + size as i32 / 2;
+            let cy = y as i32 + size as i32 / 2;
+            draw_thick_line(fb, cx - span, cy - span, cx + span, cy + span, (size / 12).max(3) as i32, color(fb, 206, 250, 255));
+            draw_thick_line(fb, cx - span, cy + span, cx + span, cy - span, (size / 12).max(3) as i32, color(fb, 111, 227, 255));
         }
     }
 }
@@ -554,7 +568,13 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
             draw_label_value(fb, left, row_y, "TIMEZONE", bytes_text(&timezone), color(fb, 226, 237, 252)); row_y += gap;
             draw_label_value(fb, left, row_y, "NTP SERVER", settings.ntp_server_str(), color(fb, 226, 237, 252)); row_y += gap;
             draw_label_value(fb, left, row_y, "TIMEOUT", bytes_text(&timeout), color(fb, 226, 237, 252)); row_y += gap + 8;
-            crate::draw_text(fb, left, row_y, "EDIT AND SAVE WITH CONFIG IN TERMINAL", 1, color(fb, 155, 176, 207));
+            crate::draw_text(fb, left, row_y, "DISPLAY", 1, color(fb, 104, 220, 255)); row_y += gap;
+            let mut resolution_buffer = [0u8; 24];
+            let resolution = format_resolution(&mut resolution_buffer, fb.width, fb.height);
+            draw_label_value(fb, left, row_y, "CURRENT MODE", resolution, color(fb, 226, 237, 252)); row_y += gap;
+            crate::draw_text(fb, left, row_y, "AVAILABLE: 1024x768 / 1280x720 / 1366x768", 1, color(fb, 226, 237, 252)); row_y += gap;
+            crate::draw_text(fb, left, row_y, "CHOOSE RESOLUTION IN LIMINE STARTUP MENU", 1, color(fb, 155, 176, 207)); row_y += gap;
+            crate::draw_text(fb, left, row_y, "LIVE SWITCHING IS NOT SUPPORTED YET", 1, color(fb, 155, 176, 207));
         }
         _ => {
             crate::draw_text(fb, left, row_y, "XAVIEROS DESKTOP PREVIEW", 2, color(fb, 112, 221, 255)); row_y += gap + 17;
@@ -613,23 +633,25 @@ fn draw_mouse_cursor_saved(fb: &Framebuffer, x: i32, y: i32, background: &mut Cu
 
 fn save_cursor_background(fb: &Framebuffer, x: i32, y: i32, background: &mut CursorBackground) {
     background.valid = false;
-    if x < 0 || y < 0 { return; }
+    let origin_x = x - CURSOR_HOTSPOT_X;
+    let origin_y = y - CURSOR_HOTSPOT_Y;
+    let fb_width = fb.width as i32;
+    let fb_height = fb.height as i32;
+    let left = origin_x.max(0) as usize;
+    let top = origin_y.max(0) as usize;
+    let right = (origin_x + CURSOR_WIDTH as i32).min(fb_width).max(0) as usize;
+    let bottom = (origin_y + CURSOR_HEIGHT as i32).min(fb_height).max(0) as usize;
+    if left >= right || top >= bottom { return; }
 
-    let x = x as usize;
-    let y = y as usize;
-    let fb_width = fb.width as usize;
-    let fb_height = fb.height as usize;
-    if x >= fb_width || y >= fb_height { return; }
-
-    background.x = x;
-    background.y = y;
-    background.width = CURSOR_SAVE_WIDTH.min(fb_width - x);
-    background.height = CURSOR_SAVE_HEIGHT.min(fb_height - y);
+    background.x = left;
+    background.y = top;
+    background.width = right - left;
+    background.height = bottom - top;
     for row_index in 0..background.height {
-        let row = unsafe { fb.address.add((y + row_index) * fb.pitch as usize) as *const u32 };
+        let row = unsafe { fb.address.add((top + row_index) * fb.pitch as usize) as *const u32 };
         for col in 0..background.width {
             background.pixels[row_index * CURSOR_SAVE_WIDTH + col] = unsafe {
-                core::ptr::read_volatile(row.add(x + col))
+                core::ptr::read_volatile(row.add(left + col))
             };
         }
     }
@@ -656,20 +678,90 @@ fn restore_cursor_background(fb: &Framebuffer, background: &mut CursorBackground
 }
 
 fn draw_mouse_cursor(fb: &Framebuffer, x: i32, y: i32) {
-    // Small black outline plus white interior; visible on both dark and bright wallpaper.
-    for row in 0..17i32 {
-        let width = (row / 2 + 1).max(1);
-        for col in 0..width {
-            let px = x + col;
-            let py = y + row;
-            if row == 16 || col == width - 1 || col == 0 {
-                if px >= 0 && py >= 0 { crate::fill_rect(fb, px as usize, py as usize, 1, 1, color(fb, 4, 8, 17)); }
-            } else if px >= 0 && py >= 0 {
-                crate::fill_rect(fb, px as usize, py as usize, 1, 1, color(fb, 250, 252, 255));
+    if CURSOR_RGBA.len() < CURSOR_WIDTH * CURSOR_HEIGHT * 4 { return; }
+    let origin_x = x - CURSOR_HOTSPOT_X;
+    let origin_y = y - CURSOR_HOTSPOT_Y;
+    let fb_width = fb.width as i32;
+    let fb_height = fb.height as i32;
+
+    // Paint a one-pixel near-white halo around the submitted black pointer so it
+    // stays visible over both the dark wallpaper and bright UI panels.
+    for cy in 0..CURSOR_HEIGHT {
+        let py = origin_y + cy as i32;
+        if py < 0 || py >= fb_height { continue; }
+        let row = unsafe { fb.address.add(py as usize * fb.pitch as usize) as *mut u32 };
+        for cx in 0..CURSOR_WIDTH {
+            let px = origin_x + cx as i32;
+            if px < 0 || px >= fb_width { continue; }
+            let index = (cy * CURSOR_WIDTH + cx) * 4;
+            let alpha = CURSOR_RGBA[index + 3];
+            if alpha == 0 {
+                if cursor_has_neighbor(cx, cy) {
+                    blend_cursor_pixel(fb, row, px as usize, 242, 247, 255, 225);
+                }
+            } else {
+                blend_cursor_pixel(
+                    fb,
+                    row,
+                    px as usize,
+                    CURSOR_RGBA[index],
+                    CURSOR_RGBA[index + 1],
+                    CURSOR_RGBA[index + 2],
+                    alpha,
+                );
             }
         }
     }
-    draw_thick_line(fb, x + 6, y + 11, x + 10, y + 18, 2, color(fb, 3, 7, 16));
+}
+
+fn cursor_has_neighbor(x: usize, y: usize) -> bool {
+    let top = y.saturating_sub(1);
+    let bottom = (y + 1).min(CURSOR_HEIGHT - 1);
+    let left = x.saturating_sub(1);
+    let right = (x + 1).min(CURSOR_WIDTH - 1);
+    for ny in top..=bottom {
+        for nx in left..=right {
+            if nx == x && ny == y { continue; }
+            if CURSOR_RGBA[(ny * CURSOR_WIDTH + nx) * 4 + 3] >= 64 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn blend_cursor_pixel(
+    fb: &Framebuffer,
+    row: *mut u32,
+    x: usize,
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+) {
+    if alpha == 0 { return; }
+    let destination = unsafe { core::ptr::read_volatile(row.add(x)) };
+    let dest_red = unpack_channel(destination, fb.red_mask_size, fb.red_mask_shift);
+    let dest_green = unpack_channel(destination, fb.green_mask_size, fb.green_mask_shift);
+    let dest_blue = unpack_channel(destination, fb.blue_mask_size, fb.blue_mask_shift);
+    let inverse = 255 - alpha as u16;
+    let blend = |source: u8, dest: u8| {
+        ((source as u16 * alpha as u16 + dest as u16 * inverse + 127) / 255) as u8
+    };
+    let output = crate::rgb(
+        fb,
+        blend(red, dest_red),
+        blend(green, dest_green),
+        blend(blue, dest_blue),
+    );
+    unsafe { core::ptr::write_volatile(row.add(x), output); }
+}
+
+fn unpack_channel(pixel: u32, size: u8, shift: u8) -> u8 {
+    if size == 0 || size > 8 || shift >= 32 { return 0; }
+    let max = (1u32 << size) - 1;
+    let value = (pixel >> shift) & max;
+    ((value * 255 + max / 2) / max) as u8
 }
 
 fn rounded_rect(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, radius: usize, shade: u32) {
@@ -753,6 +845,14 @@ fn format_mac(mac: &[u8; 6]) -> [u8; 17] {
         push_byte(&mut buffer, &mut used, HEX[(value & 0x0F) as usize]);
     }
     buffer
+}
+
+fn format_resolution(buffer: &mut [u8; 24], width: u64, height: u64) -> &str {
+    let mut used = 0usize;
+    push_num(buffer, &mut used, width, 1);
+    push_byte(buffer, &mut used, b'x');
+    push_num(buffer, &mut used, height, 1);
+    core::str::from_utf8(&buffer[..used]).unwrap_or("UNKNOWN")
 }
 
 fn format_datetime(buffer: &mut [u8; 24], now: clock::DateTime) -> &str {
