@@ -15,6 +15,9 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 static KEYBOARD_HEAD: AtomicUsize = AtomicUsize::new(0);
 static KEYBOARD_TAIL: AtomicUsize = AtomicUsize::new(0);
 static KEYBOARD_DROPPED: AtomicU64 = AtomicU64::new(0);
+static MOUSE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static MOUSE_PACKET_INDEX: AtomicU8 = AtomicU8::new(0);
+static MOUSE_PACKET: [AtomicU8; 3] = [const { AtomicU8::new(0) }; 3];
 const KEYBOARD_QUEUE_CAPACITY: usize = 256;
 static KEYBOARD_QUEUE: [AtomicU8; KEYBOARD_QUEUE_CAPACITY] =
     [const { AtomicU8::new(0) }; KEYBOARD_QUEUE_CAPACITY];
@@ -247,6 +250,106 @@ unsafe fn wait_ps2_output_full() -> bool {
     for _ in 0..1_000_000 {
         if unsafe { inb(0x64) } & 0x01 != 0 { return true; }
         core::hint::spin_loop();
+    }
+    false
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MousePacket {
+    /// Signed horizontal motion since the previous packet.
+    pub dx: i16,
+    /// Signed PS/2 vertical motion; positive values mean upward motion.
+    pub dy: i16,
+    /// Button bitfield: bit 0 left, bit 1 right, bit 2 middle.
+    pub buttons: u8,
+}
+
+/// Initialize a PS/2 auxiliary mouse in polling mode. IRQ12 remains masked, so
+/// mouse packets cannot be mistaken for keyboard scancodes by the IRQ dispatcher.
+pub fn initialize_ps2_mouse() -> bool {
+    unsafe {
+        // Drain stale output while global interrupts are still disabled during boot.
+        for _ in 0..100_000 {
+            let status = inb(0x64);
+            if status & 0x01 == 0 { break; }
+            let _ = inb(0x60);
+        }
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x64, 0xA8); // Enable auxiliary PS/2 port.
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x64, 0x20); // Read controller configuration.
+        if !wait_ps2_output_full() { return false; }
+        let mut config = inb(0x60);
+        config &= !0x20; // Enable auxiliary clock.
+        config &= !0x02; // Keep IRQ12 disabled; desktop polls AUX output bytes.
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x64, 0x60);
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x60, config);
+    }
+    if !send_mouse_command(0xF6) || !send_mouse_command(0xF4) {
+        MOUSE_INITIALIZED.store(false, Ordering::Release);
+        return false;
+    }
+    MOUSE_PACKET_INDEX.store(0, Ordering::Relaxed);
+    MOUSE_INITIALIZED.store(true, Ordering::Release);
+    true
+}
+
+pub fn mouse_is_initialized() -> bool {
+    MOUSE_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Poll at most 8 AUX bytes and return a complete 3-byte standard PS/2 packet.
+/// Keyboard data is left to IRQ1 and is never read by this function.
+pub fn poll_mouse_packet() -> Option<MousePacket> {
+    if !MOUSE_INITIALIZED.load(Ordering::Acquire) { return None; }
+    for _ in 0..8 {
+        let status = unsafe { inb(0x64) };
+        if status & 0x01 == 0 || status & 0x20 == 0 { return None; }
+        let byte = unsafe { inb(0x60) };
+        let index = MOUSE_PACKET_INDEX.load(Ordering::Relaxed) as usize;
+        if index == 0 {
+            // Standard PS/2 packet headers always have bit 3 set; use it for resync.
+            if byte & 0x08 == 0 { continue; }
+            MOUSE_PACKET[0].store(byte, Ordering::Relaxed);
+            MOUSE_PACKET_INDEX.store(1, Ordering::Relaxed);
+            continue;
+        }
+        MOUSE_PACKET[index].store(byte, Ordering::Relaxed);
+        if index < 2 {
+            MOUSE_PACKET_INDEX.store((index + 1) as u8, Ordering::Relaxed);
+            continue;
+        }
+        MOUSE_PACKET_INDEX.store(0, Ordering::Relaxed);
+        let header = MOUSE_PACKET[0].load(Ordering::Relaxed);
+        let raw_x = MOUSE_PACKET[1].load(Ordering::Relaxed) as i8 as i16;
+        let raw_y = MOUSE_PACKET[2].load(Ordering::Relaxed) as i8 as i16;
+        let overflow = header & 0xC0 != 0;
+        return Some(MousePacket {
+            dx: if overflow { 0 } else { raw_x },
+            dy: if overflow { 0 } else { raw_y },
+            buttons: header & 0x07,
+        });
+    }
+    None
+}
+
+fn send_mouse_command(command: u8) -> bool {
+    unsafe {
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x64, 0xD4); // Next byte is for the auxiliary device.
+        if !wait_ps2_input_empty() { return false; }
+        outb(0x60, command);
+        for _ in 0..1_000_000 {
+            let status = inb(0x64);
+            if status & 0x01 != 0 {
+                let response = inb(0x60);
+                if status & 0x20 != 0 { return response == 0xFA; }
+            }
+            core::hint::spin_loop();
+        }
     }
     false
 }

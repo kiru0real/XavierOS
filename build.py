@@ -42,7 +42,7 @@ def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProces
 def download(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading {url}", flush=True)
-    request = urllib.request.Request(url, headers={"User-Agent": "XavierOS-build/0.1.8"})
+    request = urllib.request.Request(url, headers={"User-Agent": "XavierOS-build/0.2.0-beta.1"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as out:
         shutil.copyfileobj(response, out)
 

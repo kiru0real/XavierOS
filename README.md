@@ -2,15 +2,15 @@
 
 # XavierOS
 
-**A tiny experimental x86_64 hobby operating system written in Rust.**
+**An experimental x86_64 hobby operating system written in Rust.**
 
 Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-Experimental-orange)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/Status-Desktop%20Preview%20Beta-orange)](#status-and-limitations)
 
-**Current version: `0.1.8` · Development target: `v0.1.8`**
+**Current version: `0.2.0-beta.1` · First desktop preview**
 
 [Русская версия README](README.ru.md)
 
@@ -20,130 +20,103 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 
 ## About
 
-XavierOS is a small hobby OS for learning kernel development. Its kernel is written in Rust without the standard library (`#![no_std]`) and targets `x86_64`. It boots through Limine and is intended for disposable virtual-machine experiments, not everyday or production use.
+XavierOS is a small `no_std` Rust kernel for learning low-level systems programming. It boots through Limine, draws directly to the framebuffer, handles PS/2 input, manages physical pages and a kernel heap, and includes an experimental storage and networking stack. Version `0.2.0-beta.1` introduces the first interactive desktop preview with a dock inspired by desktop operating systems.
 
-## Current features
+## What's included
 
-- Limine boot, framebuffer console, PS/2 keyboard, IDT exceptions, PIC/PIT interrupts, and serial diagnostics.
-- Limine memory-map parsing, bitmap PMM, HHDM, kernel heap, and a cooperative task-switching prototype.
-- ATA PIO virtual disk, writable XVDISKFS, read-only XVRFS initramfs, and a VFS dispatcher.
-- Experimental local accounts with salted PBKDF2-HMAC-SHA256 password hashes and basic shell-level home-directory restrictions.
-- Editable command line, Up/Down history, Tab completion, and neofetch-style `SYSINFO` with the XavierOS X logo.
-- QEMU E1000 networking: DMA rings, ARP, IPv4, ICMP `PING`, DNS A queries, a DHCP client, and UDP NTP client.
-- Experimental synchronous TCP/HTTP client with bounded retries, redirects, `Content-Length`, and chunked response decoding.
-- `HTTPGET` for displaying a bounded response and `FETCH` for saving a completed small HTTP body to disk.
-- `NETSTAT` and `NETCHECK` for network counters and basic connectivity checks.
-- `DATE`, `TIME`, `DATETIME`, `TIMEZONE`, and `NTP` commands.
-- Checksummed persistent configuration with alternating slots, `CONFIG`/`SETTINGS`, and a `REPORT` diagnostic summary.
-- Safer `FETCH` commit: write to a temporary sibling file, then rename after the full response has been received.
+- **Bare-metal Rust kernel** for `x86_64-unknown-none`, booted with Limine.
+- **Framebuffer UI** with a custom bitmap font, a dark gradient wallpaper, a top menu bar, and a macOS-inspired app dock.
+- **Mouse and keyboard interaction:** polled PS/2 mouse when available, keyboard dock navigation as a fallback, selectable app icons, Escape to close preview windows, and a Terminal app that opens the existing shell.
+- **Preview apps:** Files lists VFS entries, Network shows the E1000/IPv4 configuration, Clock displays the wall clock, Settings summarizes current config, and About describes the build. These app windows are early in-kernel preview panels, not independent user processes.
+- **Interactive shell:** command history, line editing, Up/Down history, Tab completion, user accounts, filesystem tools, diagnostics, and the neofetch-style `SYSINFO` screen. The shell keeps draining the polled mouse stream so keyboard input is not blocked while Terminal is open. Type `DESKTOP` in Terminal to return to the desktop.
+- **Memory management:** Limine memory map, PMM, HHDM, heap, IDT exception reporting, PIC/PIT timer and keyboard IRQ.
+- **Storage:** ATA PIO, read-only XVRFS initramfs, VFS dispatcher and writable XVDISKFS on a persistent QEMU disk.
+- **Experimental networking:** QEMU E1000, DHCP client with fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, and a bounded HTTP client.
+- **Portable Python build scripts** for Windows, Linux and macOS hosts, with QEMU as the main test environment.
 
 ## Build and run
 
 ### Requirements
 
-- Windows 10/11, Linux, or macOS.
-- Rust via `rustup`, including the `x86_64-unknown-none` target.
-- Python 3.10+ and QEMU (`qemu-system-x86_64`).
-- On Linux/macOS, a C compiler and `xorriso`; on Windows, supported helper tools can be prepared by the build script.
-- Internet access during the first build if required helper tools are missing.
+- Rust via `rustup` and Python 3.10+.
+- QEMU with `qemu-system-x86_64` available on `PATH`.
+- On Windows, the build script can prepare supported helper tools. On macOS/Linux, install a C compiler and `xorriso`.
 
-Run from the repository directory:
-
-```text
+```powershell
 python setup.py
 python -m unittest discover -s tests -v
 python build.py --clean
 python run.py
 ```
 
-The build creates `build/xavieros.iso`. The QEMU launcher attaches a persistent 16 MiB disk at `data/xavieros-disk.img`, enables the emulated Intel E1000 NIC through user-mode NAT, and sets the virtual RTC base to UTC. **`python run.py --reset-disk` erases files, user accounts, and saved configuration.**
+The build produces `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB disk at `data/xavieros-disk.img`; **do not use `--reset-disk` unless you want to erase files, accounts and settings**.
+
+## Desktop preview controls
+
+- **Mouse:** move the pointer and click a dock icon, if the PS/2 auxiliary device is available.
+- **Keyboard:** Left/Right to select a dock icon, Enter to open it, Escape to close an app preview, and `T` to open Terminal. `F`, `N`, `C`, `S`, and `A` open Files, Network, Clock, Settings, and About.
+- **Terminal:** type `DESKTOP` to return to the desktop. All existing shell commands remain available.
+
+The desktop is intentionally a preview: Terminal is the real shell; the other apps are simple framebuffer panels backed by existing kernel subsystems. Keyboard shortcuts supplement dock navigation: `T`, `F`, `N`, `C`, `S`, and `A` open Terminal, Files, Network, Clock, Settings, and About.
+
 
 ## Console commands
 
-XavierOS has a small built-in shell; it is not a POSIX shell and does not run Linux commands.
+Commands are currently entered as ASCII text. Use `HELP` for the built-in list. Common commands include:
 
 | Command | Description |
 |---|---|
-| `HELP`, `ABOUT`, `VERSION`, `BANNER` | Help, project information, version, and logo |
-| `SYSINFO`, `INFO`, `CPU`, `MEM`, `PMM`, `HHDM`, `HEAP` | System and memory information |
-| `HEALTH`, `DIAG`, `SELFTEST`, `IDT`, `IRQ`, `UPTIME`, `REPORT` | Diagnostics and system report |
-| `LS [PATH]`, `CAT PATH`, `STAT PATH`, `PWD`, `FSINFO`, `FSTEST` | Browse and inspect files |
-| `WRITE PATH TEXT`, `TOUCH PATH`, `MKDIR PATH`, `RM PATH`, `DF`, `FSCK`, `DISK` | Writable disk and filesystem tools (`FSCK` is a read-only metadata check; it does not repair data) |
-| `USERADD`, `LOGIN`, `LOGOUT`, `WHOAMI`, `USERS`, `PASSWD`, `HOME` | Experimental local accounts |
-| `CONFIG`, `SETTINGS` | Show persistent system settings |
-| `CONFIG SET TIMEZONE +0300` | Change the manual timezone offset |
-| `CONFIG SET NTP time.cloudflare.com` | Set the preferred NTP server |
-| `CONFIG SET NETWORK DHCP` / `STATIC` | Choose DHCP or the QEMU static profile |
-| `CONFIG SET TIMEOUT 10` | Set network timeout in seconds (1–120) |
-| `CONFIG SAVE`, `CONFIG RESET` | Save configuration or restore defaults |
-| `REPORT SAVE /DISK/HOME/USER/REPORT.TXT` | Save a diagnostic report to an accessible disk path |
-| `NET`, `DHCP`, `NETSTAT`, `NETCHECK` | Network setup and diagnostics |
-| `PING HOST [COUNT]` | ICMP echo test, 1–8 probes |
-| `HTTPGET http://HOST/PATH` | Display a bounded plain-HTTP response |
-| `FETCH http://HOST/PATH /DISK/PATH` | Save a completed small plain-HTTP response body |
-| `DATE`, `TIME`, `DATETIME`, `TIMEZONE`, `NTP [SERVER]` | Wall-clock display and NTP synchronization |
+| `SYSINFO` | XavierOS-branded system summary in a neofetch-like layout |
+| `NET`, `NETSTAT`, `NETCHECK`, `PING` | Network status and diagnostics |
+| `HTTPGET`, `FETCH` | Experimental plain-HTTP client and file download |
+| `DATE`, `TIME`, `DATETIME`, `TIMEZONE`, `NTP` | Wall-clock and NTP tools |
+| `CONFIG`, `SETTINGS`, `REPORT` | Persistent config and diagnostic report |
+| `LS`, `CAT`, `STAT`, `WRITE`, `MKDIR`, `RM`, `DF`, `FSCK` | Filesystem operations and checks |
+| `USERADD`, `LOGIN`, `LOGOUT`, `WHOAMI`, `PASSWD` | Experimental local account management |
+| `HEALTH`, `SELFTEST`, `TASKS`, `HEAP`, `MEM` | Kernel and subsystem diagnostics |
+| `DESKTOP` | Return from Terminal to Desktop Preview |
 
-### Examples
+## Configuration and filesystem notes
 
-```text
-CONFIG
-CONFIG SET TIMEZONE +0300
-CONFIG SET NTP time.cloudflare.com
-CONFIG SET NETWORK DHCP
-CONFIG SET TIMEOUT 10
-CONFIG SAVE
-NETCHECK
-PING example.com 2
-HTTPGET http://neverssl.com/
-FETCH http://example.com/ /DISK/HOME/alice/example.html
-REPORT
-REPORT SAVE /DISK/HOME/alice/REPORT.TXT
-```
-
-Replace `alice` in examples with your own persistent username. Only the first persistent account is the administrator. Configuration changes require administrator access. The account system is experimental; commands still run in ring 0, so this is not a complete isolation boundary.
-
-`FETCH` accepts only plain HTTP, writes under `/DISK`, checks user path permissions, rejects an existing destination, and saves the body to a temporary sibling file before committing it by rename. Its response buffer is limited to 16 KiB. Downloaded content is untrusted.
-
-## Update notifications
-
-Automatic GitHub release checking is not implemented yet. HTTPS/TLS support is required because the GitHub Releases API requires HTTPS, while XavierOS does not implement HTTPS/TLS. The OS will not send an insecure plain-HTTP request for update metadata. Once TLS with certificate validation exists, a startup check can compare the installed version with the latest published release and show a non-blocking notification without downloading or installing anything automatically.
-
-## Status and limitations
-
-- XavierOS is experimental and targets QEMU's emulated Intel E1000. Physical hardware is not validated.
-- User accounts do not provide a full security boundary because there is no user-mode isolation; do not reuse real passwords.
-- TCP is an experimental synchronous HTTP client, not a complete TCP stack. Congestion control, persistent connections, robust recovery after partial-data loss, HTTPS/TLS, IPv6, and physical NIC support are not implemented.
-- DHCP lease renewal, automatic timezone/location detection, daylight-saving rules, and persistence of the synchronized wall-clock baseline are not implemented. `TIMEZONE` lets you set a manual fixed UTC offset. The timezone offset, NTP server, network mode, and timeout can be saved in the persistent config.
-- XVDISKFS is not journaled or crash-safe. Alternating checksummed configuration slots reduce the chance of losing the previous config, but they do not make the filesystem generally crash-safe. `FSCK` only checks; it does not repair.
-- The scheduler is cooperative. Desktop, user-mode ELF loader, and virtual-address-space isolation are not implemented.
-
-Use disposable virtual disks and keep backups. The local disk image `data/xavieros-disk.img` is runtime state and must not be committed.
+- `CONFIG SET TIMEZONE` sets a manual fixed UTC offset (for example `TIMEZONE +0300`); automatic location detection and daylight-saving rules are not implemented.
+- `CONFIG SET NETWORK` selects DHCP or the static QEMU fallback. `CONFIG SAVE` persists settings on the virtual disk.
+- `REPORT SAVE` writes a diagnostic snapshot to an accessible path under `/DISK`.
+- `FSCK` is a read-only metadata check: it scans filesystem structures but does not repair the disk. Back up the virtual disk before experimenting with low-level storage tools.
+- The clock uses the CMOS RTC until NTP sync is successful. The UDP NTP client is experimental.
+- Automatic GitHub release checking is not implemented yet. HTTPS/TLS support is required before the OS can safely query the GitHub Releases API.
 
 ## Project structure
 
 ```text
 XavierOS/
-├── .cargo/             # Bare-metal target and linker configuration
-├── src/                # Kernel, memory, storage, accounts, clock, config, network
-├── tests/              # Host-side tests and source regression checks
-├── rootfs/             # Read-only XVRFS initramfs contents
-├── Cargo.toml
-├── build.py            # Build kernel and bootable ISO
-├── run.py              # Launch QEMU with persistent disk and E1000 NAT
-├── mkinitramfs.py      # Build XVRFS initramfs
-├── package_release.py  # Package versioned ISO and checksum file
-├── CHANGELOG.md
-├── LICENSE
-├── README.md
-└── README.ru.md
+├── .cargo/config.toml
+├── src/                 # Kernel, memory, storage, network, clock and desktop modules
+├── tests/               # Host-side build/tooling regression tests
+├── rootfs/              # Read-only initramfs content
+├── setup.py
+├── build.py
+├── run.py
+├── package_release.py
+├── mkinitramfs.py
+├── Cargo.toml / Cargo.lock
+├── limine.conf / linker.ld
+├── README.md / README.ru.md / CHANGELOG.md
+└── LICENSE
 ```
 
-Generated `target/`, `build/`, `tools/`, `dist/`, Python caches, and the persistent disk image are not source code and should not be committed.
+## Documentation
 
-## Changelog
+- [Changelog](CHANGELOG.md)
+- [License](LICENSE)
 
-See [CHANGELOG.md](CHANGELOG.md) for version history.
+The repository keeps its top-level documentation intentionally compact. Build and desktop-preview instructions are maintained in this README.
+
+## Status and limitations
+
+XavierOS is an **experimental hobby OS**, not a general-purpose or secure operating system. The desktop preview runs in kernel space; preview apps are not isolated user processes. User accounts enforce shell-level access rules but do not provide a ring-3 security boundary. XVDISKFS is not journaled or crash-safe. Networking currently targets QEMU's emulated E1000 and user-mode NAT; HTTPS/TLS, IPv6, and general-purpose networking are not implemented. The PS/2 mouse is polled and keyboard navigation remains the fallback. Physical-hardware support is not validated.
+
+**Run XavierOS in QEMU or another disposable virtual machine. Do not rely on it to protect important data.**
 
 ## License
 
-Original XavierOS source code and documentation are distributed under the [MIT License](LICENSE). Third-party tools and components retain their own licenses.
+XavierOS source code and documentation are distributed under the [MIT License](LICENSE). Downloaded third-party tools and components remain under their respective licenses.

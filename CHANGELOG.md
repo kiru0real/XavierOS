@@ -1,4 +1,15 @@
-# Changelog
+# XavierOS Changelog
+
+## 0.2.0-beta.1 — Desktop Preview
+
+- Added the first framebuffer desktop with a dark gradient wallpaper, menu bar, glass-style dock and six app icons.
+- Added a polled PS/2 mouse path with keyboard navigation as a fallback.
+- Fixed desktop flicker during mouse movement by restoring/redrawing only the cursor region instead of repainting the full desktop for every mouse packet.
+- Fixed Terminal keyboard starvation by draining the polled PS/2 mouse stream while the shell and password prompts wait for keyboard input.
+- Added Files, Network, Clock, Settings and About preview windows; Terminal opens the existing shell.
+- Added `DESKTOP` to return from Terminal to the desktop.
+- Updated version metadata and documentation for `0.2.0-beta.1`.
+- This is an early in-kernel UI prototype; desktop apps are not isolated user processes.
 
 ## 0.1.8 — Persistence and Reliability
 

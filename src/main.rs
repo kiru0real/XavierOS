@@ -14,6 +14,7 @@ mod users;
 mod net;
 mod clock;
 mod config;
+mod desktop;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -108,7 +109,13 @@ pub extern "C" fn _start() -> ! {
     serial_init();
     interrupts::initialize();
     interrupts::initialize_hardware();
-    serial_write("\r\nXavierOS v0.1.8\r\n");
+    let mouse_ready = interrupts::initialize_ps2_mouse();
+    serial_write(if mouse_ready {
+        "PS/2 auxiliary mouse initialized in polling mode.\r\n"
+    } else {
+        "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
+    });
+    serial_write("\r\nXavierOS v0.2.0-beta.1\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -259,7 +266,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     serial_write("Framebuffer ready. Starting interactive console...\r\n");
-    run_console(&framebuffer, memory_summary)
+    desktop::run(&framebuffer, memory_summary, mouse_ready)
 }
 
 fn halt_forever() -> ! {
@@ -437,7 +444,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.1.8 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.0-BETA.1 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -578,6 +585,7 @@ enum KeyboardKey {
     Delete,
     ClearLine,
     Cancel,
+    Escape,
     Tab,
 }
 
@@ -640,7 +648,7 @@ fn framebuffer_is_supported(fb: &Framebuffer) -> bool {
         && fb.pitch >= fb.width.saturating_mul(4)
 }
 
-fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, bool)>) -> ! {
+fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, bool)>) {
     if !framebuffer_is_supported(framebuffer) {
         serial_write("ERROR: Unsupported framebuffer format or dimensions.\r\n");
         halt_forever();
@@ -648,7 +656,7 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
 
     let mut console = Console::new(*framebuffer);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.1.8");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.0-BETA.1");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -703,6 +711,11 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         let mut cursor = 0usize;
 
         loop {
+            // The PS/2 mouse remains in streaming mode while Terminal owns the
+            // framebuffer. IRQ12 is intentionally masked, so keep draining AUX
+            // packets here; otherwise a mouse byte can occupy the 8042 output
+            // buffer and starve keyboard scancodes until the desktop loop resumes.
+            let _ = interrupts::poll_mouse_packet();
             match keyboard_poll_key() {
                 Some(KeyboardKey::Character(byte)) => {
                     if input_len < input_limit && is_console_character(byte) {
@@ -809,6 +822,18 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                         redraw_input(&mut console, prompt_start, &input, input_len, cursor);
                     }
                 }
+                Some(KeyboardKey::Escape) => {
+                    input.fill(0);
+                    input_len = 0;
+                    cursor = 0;
+                    history_offset = None;
+                    console.replace_current_input(prompt_start, &[]);
+                    console.write("ESC");
+                    console.newline();
+                    write_shell_prompt(&mut console);
+                    console.render();
+                    break;
+                }
                 Some(KeyboardKey::Tab) => {
                     // Completion currently operates on the token at the end of the line.
                     if cursor == input_len {
@@ -824,6 +849,10 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                     console.newline();
                     history.push(&input[..input_len]);
                     let command_line = core::str::from_utf8(&input[..input_len]).unwrap_or("");
+                    if command_line.trim().eq_ignore_ascii_case("DESKTOP") {
+                        serial_write("Returning to XavierOS Desktop Preview.\r\n");
+                        return;
+                    }
                     process_command(&mut console, command_line, memory_summary);
                     write_shell_prompt(&mut console);
                     console.render();
@@ -917,6 +946,7 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
     let shifted = SHIFT_STATE.load(Ordering::Relaxed) != 0;
 
     match code {
+        0x01 => Some(KeyboardKey::Escape),
         0x1C => Some(KeyboardKey::Enter),
         0x0E => Some(KeyboardKey::Backspace),
         0x0F => Some(KeyboardKey::Tab),
@@ -976,7 +1006,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "HTTPGET", "IDT",
     "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
-    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING", "REPORT", "SETTINGS",
+    "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING", "REPORT", "SETTINGS", "DESKTOP",
     "DATE", "DATETIME", "DHCP", "NTP", "TIMEZONE", "NETSTAT", "NETCHECK",
 ];
 
@@ -1120,6 +1150,9 @@ fn read_hidden_input(console: &mut Console, prompt: &str, output: &mut [u8]) -> 
     console.render();
     let mut length = 0usize;
     loop {
+        // Password prompts also run outside the desktop event loop, so they
+        // must drain the polled PS/2 mouse stream to keep keyboard input flowing.
+        let _ = interrupts::poll_mouse_packet();
         match keyboard_poll_key() {
             Some(KeyboardKey::Character(byte)) if (0x20..=0x7E).contains(&byte) => {
                 if length < output.len() {
@@ -1309,6 +1342,7 @@ fn process_command(
             console.write_line("CTRL+U       - CLEAR INPUT | CTRL+C - CANCEL INPUT");
             console.write_line("TAB         - COMPLETE COMMANDS AND VFS PATHS");
             console.write_line("ABOUT       - ABOUT XAVIEROS");
+            console.write_line("DESKTOP     - RETURN TO DESKTOP PREVIEW");
             console.write_line("BANNER      - SHOW THE XAVIEROS LOGO");
             console.write_line("CALC A OP B - INTEGER CALCULATOR (+ - * /)");
             console.write_line("CLEAR       - CLEAR THE CONSOLE");
@@ -1374,8 +1408,8 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.1.8");
-            console.write_line("NO DESKTOP. JUST THE KERNEL AND THE SHELL.");
+            console.write_line("PROJECT VERSION: 0.2.0-BETA.1");
+            console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
         "CALC" => calculate(console, arguments),
@@ -1383,7 +1417,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.1.8");
+            console.write_line("VERSION: 0.2.0-BETA.1");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1852,7 +1886,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.1.8"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.0-BETA.1"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2101,7 +2135,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.1.8");
+    let _ = writeln!(&mut out, "Version: 0.2.0-BETA.1");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2348,7 +2382,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.1.8 | NO DESKTOP. NO SHORTCUTS.");
+    console.write_line("VERSION 0.2.0-BETA.1 | DESKTOP PREVIEW AVAILABLE.");
     console.write_line("");
 }
 
@@ -2689,9 +2723,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.1.8");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.1");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.1.8");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.0-BETA.1");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2747,7 +2781,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.1.8"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.0-BETA.1"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
