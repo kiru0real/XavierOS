@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.0-beta.2.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.0-beta.3.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_preview_is_wired_and_version_is_beta_2(self) -> None:
+    def test_desktop_preview_is_wired_and_version_is_beta_3(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,19 +185,19 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.0-beta.2"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.2"', release)
-        self.assertIn('Current version: `0.2.0-beta.2`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0-beta.3"', cargo)
+        self.assertIn('VERSION = "0.2.0-beta.3"', release)
+        self.assertIn('Current version: `0.2.0-beta.3`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_desktop_mouse_motion_uses_incremental_redraw(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         run_body = desktop[desktop.index("pub(super) fn run("):desktop.index("\nfn render_desktop(")]
         render_body = desktop[desktop.index("fn render_desktop("):desktop.index("\nfn draw_wallpaper(")]
-        self.assertIn("restore_cursor_background(framebuffer, &mut cursor_background)", run_body)
-        self.assertIn("draw_mouse_cursor_saved(framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background)", run_body)
+        self.assertIn("restore_cursor_background(&active_framebuffer, &mut cursor_background)", run_body)
+        self.assertIn("draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background)", run_body)
         self.assertIn("else if dock_repaint || cursor_moved", run_body)
-        self.assertIn("restore_dock_label_background(framebuffer, &mut dock_label_background)", run_body)
-        self.assertIn("draw_dock(framebuffer, state.selected)", run_body)
+        self.assertIn("restore_dock_label_background(&active_framebuffer, &mut dock_label_background)", run_body)
+        self.assertIn("draw_dock(&active_framebuffer, state.selected)", run_body)
         self.assertNotIn("old_x != state.mouse_x || old_y != state.mouse_y {\n                    repaint = true", run_body)
         self.assertNotIn("draw_mouse_cursor(", render_body)
         self.assertLess(render_body.index("save_dock_label_background"), render_body.index("draw_dock(fb, state.selected)"))
@@ -210,8 +210,15 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('const WALLPAPER_WIDTH: usize = 735;', desktop)
         self.assertIn('const WALLPAPER_HEIGHT: usize = 452;', desktop)
         self.assertEqual(wallpaper.stat().st_size, 735 * 452 * 3)
-        self.assertIn('"CURRENT MODE"', desktop)
-        self.assertIn('"CHOOSE RESOLUTION IN LIMINE STARTUP MENU"', desktop)
+        self.assertIn('"DISPLAY & RESOLUTION"', desktop)
+        self.assertIn('fn settings_hit_test(', desktop)
+        self.assertIn('fn apply_selected_resolution(', desktop)
+        self.assertIn('fn set_qemu_vbe_mode(', desktop)
+        self.assertIn('VBE_ID_MIN: u16 = 0xB0C0', desktop)
+        self.assertIn('"APPLY MODE"', desktop)
+        self.assertIn('"USE CURRENT"', desktop)
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        self.assertIn('"-vga", "std"', run)
         for mode in ("1024x768x32", "1280x720x32", "1366x768x32"):
             self.assertIn(f"resolution: {mode}", limine)
         self.assertIn("timeout: 5", limine)
@@ -223,7 +230,7 @@ class RepositoryShapeTests(unittest.TestCase):
         body = desktop[start:end]
         self.assertLess(body.index("save_cursor_background("), body.index("draw_mouse_cursor("))
 
-    def test_custom_cursor_png_is_transparent_64x64_and_embedded_as_rgba(self) -> None:
+    def test_custom_cursor_source_is_64px_but_embedded_sprite_is_28px(self) -> None:
         png = (ROOT / "assets" / "cursor.png").read_bytes()
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
         width, height, bit_depth, color_type, _compression, _filter, _interlace = struct.unpack(">IIBBBBB", png[16:29])
@@ -231,14 +238,27 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertEqual(color_type, 6, "PNG must retain RGBA transparency")
         self.assertEqual(bit_depth, 8)
         rgba = (ROOT / "assets" / "cursor.rgba").read_bytes()
-        self.assertEqual(len(rgba), 64 * 64 * 4)
+        self.assertEqual(len(rgba), 28 * 28 * 4)
         alpha = rgba[3::4]
-        self.assertIn(0, alpha, "background should be transparent")
+        self.assertIn(0, alpha, "scaled sprite should preserve transparent pixels")
         self.assertTrue(any(value > 0 for value in alpha), "cursor pixels should remain visible")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         self.assertIn('include_bytes!("../assets/cursor.rgba")', desktop)
+        self.assertIn('const CURSOR_WIDTH: usize = 28;', desktop)
+        self.assertIn('const CURSOR_HEIGHT: usize = 28;', desktop)
         self.assertIn("fn blend_cursor_pixel(", desktop)
         self.assertIn("fn cursor_has_neighbor(", desktop)
+
+    def test_settings_has_select_apply_current_and_guarded_live_vbe_switch(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        self.assertIn("SettingsHit::SelectMode(index)", desktop)
+        self.assertIn("SettingsHit::Apply", desktop)
+        self.assertIn("SettingsHit::UseCurrent", desktop)
+        self.assertIn("state.selected_resolution = (state.selected_resolution + 1) % DISPLAY_MODES.len()", desktop)
+        self.assertIn("VBE_INDEX_VIDEO_MEMORY_64K", desktop)
+        self.assertIn("DisplayNotice::Unsupported", desktop)
+        self.assertIn("DisplayNotice::NotEnoughMemory", desktop)
+        self.assertIn("let _ = vbe_program_mode(old_width, old_height);", desktop)
 
     def test_build_rebuild_tracking_includes_assets(self) -> None:
         run = (ROOT / "run.py").read_text(encoding="utf-8")
@@ -265,13 +285,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_beta_2(self) -> None:
+    def test_version_metadata_is_consistent_for_beta_3(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.0-beta.2"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.2"', package)
-        self.assertIn("Current version: `0.2.0-beta.2`", readme)
+        self.assertIn('version = "0.2.0-beta.3"', cargo)
+        self.assertIn('VERSION = "0.2.0-beta.3"', package)
+        self.assertIn("Current version: `0.2.0-beta.3`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -318,7 +338,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.2")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.3")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -360,7 +380,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.0-BETA.2', main)
+        self.assertIn('VERSION: 0.2.0-BETA.3', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -438,8 +458,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.0-beta.2"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.0-beta.2"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0-beta.3"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.0-beta.3"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -492,9 +512,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.0-beta.2`", readme)
-        self.assertIn('VERSION = "0.2.0-beta.2"', release)
-        self.assertIn('version = "0.2.0-beta.2"', cargo)
+        self.assertIn("Current version: `0.2.0-beta.3`", readme)
+        self.assertIn('VERSION = "0.2.0-beta.3"', release)
+        self.assertIn('version = "0.2.0-beta.3"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:

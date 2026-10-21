@@ -1,5 +1,17 @@
 # XavierOS Changelog
 
+## 0.2.0-beta.3 — Compact Cursor and Display Settings
+
+- Reduced the in-kernel pointer render target from 64×64 to 28×28 pixels while keeping the original transparent 64×64 PNG as the source asset.
+- Rebuilt the embedded RGBA sprite with high-quality downsampling and scaled the pointer hotspot and framebuffer save/restore region to match.
+- Replaced the text-only Settings preview with a redesigned Display & Resolution panel, three selectable mode cards, Apply Mode and Use Current controls, active-mode information, and clear success/error feedback.
+- Added guarded Bochs VBE mode switching for QEMU's standard VGA adapter. The kernel verifies the adapter ID and available video memory, checks mode readback, and tries to restore the old mode if the request is rejected.
+- Made `run.py` request `-vga std` explicitly so the supported QEMU VBE adapter is predictable. Other video adapters may report that live switching is unavailable; Limine boot-time profiles remain available.
+- Added keyboard selection (left/right) and Enter-to-apply while Settings is open.
+- Updated package/kernel/shell/rootfs metadata to `0.2.0-beta.3`.
+- Host-side checks validate the 28×28 sprite data, the clickable resolution controls and the QEMU VBE code path. Rust compilation and QEMU runtime still require confirmation on the developer's machine.
+
+
 ## 0.2.0-beta.2 — Custom Cursor Polish
 
 - Added the supplied 64×64 transparent PNG pointer and embedded alpha-preserving RGBA data for the no_std framebuffer renderer.

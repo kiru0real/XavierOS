@@ -1,4 +1,4 @@
-//! XavierOS Desktop Preview for v0.2.0-beta.2.
+//! XavierOS Desktop Preview for v0.2.0-beta.3.
 //!
 //! A small framebuffer compositor with a macOS-inspired dock. This is an in-kernel
 //! preview: non-terminal apps are information windows, while Terminal opens the
@@ -8,12 +8,12 @@
 use crate::{clock, config, interrupts, net, users, Framebuffer, KeyboardKey, MemoryStats};
 
 const APP_COUNT: usize = 6;
-const CURSOR_WIDTH: usize = 64;
-const CURSOR_HEIGHT: usize = 64;
+const CURSOR_WIDTH: usize = 28;
+const CURSOR_HEIGHT: usize = 28;
 const CURSOR_SAVE_WIDTH: usize = CURSOR_WIDTH;
 const CURSOR_SAVE_HEIGHT: usize = CURSOR_HEIGHT;
-const CURSOR_HOTSPOT_X: i32 = 16;
-const CURSOR_HOTSPOT_Y: i32 = 6;
+const CURSOR_HOTSPOT_X: i32 = 7;
+const CURSOR_HOTSPOT_Y: i32 = 3;
 const CURSOR_RGBA: &[u8] = include_bytes!("../assets/cursor.rgba");
 const DOCK_LABEL_SAVE_WIDTH: usize = 64;
 const DOCK_LABEL_SAVE_HEIGHT: usize = 21;
@@ -23,13 +23,66 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.2";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.3";
 const WALLPAPER_WIDTH: usize = 735;
 const WALLPAPER_HEIGHT: usize = 452;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
 // raw RGB avoids needing a JPEG decoder inside this no_std kernel.
 const WALLPAPER_RGB: &[u8] = include_bytes!("../assets/wallpaper.rgb");
 const APP_NAMES: [&str; APP_COUNT] = ["FILES", "TERMINAL", "NETWORK", "CLOCK", "SETTINGS", "ABOUT"];
+
+#[derive(Clone, Copy)]
+struct DisplayMode {
+    width: usize,
+    height: usize,
+    aspect: &'static str,
+    quality: &'static str,
+}
+
+const DISPLAY_MODES: [DisplayMode; 3] = [
+    DisplayMode { width: 1024, height: 768, aspect: "4:3 ASPECT", quality: "STANDARD" },
+    DisplayMode { width: 1280, height: 720, aspect: "16:9 ASPECT", quality: "HD READY" },
+    DisplayMode { width: 1366, height: 768, aspect: "16:9 ASPECT", quality: "WIDE HD" },
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayNotice {
+    None,
+    Selected,
+    Applied,
+    Unsupported,
+    NotEnoughMemory,
+    Rejected,
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Rect {
+    fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x as i32 && y >= self.y as i32
+            && x < (self.x + self.width) as i32
+            && y < (self.y + self.height) as i32
+    }
+}
+
+struct SettingsLayout {
+    sidebar: Rect,
+    cards: [Rect; 3],
+    apply: Rect,
+    current: Rect,
+}
+
+enum SettingsHit {
+    SelectMode(usize),
+    Apply,
+    UseCurrent,
+}
 
 struct DesktopState {
     selected: usize,
@@ -38,6 +91,8 @@ struct DesktopState {
     mouse_y: i32,
     mouse_buttons: u8,
     mouse_ready: bool,
+    selected_resolution: usize,
+    display_notice: DisplayNotice,
 }
 
 // Save only the pixels underneath the small pointer. Redrawing the full desktop
@@ -87,9 +142,11 @@ impl DockLabelBackground {
 }
 
 pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, bool)>, mouse_ready: bool) -> ! {
-    interrupts::enable_interrupts();
-    let width = framebuffer.width as usize;
-    let height = framebuffer.height as usize;
+    // The desktop keeps a local copy because QEMU's Bochs VBE adapter may change
+    // the live framebuffer dimensions while Settings is open.
+    let mut active_framebuffer = *framebuffer;
+    let mut width = active_framebuffer.width as usize;
+    let mut height = active_framebuffer.height as usize;
     let mut state = DesktopState {
         selected: APP_TERMINAL,
         open_window: None,
@@ -97,14 +154,16 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         mouse_y: (height.saturating_sub(150)) as i32,
         mouse_buttons: 0,
         mouse_ready,
+        selected_resolution: display_mode_index(width, height),
+        display_notice: DisplayNotice::None,
     };
     let mut cursor_background = CursorBackground::new();
     let mut dock_label_background = DockLabelBackground::new();
 
     crate::serial_write("XavierOS Desktop Preview entered. Press Enter on Terminal or type T.\r\n");
-    render_desktop(framebuffer, &state, memory_summary, &mut dock_label_background);
+    render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
     if state.mouse_ready {
-        draw_mouse_cursor_saved(framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
+        draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
     }
 
     loop {
@@ -140,7 +199,36 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                         state.open_window = Some(index);
                         repaint = true;
                     }
-                } else if state.open_window.is_some() && close_button_hit(framebuffer, state.mouse_x, state.mouse_y) {
+                } else if state.open_window == Some(APP_SETTINGS) {
+                    match settings_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        Some(SettingsHit::SelectMode(index)) => {
+                            state.selected_resolution = index;
+                            state.display_notice = DisplayNotice::Selected;
+                            repaint = true;
+                        }
+                        Some(SettingsHit::Apply) => {
+                            let _changed = apply_selected_resolution(
+                                &mut active_framebuffer,
+                                &mut state,
+                                &mut width,
+                                &mut height,
+                                memory_summary,
+                            );
+                            repaint = true;
+                        }
+                        Some(SettingsHit::UseCurrent) => {
+                            state.selected_resolution = display_mode_index(width, height);
+                            state.display_notice = DisplayNotice::None;
+                            repaint = true;
+                        }
+                        None => {
+                            if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                                state.open_window = None;
+                                repaint = true;
+                            }
+                        }
+                    }
+                } else if state.open_window.is_some() && close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
                     state.open_window = None;
                     repaint = true;
                 }
@@ -151,15 +239,36 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         if let Some(key) = crate::keyboard_poll_key() {
             match key {
                 KeyboardKey::CursorLeft | KeyboardKey::HistoryUp => {
-                    state.selected = (state.selected + APP_COUNT - 1) % APP_COUNT;
-                    dock_repaint = true;
+                    if state.open_window == Some(APP_SETTINGS) {
+                        state.selected_resolution = (state.selected_resolution + DISPLAY_MODES.len() - 1) % DISPLAY_MODES.len();
+                        state.display_notice = DisplayNotice::Selected;
+                        repaint = true;
+                    } else {
+                        state.selected = (state.selected + APP_COUNT - 1) % APP_COUNT;
+                        dock_repaint = true;
+                    }
                 }
                 KeyboardKey::CursorRight | KeyboardKey::HistoryDown | KeyboardKey::Tab => {
-                    state.selected = (state.selected + 1) % APP_COUNT;
-                    dock_repaint = true;
+                    if state.open_window == Some(APP_SETTINGS) {
+                        state.selected_resolution = (state.selected_resolution + 1) % DISPLAY_MODES.len();
+                        state.display_notice = DisplayNotice::Selected;
+                        repaint = true;
+                    } else {
+                        state.selected = (state.selected + 1) % APP_COUNT;
+                        dock_repaint = true;
+                    }
                 }
                 KeyboardKey::Enter => {
-                    if state.selected == APP_TERMINAL {
+                    if state.open_window == Some(APP_SETTINGS) {
+                        let _changed = apply_selected_resolution(
+                            &mut active_framebuffer,
+                            &mut state,
+                            &mut width,
+                            &mut height,
+                            memory_summary,
+                        );
+                        repaint = true;
+                    } else if state.selected == APP_TERMINAL {
                         launch_terminal = true;
                     } else {
                         state.open_window = Some(state.selected);
@@ -188,29 +297,29 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         if launch_terminal {
             // The console owns the framebuffer while it runs, so the previous
             // cursor snapshot is discarded by the full desktop redraw below.
-            crate::run_console(framebuffer, memory_summary);
+            crate::run_console(&active_framebuffer, memory_summary);
             state.open_window = None;
             repaint = true;
         }
 
         if repaint {
-            render_desktop(framebuffer, &state, memory_summary, &mut dock_label_background);
+            cursor_background.valid = false;
+            dock_label_background.valid = false;
+            render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
             if state.mouse_ready {
-                draw_mouse_cursor_saved(framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
-            } else {
-                cursor_background.valid = false;
+                draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
         } else if dock_repaint || cursor_moved {
             if state.mouse_ready {
-                restore_cursor_background(framebuffer, &mut cursor_background);
+                restore_cursor_background(&active_framebuffer, &mut cursor_background);
             }
             if dock_repaint {
-                restore_dock_label_background(framebuffer, &mut dock_label_background);
-                save_dock_label_background(framebuffer, state.selected, &mut dock_label_background);
-                draw_dock(framebuffer, state.selected);
+                restore_dock_label_background(&active_framebuffer, &mut dock_label_background);
+                save_dock_label_background(&active_framebuffer, state.selected, &mut dock_label_background);
+                draw_dock(&active_framebuffer, state.selected);
             }
             if state.mouse_ready {
-                draw_mouse_cursor_saved(framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
+                draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
         }
 
@@ -226,7 +335,7 @@ fn render_desktop(
 ) {
     draw_wallpaper(fb);
     if let Some(app) = state.open_window {
-        draw_app_window(fb, app, memory_summary);
+        draw_app_window(fb, app, memory_summary, state);
     }
     draw_menu_bar(fb, state.mouse_ready);
     save_dock_label_background(fb, state.selected, dock_label_background);
@@ -491,13 +600,9 @@ fn draw_app_icon(fb: &Framebuffer, app: usize, x: usize, y: usize, size: usize) 
     }
 }
 
-fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryStats, bool)>) {
+fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryStats, bool)>, state: &DesktopState) {
     let width = fb.width as usize;
-    let height = fb.height as usize;
-    let win_w = width.saturating_sub(54).min(700).max(250);
-    let win_h = height.saturating_sub(230).min(420).max(180);
-    let x = width.saturating_sub(win_w) / 2;
-    let y = 74 + height.saturating_sub(74 + win_h + 104) / 2;
+    let (x, y, win_w, win_h) = app_window_geometry(fb);
     rounded_rect(fb, x + 5, y + 8, win_w, win_h, 13, color(fb, 5, 8, 19));
     rounded_rect(fb, x, y, win_w, win_h, 13, color(fb, 23, 31, 52));
     rounded_rect(fb, x + 1, y + 1, win_w.saturating_sub(2), win_h.saturating_sub(2), 12, color(fb, 16, 24, 43));
@@ -560,21 +665,7 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
             crate::draw_text(fb, left, row_y, if clock::is_ntp_synchronized() { "SOURCE: NTP SYNCED" } else { "SOURCE: CMOS RTC" }, 1, color(fb, 105, 224, 181));
         }
         APP_SETTINGS => {
-            let settings = config::current();
-            crate::draw_text(fb, left, row_y, "SYSTEM PREFERENCES", 1, color(fb, 104, 220, 255)); row_y += gap + 4;
-            draw_label_value(fb, left, row_y, "NETWORK", if settings.use_dhcp { "DHCP" } else { "STATIC" }, color(fb, 226, 237, 252)); row_y += gap;
-            let timezone = format_timezone(settings.timezone_minutes);
-            let timeout = format_seconds(settings.timeout_seconds);
-            draw_label_value(fb, left, row_y, "TIMEZONE", bytes_text(&timezone), color(fb, 226, 237, 252)); row_y += gap;
-            draw_label_value(fb, left, row_y, "NTP SERVER", settings.ntp_server_str(), color(fb, 226, 237, 252)); row_y += gap;
-            draw_label_value(fb, left, row_y, "TIMEOUT", bytes_text(&timeout), color(fb, 226, 237, 252)); row_y += gap + 8;
-            crate::draw_text(fb, left, row_y, "DISPLAY", 1, color(fb, 104, 220, 255)); row_y += gap;
-            let mut resolution_buffer = [0u8; 24];
-            let resolution = format_resolution(&mut resolution_buffer, fb.width, fb.height);
-            draw_label_value(fb, left, row_y, "CURRENT MODE", resolution, color(fb, 226, 237, 252)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "AVAILABLE: 1024x768 / 1280x720 / 1366x768", 1, color(fb, 226, 237, 252)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "CHOOSE RESOLUTION IN LIMINE STARTUP MENU", 1, color(fb, 155, 176, 207)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "LIVE SWITCHING IS NOT SUPPORTED YET", 1, color(fb, 155, 176, 207));
+            draw_settings_panel(fb, state);
         }
         _ => {
             crate::draw_text(fb, left, row_y, "XAVIEROS DESKTOP PREVIEW", 2, color(fb, 112, 221, 255)); row_y += gap + 17;
@@ -584,9 +675,284 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
             crate::draw_text(fb, left, row_y, "FILES, NETWORK, CLOCK AND SETTINGS ARE PREVIEW WINDOWS.", 1, color(fb, 180, 200, 231));
         }
     }
-    let hint = "PRESS ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
-    crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
+    if app == APP_SETTINGS {
+        let layout = settings_layout(fb);
+        crate::draw_text(fb, layout.cards[0].x, y + win_h.saturating_sub(18), "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS", 1, color(fb, 123, 150, 190));
+    } else {
+        let hint = "PRESS ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
+        crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
+    }
     let _ = memory_summary;
+}
+
+fn app_window_geometry(fb: &Framebuffer) -> (usize, usize, usize, usize) {
+    let width = fb.width as usize;
+    let height = fb.height as usize;
+    let win_w = width.saturating_sub(54).min(700).max(250);
+    let win_h = height.saturating_sub(230).min(420).max(180);
+    let x = width.saturating_sub(win_w) / 2;
+    let y = 74 + height.saturating_sub(74 + win_h + 104) / 2;
+    (x, y, win_w, win_h)
+}
+
+fn settings_layout(fb: &Framebuffer) -> SettingsLayout {
+    let (x, y, win_w, win_h) = app_window_geometry(fb);
+    let content_x = x + 160;
+    let content_width = win_w.saturating_sub(176);
+    let card_gap = 8;
+    let card_width = content_width.saturating_sub(card_gap * 2) / 3;
+    let card_y = y + 124;
+    let card_height = 78;
+    SettingsLayout {
+        sidebar: Rect {
+            x: x + 12,
+            y: y + 48,
+            width: 132,
+            height: win_h.saturating_sub(61),
+        },
+        cards: [
+            Rect { x: content_x, y: card_y, width: card_width, height: card_height },
+            Rect { x: content_x + card_width + card_gap, y: card_y, width: card_width, height: card_height },
+            Rect { x: content_x + (card_width + card_gap) * 2, y: card_y, width: card_width, height: card_height },
+        ],
+        apply: Rect { x: content_x, y: card_y + 89, width: 112, height: 34 },
+        current: Rect { x: content_x + 122, y: card_y + 89, width: 104, height: 34 },
+    }
+}
+
+fn draw_settings_panel(fb: &Framebuffer, state: &DesktopState) {
+    let layout = settings_layout(fb);
+    let (_, window_y, _, _) = app_window_geometry(fb);
+    let content_x = layout.cards[0].x;
+    let current_index = display_mode_index(fb.width as usize, fb.height as usize);
+    let settings = config::current();
+
+    // A compact, calm sidebar keeps the main display controls visually grouped.
+    rounded_rect(fb, layout.sidebar.x, layout.sidebar.y, layout.sidebar.width, layout.sidebar.height, 9, color(fb, 11, 18, 34));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 14, "PREFERENCES", 1, color(fb, 118, 147, 186));
+    rounded_rect(fb, layout.sidebar.x + 7, layout.sidebar.y + 38, layout.sidebar.width - 14, 34, 7, color(fb, 28, 91, 124));
+    rounded_rect(fb, layout.sidebar.x + 17, layout.sidebar.y + 48, 16, 13, 3, color(fb, 116, 232, 255));
+    crate::fill_rect(fb, layout.sidebar.x + 20, layout.sidebar.y + 51, 10, 7, color(fb, 22, 49, 76));
+    crate::draw_text(fb, layout.sidebar.x + 40, layout.sidebar.y + 50, "DISPLAY", 1, color(fb, 240, 249, 255));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 91, "ACTIVE MODE", 1, color(fb, 118, 147, 186));
+    let mut resolution_buffer = [0u8; 24];
+    let current_resolution = format_resolution(&mut resolution_buffer, fb.width, fb.height);
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 108, current_resolution, 1, color(fb, 231, 242, 255));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 139, "COLOR", 1, color(fb, 118, 147, 186));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 155, "32-BIT RGB", 1, color(fb, 192, 211, 237));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 192, "NETWORK", 1, color(fb, 118, 147, 186));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 208, if settings.use_dhcp { "DHCP" } else { "STATIC" }, 1, color(fb, 192, 211, 237));
+    let timezone = format_timezone(settings.timezone_minutes);
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 235, "TIMEZONE", 1, color(fb, 118, 147, 186));
+    crate::draw_text(fb, layout.sidebar.x + 12, layout.sidebar.y + 251, bytes_text(&timezone), 1, color(fb, 192, 211, 237));
+
+    crate::draw_text(fb, content_x, window_y + 57, "DISPLAY & RESOLUTION", 2, color(fb, 238, 246, 255));
+    crate::draw_text(fb, content_x, window_y + 81, "Choose a mode for the virtual display.", 1, color(fb, 154, 177, 210));
+    crate::draw_text(fb, content_x, window_y + 101, "AVAILABLE MODES", 1, color(fb, 103, 222, 255));
+
+    for index in 0..DISPLAY_MODES.len() {
+        let mode = DISPLAY_MODES[index];
+        let rect = layout.cards[index];
+        let is_selected = state.selected_resolution == index;
+        let is_current = current_index == index;
+        let card_color = if is_selected { color(fb, 28, 83, 111) } else { color(fb, 21, 31, 51) };
+        rounded_rect(fb, rect.x, rect.y, rect.width, rect.height, 8, card_color);
+        if is_selected {
+            crate::fill_rect(fb, rect.x + 12, rect.y + rect.height - 4, rect.width.saturating_sub(24), 2, color(fb, 87, 225, 255));
+        } else {
+            crate::fill_rect(fb, rect.x + 12, rect.y + rect.height - 3, rect.width.saturating_sub(24), 1, color(fb, 47, 61, 83));
+        }
+        let resolution_label = match index {
+            0 => "1024 x 768",
+            1 => "1280 x 720",
+            _ => "1366 x 768",
+        };
+        let title_x = rect.x + rect.width.saturating_sub(resolution_label.len() * 6) / 2;
+        crate::draw_text(fb, title_x, rect.y + 13, resolution_label, 1, color(fb, 240, 247, 255));
+        let aspect_x = rect.x + rect.width.saturating_sub(mode.aspect.len() * 6) / 2;
+        crate::draw_text(fb, aspect_x, rect.y + 34, mode.aspect, 1, color(fb, 159, 186, 218));
+        let badge = if is_current { "CURRENT" } else if is_selected { "SELECTED" } else { mode.quality };
+        let badge_x = rect.x + rect.width.saturating_sub(badge.len() * 6) / 2;
+        crate::draw_text(fb, badge_x, rect.y + 55, badge, 1, if is_current { color(fb, 107, 235, 182) } else { color(fb, 108, 219, 255) });
+    }
+
+    rounded_rect(fb, layout.apply.x, layout.apply.y, layout.apply.width, layout.apply.height, 7, color(fb, 31, 147, 184));
+    crate::draw_text(fb, layout.apply.x + 19, layout.apply.y + 13, "APPLY MODE", 1, color(fb, 248, 253, 255));
+    rounded_rect(fb, layout.current.x, layout.current.y, layout.current.width, layout.current.height, 7, color(fb, 34, 46, 67));
+    crate::draw_text(fb, layout.current.x + 19, layout.current.y + 13, "USE CURRENT", 1, color(fb, 202, 218, 240));
+
+    let notice_text = match state.display_notice {
+        DisplayNotice::None => "Select a resolution, then apply it.",
+        DisplayNotice::Selected => "New mode selected. Apply to switch the display.",
+        DisplayNotice::Applied => "Display resolution changed successfully.",
+        DisplayNotice::Unsupported => "Live switching is unavailable in this video setup.",
+        DisplayNotice::NotEnoughMemory => "This mode needs more video memory than is available.",
+        DisplayNotice::Rejected => "The video adapter rejected this mode; previous mode restored.",
+    };
+    let notice_color = match state.display_notice {
+        DisplayNotice::Applied => color(fb, 104, 235, 182),
+        DisplayNotice::Unsupported | DisplayNotice::NotEnoughMemory | DisplayNotice::Rejected => color(fb, 255, 169, 155),
+        _ => color(fb, 154, 177, 210),
+    };
+    crate::draw_text(fb, content_x, layout.apply.y + 48, notice_text, 1, notice_color);
+    crate::draw_text(fb, content_x, layout.apply.y + 68, "CHANGES APPLY TO THIS QEMU SESSION.", 1, color(fb, 113, 142, 181));
+}
+
+fn settings_hit_test(fb: &Framebuffer, x: i32, y: i32) -> Option<SettingsHit> {
+    let layout = settings_layout(fb);
+    for index in 0..layout.cards.len() {
+        if layout.cards[index].contains(x, y) {
+            return Some(SettingsHit::SelectMode(index));
+        }
+    }
+    if layout.apply.contains(x, y) { return Some(SettingsHit::Apply); }
+    if layout.current.contains(x, y) { return Some(SettingsHit::UseCurrent); }
+    None
+}
+
+fn display_mode_index(width: usize, height: usize) -> usize {
+    DISPLAY_MODES.iter().position(|mode| mode.width == width && mode.height == height).unwrap_or(0)
+}
+
+fn apply_selected_resolution(
+    framebuffer: &mut Framebuffer,
+    state: &mut DesktopState,
+    current_width: &mut usize,
+    current_height: &mut usize,
+    memory_summary: Option<(MemoryStats, bool)>,
+) -> bool {
+    let mode = DISPLAY_MODES[state.selected_resolution.min(DISPLAY_MODES.len() - 1)];
+    if framebuffer.width as usize == mode.width && framebuffer.height as usize == mode.height {
+        state.display_notice = DisplayNotice::Applied;
+        return false;
+    }
+
+    let hhdm_offset = memory_summary.map(|(stats, _)| stats.hhdm_offset);
+    match set_qemu_vbe_mode(
+        mode,
+        *current_width,
+        *current_height,
+        framebuffer.address,
+        hhdm_offset,
+    ) {
+        Ok(mapped_framebuffer) => {
+            framebuffer.address = mapped_framebuffer;
+            framebuffer.width = mode.width as u64;
+            framebuffer.height = mode.height as u64;
+            framebuffer.pitch = (mode.width * 4) as u64;
+            *current_width = mode.width;
+            *current_height = mode.height;
+            state.mouse_x = state.mouse_x.clamp(1, (*current_width).saturating_sub(2) as i32);
+            state.mouse_y = state.mouse_y.clamp(1, (*current_height).saturating_sub(2) as i32);
+            state.display_notice = DisplayNotice::Applied;
+            crate::serial_write("Display mode changed through QEMU Bochs VBE.\r\n");
+            true
+        }
+        Err(notice) => {
+            state.display_notice = notice;
+            crate::serial_write("Display mode switch failed; see the Settings panel for details.\r\n");
+            false
+        }
+    }
+}
+
+const VBE_INDEX_PORT: u16 = 0x01CE;
+const VBE_DATA_PORT: u16 = 0x01CF;
+const VBE_INDEX_ID: u16 = 0;
+const VBE_INDEX_XRES: u16 = 1;
+const VBE_INDEX_YRES: u16 = 2;
+const VBE_INDEX_BPP: u16 = 3;
+const VBE_INDEX_ENABLE: u16 = 4;
+const VBE_INDEX_VIRT_WIDTH: u16 = 6;
+const VBE_INDEX_VIRT_HEIGHT: u16 = 7;
+const VBE_INDEX_X_OFFSET: u16 = 8;
+const VBE_INDEX_Y_OFFSET: u16 = 9;
+const VBE_INDEX_VIDEO_MEMORY_64K: u16 = 10;
+const VBE_ENABLE: u16 = 0x0041;
+const VBE_ID_MIN: u16 = 0xB0C0;
+const VBE_ID_MAX: u16 = 0xB0C5;
+
+fn set_qemu_vbe_mode(
+    mode: DisplayMode,
+    old_width: usize,
+    old_height: usize,
+    framebuffer_address: *mut u8,
+    hhdm_offset: Option<u64>,
+) -> Result<*mut u8, DisplayNotice> {
+    let id = vbe_read_register(VBE_INDEX_ID);
+    if !(VBE_ID_MIN..=VBE_ID_MAX).contains(&id) {
+        return Err(DisplayNotice::Unsupported);
+    }
+
+    let video_memory_64k = vbe_read_register(VBE_INDEX_VIDEO_MEMORY_64K) as usize;
+    let required_bytes = (mode.width * mode.height * 4) as u64;
+    let required_64k = ((required_bytes + 65_535) / 65_536) as usize;
+    if video_memory_64k != 0 && required_64k > video_memory_64k {
+        return Err(DisplayNotice::NotEnoughMemory);
+    }
+
+    // Extend the HHDM mapping across the adapter's linear framebuffer before
+    // allowing a larger resolution to write more pixels than Limine initially mapped.
+    let offset = hhdm_offset.ok_or(DisplayNotice::Unsupported)?;
+    let address = framebuffer_address as u64;
+    let physical_base = address.checked_sub(offset).ok_or(DisplayNotice::Unsupported)?;
+    // In this QEMU-standard-VGA path, the linear framebuffer must be in the
+    // conventional high PCI MMIO window. Reject a non-HHDM or unexpected alias
+    // rather than accidentally mapping an unrelated physical range.
+    if !(0xC000_0000..4 * 1024 * 1024 * 1024).contains(&physical_base) {
+        return Err(DisplayNotice::Unsupported);
+    }
+    // Map only the aperture bytes needed by the selected mode, not the adapter's
+    // entire advertised VRAM. Some emulated devices report a large VRAM capacity
+    // even though the framebuffer BAR itself is a smaller window.
+    crate::memory::map_mmio_region(physical_base, required_bytes)
+        .map_err(|_| DisplayNotice::Unsupported)?;
+    let mapped_address = offset.checked_add(physical_base).ok_or(DisplayNotice::Unsupported)? as *mut u8;
+
+    if vbe_program_mode(mode.width, mode.height) {
+        Ok(mapped_address)
+    } else {
+        // Avoid leaving the display in an unrecognized mode if the adapter
+        // advertises VBE but refuses a requested resolution.
+        let _ = vbe_program_mode(old_width, old_height);
+        Err(DisplayNotice::Rejected)
+    }
+}
+
+fn vbe_program_mode(width: usize, height: usize) -> bool {
+    unsafe {
+        vbe_write_register(VBE_INDEX_ENABLE, 0);
+        vbe_write_register(VBE_INDEX_XRES, width as u16);
+        vbe_write_register(VBE_INDEX_YRES, height as u16);
+        vbe_write_register(VBE_INDEX_BPP, 32);
+        vbe_write_register(VBE_INDEX_VIRT_WIDTH, width as u16);
+        vbe_write_register(VBE_INDEX_VIRT_HEIGHT, height as u16);
+        vbe_write_register(VBE_INDEX_X_OFFSET, 0);
+        vbe_write_register(VBE_INDEX_Y_OFFSET, 0);
+        vbe_write_register(VBE_INDEX_ENABLE, VBE_ENABLE);
+    }
+    vbe_read_register(VBE_INDEX_XRES) as usize == width
+        && vbe_read_register(VBE_INDEX_YRES) as usize == height
+        && vbe_read_register(VBE_INDEX_BPP) == 32
+        && vbe_read_register(VBE_INDEX_VIRT_WIDTH) as usize == width
+}
+
+fn vbe_read_register(index: u16) -> u16 {
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") VBE_INDEX_PORT, in("ax") index, options(nomem, nostack, preserves_flags));
+        let value: u16;
+        core::arch::asm!("in ax, dx", in("dx") VBE_DATA_PORT, out("ax") value, options(nomem, nostack, preserves_flags));
+        value
+    }
+}
+
+fn vbe_write_register(index: u16, value: u16) {
+    // Port I/O is privileged; this helper is only called by the ring-0 kernel
+    // after confirming that the QEMU Bochs VBE device advertises its ID.
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") VBE_INDEX_PORT, in("ax") index, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("out dx, ax", in("dx") VBE_DATA_PORT, in("ax") value, options(nomem, nostack, preserves_flags));
+    }
 }
 
 fn draw_label_value(fb: &Framebuffer, x: usize, y: usize, label: &str, value: &str, color_value: u32) {
@@ -615,12 +981,7 @@ fn dock_hit_test(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
 
 fn close_button_hit(fb: &Framebuffer, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 { return false; }
-    let width = fb.width as usize;
-    let height = fb.height as usize;
-    let win_w = width.saturating_sub(54).min(700).max(250);
-    let win_h = height.saturating_sub(230).min(420).max(180);
-    let left = width.saturating_sub(win_w) / 2;
-    let top = 74 + height.saturating_sub(74 + win_h + 104) / 2;
+    let (left, top, _win_w, _win_h) = app_window_geometry(fb);
     let x = x as usize;
     let y = y as usize;
     x >= left + 7 && x <= left + 29 && y >= top + 7 && y <= top + 31

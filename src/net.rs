@@ -975,7 +975,7 @@ fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'sta
     append_bytes(&mut request, &mut request_len, parsed.path.as_bytes())?;
     append_bytes(&mut request, &mut request_len, b" HTTP/1.0\r\nHost: ")?;
     append_bytes(&mut request, &mut request_len, parsed.host_header.as_bytes())?;
-    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.2.0-beta.2\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
+    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.2.0-beta.3\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
     if request_len > TCP_MAX_PAYLOAD { return Err("HTTP request exceeds supported TCP payload size"); }
 
     let request_sequence = initial_sequence.wrapping_add(1);

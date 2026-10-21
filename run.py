@@ -91,8 +91,8 @@ def main() -> int:
         print(f"error: QEMU was not found. {hint}", file=sys.stderr)
         return 1
     print("Starting XavierOS in QEMU; close the emulator window to stop it.", flush=True)
-    # Legacy PC/PIIX exposes ATA PIO; QEMU user-mode NAT adds an E1000 NIC, and -cpu max exposes RDRAND when TCG supports it.
-    command = [qemu, "-machine", "pc", "-cpu", "max", "-rtc", "base=utc", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d",
+    # Legacy PC/PIIX exposes ATA PIO; explicit standard VGA enables the QEMU Bochs VBE display-mode controls; user-mode NAT adds E1000 networking.
+    command = [qemu, "-machine", "pc", "-vga", "std", "-cpu", "max", "-rtc", "base=utc", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d",
                "-netdev", "user,id=xvnet0", "-device", "e1000,netdev=xvnet0"]
     if not args.no_disk:
         try:
