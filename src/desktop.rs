@@ -1,4 +1,4 @@
-//! XavierOS Desktop Preview for v0.2.0-beta.3.
+//! XavierOS Desktop Preview for v0.2.0-beta.4.
 //!
 //! A small framebuffer compositor with a macOS-inspired dock. This is an in-kernel
 //! preview: non-terminal apps are information windows, while Terminal opens the
@@ -23,7 +23,7 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.3";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.4";
 const WALLPAPER_WIDTH: usize = 735;
 const WALLPAPER_HEIGHT: usize = 452;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
@@ -97,7 +97,7 @@ struct DesktopState {
 
 // Save only the pixels underneath the small pointer. Redrawing the full desktop
 // for every PS/2 packet caused visible flicker and wasted a large amount of CPU.
-struct CursorBackground {
+pub(super) struct CursorBackground {
     x: usize,
     y: usize,
     width: usize,
@@ -160,7 +160,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
     let mut cursor_background = CursorBackground::new();
     let mut dock_label_background = DockLabelBackground::new();
 
-    crate::serial_write("XavierOS Desktop Preview entered. Press Enter on Terminal or type T.\r\n");
+    crate::serial_write("XavierOS Desktop entered. Terminal opens in a window; press ESC to close it.\r\n");
     render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
     if state.mouse_ready {
         draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
@@ -194,7 +194,9 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                 if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
                     state.selected = index;
                     if index == APP_TERMINAL {
+                        state.open_window = Some(APP_TERMINAL);
                         launch_terminal = true;
+                        repaint = true;
                     } else {
                         state.open_window = Some(index);
                         repaint = true;
@@ -269,7 +271,9 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                         );
                         repaint = true;
                     } else if state.selected == APP_TERMINAL {
+                        state.open_window = Some(APP_TERMINAL);
                         launch_terminal = true;
+                        repaint = true;
                     } else {
                         state.open_window = Some(state.selected);
                         repaint = true;
@@ -282,7 +286,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     }
                 }
                 KeyboardKey::Character(byte) => match byte.to_ascii_uppercase() {
-                    b'T' => launch_terminal = true,
+                    b'T' => { state.open_window = Some(APP_TERMINAL); launch_terminal = true; repaint = true; },
                     b'F' => { state.selected = APP_FILES; state.open_window = Some(APP_FILES); repaint = true; }
                     b'N' => { state.selected = APP_NETWORK; state.open_window = Some(APP_NETWORK); repaint = true; }
                     b'C' => { state.selected = APP_CLOCK; state.open_window = Some(APP_CLOCK); repaint = true; }
@@ -295,9 +299,35 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         }
 
         if launch_terminal {
-            // The console owns the framebuffer while it runs, so the previous
-            // cursor snapshot is discarded by the full desktop redraw below.
-            crate::run_console(&active_framebuffer, memory_summary);
+            // Draw the normal app frame first, then render the existing shell into
+            // a sub-framebuffer clipped to the Terminal window's content area.
+            cursor_background.valid = false;
+            dock_label_background.valid = false;
+            render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+            if state.mouse_ready {
+                draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
+            }
+            let (window_x, window_y, window_w, window_h) = app_window_geometry(&active_framebuffer);
+            let content_x = window_x + 8;
+            let content_y = window_y + 40;
+            let content_w = window_w.saturating_sub(16);
+            let content_h = window_h.saturating_sub(62);
+            let mut terminal_framebuffer = active_framebuffer;
+            terminal_framebuffer.address = unsafe {
+                active_framebuffer.address.add(content_y * active_framebuffer.pitch as usize + content_x * 4)
+            };
+            terminal_framebuffer.width = content_w as u64;
+            terminal_framebuffer.height = content_h as u64;
+            crate::run_console_window(
+                &terminal_framebuffer,
+                &active_framebuffer,
+                memory_summary,
+                state.mouse_ready,
+                &mut state.mouse_x,
+                &mut state.mouse_y,
+                &mut state.mouse_buttons,
+                &mut cursor_background,
+            );
             state.open_window = None;
             repaint = true;
         }
@@ -349,8 +379,10 @@ fn draw_wallpaper(fb: &Framebuffer) {
         return;
     }
 
-    // "Cover" scaling: preserve the photo's aspect ratio and crop the centered
-    // excess so every framebuffer pixel is covered (no stretching or black bars).
+    // Cover scaling with bilinear interpolation. Nearest-neighbour scaling made
+    // the 735x452 source visibly blocky at common 1024x768 and 1280x720 modes.
+    const FP_SHIFT: u32 = 16;
+    const FP_ONE: u64 = 1 << FP_SHIFT;
     let width_u = width as u64;
     let height_u = height as u64;
     let source_w = WALLPAPER_WIDTH as u64;
@@ -360,34 +392,45 @@ fn draw_wallpaper(fb: &Framebuffer) {
     let start_x_fp: u64;
     let start_y_fp: u64;
     if target_is_wider {
-        step_fp = (source_w << 16) / width_u;
+        step_fp = ((source_w << FP_SHIFT) / width_u).max(1);
         start_x_fp = 0;
-        start_y_fp = ((width_u * source_h - height_u * source_w) << 15) / width_u;
+        start_y_fp = ((width_u * source_h - height_u * source_w) << (FP_SHIFT - 1)) / width_u;
     } else {
-        step_fp = (source_h << 16) / height_u;
-        start_x_fp = ((height_u * source_w - width_u * source_h) << 15) / height_u;
+        step_fp = ((source_h << FP_SHIFT) / height_u).max(1);
+        start_x_fp = ((height_u * source_w - width_u * source_h) << (FP_SHIFT - 1)) / height_u;
         start_y_fp = 0;
     }
 
     for y in 0..height {
-        let source_y_fp = start_y_fp + y as u64 * step_fp;
-        let source_y = ((source_y_fp >> 16) as usize).min(WALLPAPER_HEIGHT - 1);
+        let source_y_fp = start_y_fp.saturating_add(y as u64 * step_fp);
+        let source_y0 = ((source_y_fp >> FP_SHIFT) as usize).min(WALLPAPER_HEIGHT - 1);
+        let source_y1 = (source_y0 + 1).min(WALLPAPER_HEIGHT - 1);
+        let fy = (source_y_fp & (FP_ONE - 1)) as u32;
         let row = unsafe { fb.address.add(y * fb.pitch as usize) as *mut u32 };
         for x in 0..width {
-            let source_x_fp = start_x_fp + x as u64 * step_fp;
-            let source_x = ((source_x_fp >> 16) as usize).min(WALLPAPER_WIDTH - 1);
-            let source_index = (source_y * WALLPAPER_WIDTH + source_x) * 3;
-            let pixel = color(
-                fb,
-                WALLPAPER_RGB[source_index],
-                WALLPAPER_RGB[source_index + 1],
-                WALLPAPER_RGB[source_index + 2],
-            );
+            let source_x_fp = start_x_fp.saturating_add(x as u64 * step_fp);
+            let source_x0 = ((source_x_fp >> FP_SHIFT) as usize).min(WALLPAPER_WIDTH - 1);
+            let source_x1 = (source_x0 + 1).min(WALLPAPER_WIDTH - 1);
+            let fx = (source_x_fp & (FP_ONE - 1)) as u32;
+            let top_left = (source_y0 * WALLPAPER_WIDTH + source_x0) * 3;
+            let top_right = (source_y0 * WALLPAPER_WIDTH + source_x1) * 3;
+            let bottom_left = (source_y1 * WALLPAPER_WIDTH + source_x0) * 3;
+            let bottom_right = (source_y1 * WALLPAPER_WIDTH + source_x1) * 3;
+            let interpolate = |channel: usize| -> u8 {
+                let a = WALLPAPER_RGB[top_left + channel] as u64;
+                let b = WALLPAPER_RGB[top_right + channel] as u64;
+                let c = WALLPAPER_RGB[bottom_left + channel] as u64;
+                let d = WALLPAPER_RGB[bottom_right + channel] as u64;
+                let top = a * (FP_ONE - fx as u64) + b * fx as u64;
+                let bottom = c * (FP_ONE - fx as u64) + d * fx as u64;
+                let mixed = top * (FP_ONE - fy as u64) + bottom * fy as u64;
+                ((mixed + (1u64 << 31)) >> 32).min(255) as u8
+            };
+            let pixel = color(fb, interpolate(0), interpolate(1), interpolate(2));
             unsafe { core::ptr::write_volatile(row.add(x), pixel); }
         }
     }
 }
-
 
 fn draw_menu_bar(fb: &Framebuffer, mouse_ready: bool) {
     let width = fb.width as usize;
@@ -618,71 +661,178 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
     let gap = 23;
     match app {
         APP_FILES => {
-            crate::draw_text(fb, left, row_y, "LOCATIONS", 1, color(fb, 104, 220, 255)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "/", 1, color(fb, 226, 237, 252)); row_y += gap;
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "FILES", &["HOME", "DISK", "SYSTEM"], 0);
+            let content_x = x + 160;
+            let content_w = win_w.saturating_sub(180);
+            draw_page_heading(fb, content_x, y + 56, "FILES & STORAGE", "Browse the virtual filesystem.");
+            let stat_w = content_w.saturating_sub(16) / 3;
+            draw_stat_card(fb, content_x, y + 96, stat_w, 58, "LOCATION", "/", color(fb, 97, 211, 255));
+            draw_stat_card(fb, content_x + stat_w + 8, y + 96, stat_w, 58, "FILESYSTEM", "XVRFS", color(fb, 100, 231, 184));
+            draw_stat_card(fb, content_x + (stat_w + 8) * 2, y + 96, stat_w, 58, "DISK", "WRITABLE", color(fb, 255, 196, 100));
+            crate::draw_text(fb, content_x, y + 169, "ROOT DIRECTORY", 1, color(fb, 115, 222, 255));
             let mut count = 0usize;
+            let mut row_y = y + 184;
             let _ = crate::vfs::list_directory("/", |name, is_dir| {
-                if count < 7 {
-                    let prefix = if is_dir { "[DIR]" } else { "[FILE]" };
-                    crate::draw_text(fb, left + 12, row_y + count * gap, prefix, 1, color(fb, 105, 224, 181));
-                    crate::draw_text(fb, left + 58, row_y + count * gap, name, 1, color(fb, 220, 232, 250));
+                if count < 5 {
+                    draw_content_row(
+                        fb, content_x, row_y + count * 35, content_w, 31,
+                        if is_dir { APP_FILES } else { APP_TERMINAL },
+                        name, if is_dir { "DIRECTORY" } else { "FILE" },
+                        if is_dir { color(fb, 101, 216, 255) } else { color(fb, 117, 226, 184) },
+                    );
                 }
                 count += 1;
             });
-            let info_y = y + win_h.saturating_sub(38);
-            crate::draw_text(fb, left, info_y, "OPEN TERMINAL FOR CAT / WRITE / MKDIR", 1, color(fb, 155, 176, 207));
+            if count == 0 {
+                crate::draw_text(fb, content_x + 8, y + 197, "THIS DIRECTORY IS EMPTY.", 1, color(fb, 177, 194, 220));
+            }
+        }
+        APP_TERMINAL => {
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "TERMINAL", &["SESSION", "COMMANDS", "HELP"], 0);
+            let content_x = x + 160;
+            let content_w = win_w.saturating_sub(180);
+            draw_page_heading(fb, content_x, y + 56, "INTERACTIVE TERMINAL", "Run commands in a window, without leaving the desktop.");
+            rounded_rect(fb, content_x, y + 100, content_w, 105, 10, color(fb, 8, 14, 26));
+            crate::fill_rect(fb, content_x + 12, y + 114, 3, 76, color(fb, 93, 224, 178));
+            crate::draw_text(fb, content_x + 28, y + 119, "XAVIEROS SHELL", 1, color(fb, 100, 229, 188));
+            crate::draw_text(fb, content_x + 28, y + 145, "TYPE HELP TO EXPLORE COMMANDS.", 1, color(fb, 223, 234, 251));
+            crate::draw_text(fb, content_x + 28, y + 166, "ESC CLOSES THIS WINDOW AND RETURNS TO DESKTOP.", 1, color(fb, 155, 177, 208));
+            draw_stat_card(fb, content_x, y + 219, (content_w.saturating_sub(12)) / 2, 57, "INPUT", "KEYBOARD READY", color(fb, 104, 224, 255));
+            draw_stat_card(fb, content_x + (content_w.saturating_sub(12)) / 2 + 12, y + 219, (content_w.saturating_sub(12)) / 2, 57, "SHELL", "NO STD / RUST", color(fb, 102, 232, 183));
         }
         APP_NETWORK => {
-            crate::draw_text(fb, left, row_y, "NETWORK STATUS", 1, color(fb, 104, 220, 255)); row_y += gap + 3;
-            crate::draw_text(fb, left, row_y, net::status_text(), 2, color(fb, if net::is_ready() { 105 } else { 255 }, if net::is_ready() { 231 } else { 139 }, if net::is_ready() { 183 } else { 139 })); row_y += gap + 9;
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "NETWORK", &["STATUS", "ADAPTER", "DNS"], 0);
+            let content_x = x + 160;
+            let content_w = win_w.saturating_sub(180);
+            draw_page_heading(fb, content_x, y + 56, "NETWORK OVERVIEW", "Adapter and address information.");
+            let status_text = if net::is_ready() { "CONNECTED" } else { "OFFLINE" };
+            rounded_rect(fb, content_x, y + 95, content_w, 48, 9, color(fb, 17, 31, 49));
+            fill_circle(fb, (content_x + 17) as i32, (y + 119) as i32, 4, color(fb, if net::is_ready() { 98 } else { 255 }, if net::is_ready() { 229 } else { 152 }, if net::is_ready() { 178 } else { 145 }));
+            crate::draw_text(fb, content_x + 31, y + 113, status_text, 1, color(fb, 239, 247, 255));
+            crate::draw_text(fb, content_x + content_w.saturating_sub(132), y + 113, "QEMU E1000", 1, color(fb, 142, 171, 205));
+            let gap = 10;
+            let card_w = content_w.saturating_sub(gap) / 2;
             if let Some(info) = net::info() {
                 let mac = format_mac(&info.mac);
                 let local_ip = format_ipv4(info.local_ip);
                 let gateway = format_ipv4(info.gateway);
                 let dns = format_ipv4(info.dns);
-                draw_label_value(fb, left, row_y, "MAC", bytes_text(&mac), color(fb, 223, 234, 251)); row_y += gap;
-                draw_label_value(fb, left, row_y, "IPV4", bytes_text(&local_ip), color(fb, 223, 234, 251)); row_y += gap;
-                draw_label_value(fb, left, row_y, "GATEWAY", bytes_text(&gateway), color(fb, 223, 234, 251)); row_y += gap;
-                draw_label_value(fb, left, row_y, "DNS", bytes_text(&dns), color(fb, 223, 234, 251)); row_y += gap;
-                crate::draw_text(fb, left, row_y, if info.link_up { "LINK UP" } else { "LINK DOWN" }, 1, color(fb, 105, 224, 181));
+                draw_stat_card(fb, content_x, y + 155, card_w, 63, "MAC ADDRESS", bytes_text(&mac), color(fb, 98, 215, 255));
+                draw_stat_card(fb, content_x + card_w + gap, y + 155, card_w, 63, "IPV4 ADDRESS", bytes_text(&local_ip), color(fb, 103, 230, 183));
+                draw_stat_card(fb, content_x, y + 228, card_w, 63, "GATEWAY", bytes_text(&gateway), color(fb, 255, 201, 112));
+                draw_stat_card(fb, content_x + card_w + gap, y + 228, card_w, 63, "DNS SERVER", bytes_text(&dns), color(fb, 190, 150, 255));
             } else {
-                crate::draw_text(fb, left, row_y, "NO E1000 NETWORK DEVICE WAS DETECTED", 1, color(fb, 255, 166, 151));
+                rounded_rect(fb, content_x, y + 155, content_w, 88, 9, color(fb, 36, 28, 40));
+                crate::draw_text(fb, content_x + 14, y + 173, "NO NETWORK INFORMATION AVAILABLE", 1, color(fb, 255, 171, 158));
+                crate::draw_text(fb, content_x + 14, y + 196, "CHECK THE VIRTUAL NIC AND DHCP STATUS.", 1, color(fb, 194, 202, 221));
             }
-            crate::draw_text(fb, left, y + win_h.saturating_sub(38), "COMMANDS: NETSTAT  NETCHECK  PING", 1, color(fb, 155, 176, 207));
         }
         APP_CLOCK => {
-            crate::draw_text(fb, left, row_y, "WALL CLOCK", 1, color(fb, 104, 220, 255)); row_y += gap + 14;
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "CLOCK", &["LOCAL TIME", "TIMEZONE", "SYNC"], 0);
+            let content_x = x + 160;
+            let content_w = win_w.saturating_sub(180);
+            draw_page_heading(fb, content_x, y + 56, "TIME & DATE", "Your system clock at a glance.");
+            rounded_rect(fb, content_x, y + 98, content_w, 108, 10, color(fb, 12, 23, 40));
+            crate::draw_text(fb, content_x + 15, y + 113, "LOCAL TIME", 1, color(fb, 107, 222, 255));
             if let Ok(now) = clock::now_local() {
                 let mut buffer = [0u8; 24];
                 let text = format_datetime(&mut buffer, now);
-                crate::draw_text(fb, left, row_y, text, if width >= 640 { 3 } else { 2 }, color(fb, 245, 249, 255)); row_y += 42;
+                crate::draw_text(fb, content_x + 15, y + 141, text, 2, color(fb, 244, 248, 255));
+                let mut time_buffer = [0u8; 24];
+                let time = format_clock(&mut time_buffer);
+                crate::draw_text(fb, content_x + 15, y + 177, time, 1, color(fb, 170, 196, 224));
             } else {
-                crate::draw_text(fb, left, row_y, "CLOCK UNAVAILABLE", 2, color(fb, 255, 177, 156)); row_y += gap + 12;
+                crate::draw_text(fb, content_x + 15, y + 148, "CLOCK UNAVAILABLE", 2, color(fb, 255, 171, 158));
             }
-            let offset = clock::timezone_offset_minutes();
-            let timezone = format_timezone(offset);
-            crate::draw_text(fb, left, row_y, bytes_text(&timezone), 1, color(fb, 180, 202, 232)); row_y += gap;
-            crate::draw_text(fb, left, row_y, if clock::is_ntp_synchronized() { "SOURCE: NTP SYNCED" } else { "SOURCE: CMOS RTC" }, 1, color(fb, 105, 224, 181));
+            let card_w = content_w.saturating_sub(12) / 2;
+            let timezone = format_timezone(clock::timezone_offset_minutes());
+            draw_stat_card(fb, content_x, y + 219, card_w, 58, "TIMEZONE", bytes_text(&timezone), color(fb, 98, 215, 255));
+            draw_stat_card(fb, content_x + card_w + 12, y + 219, card_w, 58, "TIME SOURCE", if clock::is_ntp_synchronized() { "NTP SYNCED" } else { "CMOS RTC" }, color(fb, 103, 230, 183));
         }
         APP_SETTINGS => {
             draw_settings_panel(fb, state);
         }
-        _ => {
-            crate::draw_text(fb, left, row_y, "XAVIEROS DESKTOP PREVIEW", 2, color(fb, 112, 221, 255)); row_y += gap + 17;
-            crate::draw_text(fb, left, row_y, BUILD_LABEL, 1, color(fb, 224, 235, 252)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "RUST NO_STD KERNEL  /  LIMINE  /  X86_64", 1, color(fb, 180, 200, 231)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "THE DESKTOP IS AN EARLY IN-KERNEL UI PROTOTYPE.", 1, color(fb, 180, 200, 231)); row_y += gap;
-            crate::draw_text(fb, left, row_y, "FILES, NETWORK, CLOCK AND SETTINGS ARE PREVIEW WINDOWS.", 1, color(fb, 180, 200, 231));
+        APP_ABOUT => {
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "SYSTEM", &["OVERVIEW", "KERNEL", "LICENSE"], 0);
+            let content_x = x + 160;
+            let content_w = win_w.saturating_sub(180);
+            draw_page_heading(fb, content_x, y + 56, "MEET XAVIEROS", "A small operating system built from the kernel up.");
+            rounded_rect(fb, content_x, y + 100, content_w, 79, 10, color(fb, 13, 26, 44));
+            rounded_rect(fb, content_x + 14, y + 113, 51, 51, 12, color(fb, 23, 81, 112));
+            draw_thick_line(fb, (content_x + 25) as i32, (y + 125) as i32, (content_x + 54) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
+            draw_thick_line(fb, (content_x + 54) as i32, (y + 125) as i32, (content_x + 25) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
+            crate::draw_text(fb, content_x + 79, y + 119, "XAVIEROS", 2, color(fb, 243, 248, 255));
+            crate::draw_text(fb, content_x + 79, y + 151, BUILD_LABEL, 1, color(fb, 110, 225, 255));
+            let card_w = content_w.saturating_sub(16) / 3;
+            draw_stat_card(fb, content_x, y + 193, card_w, 62, "KERNEL", "RUST NO_STD", color(fb, 101, 215, 255));
+            draw_stat_card(fb, content_x + card_w + 8, y + 193, card_w, 62, "BOOT", "LIMINE", color(fb, 103, 230, 183));
+            draw_stat_card(fb, content_x + (card_w + 8) * 2, y + 193, card_w, 62, "ARCH", "X86_64", color(fb, 255, 199, 108));
+            crate::draw_text(fb, content_x, y + 278, "EXPERIMENTAL HOBBY OS  /  DIRECT FRAMEBUFFER UI", 1, color(fb, 162, 184, 215));
         }
+        _ => {}
     }
     if app == APP_SETTINGS {
         let layout = settings_layout(fb);
         crate::draw_text(fb, layout.cards[0].x, y + win_h.saturating_sub(18), "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS", 1, color(fb, 123, 150, 190));
+    } else if app == APP_TERMINAL {
+        crate::draw_text(fb, left, y + win_h.saturating_sub(18), "ESC TO CLOSE TERMINAL  /  SHELL INPUT ACTIVE", 1, color(fb, 123, 150, 190));
     } else {
-        let hint = "PRESS ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
+        let hint = "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
     }
     let _ = memory_summary;
+}
+
+fn draw_page_heading(fb: &Framebuffer, x: usize, y: usize, title: &str, subtitle: &str) {
+    crate::draw_text(fb, x, y, title, 2, color(fb, 239, 246, 255));
+    crate::draw_text(fb, x, y + 24, subtitle, 1, color(fb, 155, 179, 211));
+}
+
+fn draw_app_sidebar(fb: &Framebuffer, x: usize, y: usize, width: usize, height: usize, title: &str, items: &[&str], active: usize) {
+    rounded_rect(fb, x, y, width, height, 9, color(fb, 11, 18, 34));
+    crate::draw_text(fb, x + 12, y + 13, title, 1, color(fb, 119, 148, 187));
+    for (index, item) in items.iter().enumerate() {
+        let item_y = y + 35 + index * 36;
+        if item_y + 28 >= y + height { break; }
+        if index == active {
+            rounded_rect(fb, x + 7, item_y, width.saturating_sub(14), 29, 7, color(fb, 28, 88, 119));
+            crate::fill_rect(fb, x + 7, item_y + 5, 2, 19, color(fb, 102, 228, 255));
+        }
+        crate::draw_text(fb, x + 17, item_y + 11, item, 1, color(fb, if index == active { 239 } else { 167 }, if index == active { 247 } else { 190 }, if index == active { 255 } else { 220 }));
+    }
+    let footer_y = y + height.saturating_sub(30);
+    crate::fill_rect(fb, x + 12, footer_y, width.saturating_sub(24), 1, color(fb, 34, 48, 70));
+    crate::draw_text(fb, x + 12, footer_y + 10, "XAVIEROS", 1, color(fb, 100, 216, 245));
+}
+
+fn draw_stat_card(fb: &Framebuffer, x: usize, y: usize, width: usize, height: usize, label: &str, value: &str, accent: u32) {
+    if width < 24 || height < 32 { return; }
+    rounded_rect(fb, x, y, width, height, 8, color(fb, 19, 29, 47));
+    crate::fill_rect(fb, x + 10, y + 9, 3, height.saturating_sub(18).min(28), accent);
+    crate::draw_text(fb, x + 20, y + 10, label, 1, color(fb, 125, 151, 188));
+    let max_chars = width.saturating_sub(29) / 6;
+    let visible = &value[..value.len().min(max_chars)];
+    crate::draw_text(fb, x + 20, y + 30, visible, 1, color(fb, 231, 241, 254));
+}
+
+fn draw_content_row(
+    fb: &Framebuffer,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    icon_app: usize,
+    label: &str,
+    kind: &str,
+    accent: u32,
+) {
+    if width < 72 || height < 24 { return; }
+    rounded_rect(fb, x, y, width, height, 6, color(fb, 17, 27, 44));
+    draw_app_icon(fb, icon_app, x + 5, y + 3, height.saturating_sub(6).min(25));
+    let max_label_chars = width.saturating_sub(116) / 6;
+    crate::draw_text(fb, x + 38, y + 7, &label[..label.len().min(max_label_chars)], 1, color(fb, 226, 237, 252));
+    let kind_width = kind.len() * 6;
+    crate::draw_text(fb, x + width.saturating_sub(kind_width + 10), y + 11, kind, 1, accent);
 }
 
 fn app_window_geometry(fb: &Framebuffer) -> (usize, usize, usize, usize) {
@@ -979,7 +1129,7 @@ fn dock_hit_test(width: usize, height: usize, x: i32, y: i32) -> Option<usize> {
     if index < APP_COUNT { Some(index) } else { None }
 }
 
-fn close_button_hit(fb: &Framebuffer, x: i32, y: i32) -> bool {
+pub(super) fn close_button_hit(fb: &Framebuffer, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 { return false; }
     let (left, top, _win_w, _win_h) = app_window_geometry(fb);
     let x = x as usize;
@@ -987,7 +1137,7 @@ fn close_button_hit(fb: &Framebuffer, x: i32, y: i32) -> bool {
     x >= left + 7 && x <= left + 29 && y >= top + 7 && y <= top + 31
 }
 
-fn draw_mouse_cursor_saved(fb: &Framebuffer, x: i32, y: i32, background: &mut CursorBackground) {
+pub(super) fn draw_mouse_cursor_saved(fb: &Framebuffer, x: i32, y: i32, background: &mut CursorBackground) {
     save_cursor_background(fb, x, y, background);
     draw_mouse_cursor(fb, x, y);
 }
@@ -1019,7 +1169,7 @@ fn save_cursor_background(fb: &Framebuffer, x: i32, y: i32, background: &mut Cur
     background.valid = true;
 }
 
-fn restore_cursor_background(fb: &Framebuffer, background: &mut CursorBackground) {
+pub(super) fn restore_cursor_background(fb: &Framebuffer, background: &mut CursorBackground) {
     if !background.valid { return; }
 
     for row_index in 0..background.height {

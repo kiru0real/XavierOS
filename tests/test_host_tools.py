@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.0-beta.3.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.0-beta.4.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_preview_is_wired_and_version_is_beta_3(self) -> None:
+    def test_desktop_preview_is_wired_and_version_is_beta_4(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,40 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.0-beta.3"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.3"', release)
-        self.assertIn('Current version: `0.2.0-beta.3`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0-beta.4"', cargo)
+        self.assertIn('VERSION = "0.2.0-beta.4"', release)
+        self.assertIn('Current version: `0.2.0-beta.4`', (ROOT / "README.md").read_text(encoding="utf-8"))
+
+    def test_beta4_wallpaper_uses_bilinear_interpolation(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        wallpaper = desktop[desktop.index("fn draw_wallpaper("):desktop.index("fn draw_menu_bar(")]
+        self.assertIn("bilinear interpolation", wallpaper.lower())
+        self.assertIn("let top = a * (FP_ONE - fx as u64) + b * fx as u64;", wallpaper)
+        self.assertIn("let bottom = c * (FP_ONE - fx as u64) + d * fx as u64;", wallpaper)
+        self.assertIn("mixed + (1u64 << 31)", wallpaper)
+
+    def test_terminal_uses_a_sub_framebuffer_and_window_close_controls(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("terminal_framebuffer.address = unsafe", desktop)
+        self.assertIn("terminal_framebuffer.width = content_w as u64", desktop)
+        self.assertIn("crate::run_console_window(", desktop)
+        self.assertIn("fn run_console_window(", main)
+        self.assertIn("if self.windowed", main)
+        self.assertIn("close_button_hit(desktop_framebuffer", main)
+        self.assertIn("Returning to desktop from Terminal window", main)
+
+    def test_beta4_applications_share_desktop_panel_components(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        for app in ("APP_FILES", "APP_TERMINAL", "APP_NETWORK", "APP_CLOCK", "APP_ABOUT"):
+            self.assertIn(app, desktop)
+        self.assertIn("fn draw_app_sidebar(", desktop)
+        self.assertIn("fn draw_stat_card(", desktop)
+        self.assertIn("fn draw_content_row(", desktop)
+        self.assertIn('"FILES & STORAGE"', desktop)
+        self.assertIn('"NETWORK OVERVIEW"', desktop)
+        self.assertIn('"TIME & DATE"', desktop)
+        self.assertIn('"MEET XAVIEROS"', desktop)
 
     def test_desktop_mouse_motion_uses_incremental_redraw(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -267,9 +298,9 @@ class RepositoryShapeTests(unittest.TestCase):
 
     def test_terminal_drains_polled_mouse_stream_while_waiting_for_keyboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
-        console = main[main.index("fn run_console("):main.index("fn redraw_input(")]
+        console = main[main.index("fn run_console_window("):main.index("fn redraw_input(")]
         hidden_input = main[main.index("fn read_hidden_input("):main.index("fn command_user_add(")]
-        self.assertIn("let _ = interrupts::poll_mouse_packet();", console)
+        self.assertIn("let mouse_packet = interrupts::poll_mouse_packet();", console)
         self.assertIn("let _ = interrupts::poll_mouse_packet();", hidden_input)
         self.assertIn("IRQ12 is intentionally masked", console)
 
@@ -285,13 +316,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_beta_3(self) -> None:
+    def test_version_metadata_is_consistent_for_beta_4(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.0-beta.3"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.3"', package)
-        self.assertIn("Current version: `0.2.0-beta.3`", readme)
+        self.assertIn('version = "0.2.0-beta.4"', cargo)
+        self.assertIn('VERSION = "0.2.0-beta.4"', package)
+        self.assertIn("Current version: `0.2.0-beta.4`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -338,7 +369,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.3")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.4")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -380,7 +411,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.0-BETA.3', main)
+        self.assertIn('VERSION: 0.2.0-BETA.4', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -458,8 +489,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.0-beta.3"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.0-beta.3"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0-beta.4"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.0-beta.4"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -512,9 +543,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.0-beta.3`", readme)
-        self.assertIn('VERSION = "0.2.0-beta.3"', release)
-        self.assertIn('version = "0.2.0-beta.3"', cargo)
+        self.assertIn("Current version: `0.2.0-beta.4`", readme)
+        self.assertIn('VERSION = "0.2.0-beta.4"', release)
+        self.assertIn('version = "0.2.0-beta.4"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
@@ -604,7 +635,7 @@ class RepositoryShapeTests(unittest.TestCase):
 
     def test_shell_does_not_override_saved_static_network_mode(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
-        start = main.index("fn run_console(")
+        start = main.index("fn run_console_window(")
         end = main.index("fn redraw_input(", start)
         console = main[start:end]
         self.assertIn("let network_settings = config::current();", console)

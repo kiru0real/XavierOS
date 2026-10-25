@@ -115,7 +115,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
     });
-    serial_write("\r\nXavierOS v0.2.0-beta.3\r\n");
+    serial_write("\r\nXavierOS v0.2.0-beta.4\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -305,13 +305,18 @@ struct Console {
     scale: usize,
     line_height: usize,
     max_cols: usize,
+    windowed: bool,
 }
 
 impl Console {
-    fn new(framebuffer: Framebuffer) -> Self {
-        let scale = if framebuffer.width >= 640 { 2 } else { 1 };
+    fn new(framebuffer: Framebuffer, windowed: bool) -> Self {
+        // Windowed Terminal uses a compact one-pixel font so the shell fits the
+        // content area of a normal desktop window instead of drawing a second
+        // full-screen console chrome inside it.
+        let scale = if windowed { 1 } else if framebuffer.width >= 640 { 2 } else { 1 };
+        let horizontal_padding = if windowed { 32 } else { 80 };
         let max_cols = (framebuffer.width as usize)
-            .saturating_sub(80)
+            .saturating_sub(horizontal_padding)
             .checked_div(6 * scale)
             .unwrap_or(1)
             .max(20)
@@ -323,7 +328,16 @@ impl Console {
             scale,
             line_height: 7 * scale + 4,
             max_cols,
+            windowed,
         }
+    }
+
+    fn text_origin(&self) -> (usize, usize) {
+        if self.windowed { (16, 52) } else { (CONSOLE_TEXT_X, CONSOLE_TEXT_Y) }
+    }
+
+    fn footer_height(&self) -> usize {
+        if self.windowed { 24 } else { CONSOLE_FOOTER_HEIGHT }
     }
 
     fn clear(&mut self) {
@@ -404,8 +418,9 @@ impl Console {
     }
 
     fn visible_rows(&self) -> usize {
+        let (_, text_y) = self.text_origin();
         let available = (self.framebuffer.height as usize)
-            .saturating_sub(CONSOLE_FOOTER_HEIGHT + CONSOLE_TEXT_Y + 10);
+            .saturating_sub(self.footer_height() + text_y + 8);
         (available / self.line_height).max(1)
     }
 
@@ -413,6 +428,25 @@ impl Console {
         let fb = &self.framebuffer;
         let width = fb.width as usize;
         let height = fb.height as usize;
+        if self.windowed {
+            let background = rgb(fb, 8, 13, 24);
+            let header = rgb(fb, 16, 25, 42);
+            let panel = rgb(fb, 11, 18, 31);
+            let line = rgb(fb, 45, 64, 88);
+            fill_rect(fb, 0, 0, width, height, background);
+            fill_rect(fb, 0, 0, width, 32, header);
+            fill_rect(fb, 0, 31, width, 2, rgb(fb, 78, 207, 245));
+            draw_text(fb, 14, 11, "TERMINAL SESSION", 1, rgb(fb, 102, 224, 255));
+            draw_text(fb, width.saturating_sub(120), 11, "XVR / SHELL", 1, rgb(fb, 133, 156, 189));
+            let panel_bottom = height.saturating_sub(27);
+            fill_rect(fb, 8, 39, width.saturating_sub(16), panel_bottom.saturating_sub(39), panel);
+            fill_rect(fb, 8, 39, 2, panel_bottom.saturating_sub(39), rgb(fb, 81, 200, 166));
+            let footer_y = height.saturating_sub(24);
+            fill_rect(fb, 0, footer_y, width, 24, header);
+            fill_rect(fb, 0, footer_y, width, 1, line);
+            draw_text(fb, 12, height.saturating_sub(15), "ESC CLOSE  |  CTRL+C CANCEL  |  TAB COMPLETE", 1, rgb(fb, 141, 164, 195));
+            return;
+        }
         let background = rgb(fb, 10, 15, 29);
         let header = rgb(fb, 19, 28, 49);
         let panel = rgb(fb, 12, 18, 32);
@@ -444,7 +478,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.2.0-BETA.3 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.0-BETA.4 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -453,6 +487,7 @@ impl Console {
     fn render(&self) {
         self.draw_chrome();
         let visible_rows = self.visible_rows();
+        let (text_x, text_y) = self.text_origin();
         let first_line = self.line_count.saturating_sub(visible_rows);
         for (screen_row, line_index) in (first_line..self.line_count).enumerate() {
             let line = &self.lines[line_index];
@@ -463,15 +498,15 @@ impl Console {
             } else {
                 rgb(&self.framebuffer, 225, 234, 249)
             };
-            let y = CONSOLE_TEXT_Y + screen_row * self.line_height;
+            let y = text_y + screen_row * self.line_height;
             if is_x_logo_line(text.as_bytes()) {
                 let logo_color = rgb(&self.framebuffer, 89, 218, 255);
                 let logo = core::str::from_utf8(&text.as_bytes()[..18]).unwrap_or("");
-                draw_text(&self.framebuffer, CONSOLE_TEXT_X, y, logo, self.scale, logo_color);
+                draw_text(&self.framebuffer, text_x, y, logo, self.scale, logo_color);
                 let rest = core::str::from_utf8(&text.as_bytes()[18..]).unwrap_or("");
                 draw_text(
                     &self.framebuffer,
-                    CONSOLE_TEXT_X + 18 * 6 * self.scale,
+                    text_x + 18 * 6 * self.scale,
                     y,
                     rest,
                     self.scale,
@@ -480,7 +515,7 @@ impl Console {
             } else {
                 draw_text(
                     &self.framebuffer,
-                    CONSOLE_TEXT_X,
+                    text_x,
                     y,
                     text,
                     self.scale,
@@ -515,9 +550,10 @@ impl Console {
         let first_line = self.line_count.saturating_sub(visible_rows);
         let index = self.line_count - 1;
         let screen_row = index.saturating_sub(first_line);
-        let cell_x = CONSOLE_TEXT_X.saturating_add(column.saturating_mul(6 * self.scale));
+        let (text_x, text_y) = self.text_origin();
+        let cell_x = text_x.saturating_add(column.saturating_mul(6 * self.scale));
         let x = if column > 0 { cell_x.saturating_sub(self.scale) } else { cell_x };
-        let y = CONSOLE_TEXT_Y + screen_row * self.line_height;
+        let y = text_y + screen_row * self.line_height;
         let cursor_width = self.scale.max(1);
         let cursor_height = (7 * self.scale).min(self.line_height);
         let width = self.framebuffer.width as usize;
@@ -539,21 +575,24 @@ impl Console {
         let index = self.line_count - 1;
         let screen_row = index.saturating_sub(first_line);
         let fb = &self.framebuffer;
-        let y = CONSOLE_TEXT_Y + screen_row * self.line_height;
+        let (text_x, text_y) = self.text_origin();
+        let y = text_y + screen_row * self.line_height;
+        let left = if self.windowed { 8 } else { 32 };
+        let horizontal_padding = if self.windowed { 16 } else { 64 };
         fill_rect(
             fb,
-            32,
+            left,
             y,
-            (fb.width as usize).saturating_sub(64),
+            (fb.width as usize).saturating_sub(horizontal_padding),
             self.line_height,
-            rgb(fb, 12, 18, 32),
+            rgb(fb, 11, 18, 31),
         );
         let line = &self.lines[index];
         let len = line.len.min(self.max_cols);
         let text = core::str::from_utf8(&line.bytes[..len]).unwrap_or("");
         draw_text(
             fb,
-            CONSOLE_TEXT_X,
+            text_x,
             y,
             text,
             self.scale,
@@ -648,15 +687,24 @@ fn framebuffer_is_supported(fb: &Framebuffer) -> bool {
         && fb.pitch >= fb.width.saturating_mul(4)
 }
 
-fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, bool)>) {
+fn run_console_window(
+    framebuffer: &Framebuffer,
+    desktop_framebuffer: &Framebuffer,
+    memory_summary: Option<(MemoryStats, bool)>,
+    mouse_ready: bool,
+    mouse_x: &mut i32,
+    mouse_y: &mut i32,
+    mouse_buttons: &mut u8,
+    cursor_background: &mut crate::desktop::CursorBackground,
+) {
     if !framebuffer_is_supported(framebuffer) {
-        serial_write("ERROR: Unsupported framebuffer format or dimensions.\r\n");
-        halt_forever();
+        serial_write("ERROR: Unsupported Terminal window framebuffer format or dimensions.\r\n");
+        return;
     }
 
-    let mut console = Console::new(*framebuffer);
+    let mut console = Console::new(*framebuffer, true);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.0-BETA.3");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.0-BETA.4");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -692,9 +740,13 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
     }
     console.write_line("");
     write_shell_prompt(&mut console);
+    crate::desktop::restore_cursor_background(desktop_framebuffer, cursor_background);
     console.render();
+    if mouse_ready {
+        crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
+    }
 
-    serial_write("Interactive shell ready. PIC/PIT active; type HELP for commands.\r\n");
+    serial_write("Windowed Terminal ready. Press ESC to return to desktop; type HELP for commands.\r\n");
 
     let mut history = CommandHistory::new();
     loop {
@@ -703,7 +755,13 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         let prompt_start = console.current_line_len();
         let prompt_len = users::current_name_len() + "@XAVIEROS> ".len();
         let input_limit = console.input_limit(prompt_len);
+        if mouse_ready {
+            crate::desktop::restore_cursor_background(desktop_framebuffer, cursor_background);
+        }
         console.render_input_cursor(prompt_start);
+        if mouse_ready {
+            crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
+        }
         let mut history_offset: Option<usize> = None;
         let mut saved_input = [0u8; CONSOLE_INPUT_CAPACITY];
         let mut saved_input_len = 0usize;
@@ -711,12 +769,28 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
         let mut cursor = 0usize;
 
         loop {
-            // The PS/2 mouse remains in streaming mode while Terminal owns the
-            // framebuffer. IRQ12 is intentionally masked, so keep draining AUX
-            // packets here; otherwise a mouse byte can occupy the 8042 output
-            // buffer and starve keyboard scancodes until the desktop loop resumes.
-            let _ = interrupts::poll_mouse_packet();
-            match keyboard_poll_key() {
+            // IRQ12 is intentionally masked in polling mode, so keep draining AUX packets here.
+            // Avoid restoring/redrawing the cursor on idle timer ticks; only do it when
+            // mouse or keyboard activity can alter the pixels beneath the pointer.
+            let mouse_packet = interrupts::poll_mouse_packet();
+            let mouse_event = mouse_packet.is_some();
+            let key = keyboard_poll_key();
+            let keyboard_event = key.is_some();
+            if mouse_event || keyboard_event {
+                crate::desktop::restore_cursor_background(desktop_framebuffer, cursor_background);
+            }
+            if let Some(packet) = mouse_packet {
+                *mouse_x = (*mouse_x + packet.dx as i32).clamp(1, desktop_framebuffer.width.saturating_sub(2) as i32);
+                *mouse_y = (*mouse_y - packet.dy as i32).clamp(1, desktop_framebuffer.height.saturating_sub(2) as i32);
+                let left_now = packet.buttons & 0x01 != 0;
+                let left_before = *mouse_buttons & 0x01 != 0;
+                *mouse_buttons = packet.buttons;
+                if left_now && !left_before && crate::desktop::close_button_hit(desktop_framebuffer, *mouse_x, *mouse_y) {
+                    serial_write("Terminal window closed by pointer.\r\n");
+                    return;
+                }
+            }
+            match key {
                 Some(KeyboardKey::Character(byte)) => {
                     if input_len < input_limit && is_console_character(byte) {
                         input.copy_within(cursor..input_len, cursor + 1);
@@ -779,6 +853,9 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                     console.newline();
                     write_shell_prompt(&mut console);
                     console.render();
+                    if mouse_ready {
+                        crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
+                    }
                     break;
                 }
                 Some(KeyboardKey::HistoryUp) => {
@@ -823,16 +900,8 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                     }
                 }
                 Some(KeyboardKey::Escape) => {
-                    input.fill(0);
-                    input_len = 0;
-                    cursor = 0;
-                    history_offset = None;
-                    console.replace_current_input(prompt_start, &[]);
-                    console.write("ESC");
-                    console.newline();
-                    write_shell_prompt(&mut console);
-                    console.render();
-                    break;
+                    serial_write("Returning to desktop from Terminal window.\r\n");
+                    return;
                 }
                 Some(KeyboardKey::Tab) => {
                     // Completion currently operates on the token at the end of the line.
@@ -856,9 +925,15 @@ fn run_console(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, b
                     process_command(&mut console, command_line, memory_summary);
                     write_shell_prompt(&mut console);
                     console.render();
+                    if mouse_ready {
+                        crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
+                    }
                     break;
                 }
                 None => interrupts::wait_for_interrupt(),
+            }
+            if mouse_ready && (mouse_event || keyboard_event) {
+                crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
             }
         }
     }
@@ -1408,7 +1483,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.2.0-BETA.3");
+            console.write_line("PROJECT VERSION: 0.2.0-BETA.4");
             console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
@@ -1417,7 +1492,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.2.0-BETA.3");
+            console.write_line("VERSION: 0.2.0-BETA.4");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1886,7 +1961,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.2.0-BETA.3"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.0-BETA.4"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2135,7 +2210,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.2.0-BETA.3");
+    let _ = writeln!(&mut out, "Version: 0.2.0-BETA.4");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2382,7 +2457,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.2.0-BETA.3 | DESKTOP PREVIEW AVAILABLE.");
+    console.write_line("VERSION 0.2.0-BETA.4 | DESKTOP PREVIEW AVAILABLE.");
     console.write_line("");
 }
 
@@ -2723,9 +2798,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.3");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.4");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.0-BETA.3");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.0-BETA.4");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2781,7 +2856,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.2.0-BETA.3"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.0-BETA.4"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);

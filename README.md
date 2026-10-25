@@ -10,7 +10,7 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
 [![Status](https://img.shields.io/badge/Status-Desktop%20Preview%20Beta-orange)](#status-and-limitations)
 
-**Current version: `0.2.0-beta.3` · Compact pointer and display settings(available as pre-release)**
+**Current version: `0.2.0-beta.4` · Smoother desktop and windowed Terminal**
 
 [Русская версия README](README.ru.md)
 
@@ -20,15 +20,15 @@ Built from scratch with `no_std`, booted by Limine, and tested in QEMU.
 
 ## About
 
-XavierOS is a small `no_std` Rust kernel for learning low-level systems programming. It boots through Limine, draws directly to the framebuffer, handles PS/2 input, manages physical pages and a kernel heap, and includes an experimental storage and networking stack. Version `0.2.0-beta.3` shrinks the transparent pointer to 28×28 pixels and adds a redesigned Settings display panel with interactive resolution profiles. On QEMU standard VGA, modes can be applied live through Bochs VBE.
+XavierOS is a small `no_std` Rust kernel for learning low-level systems programming. It boots through Limine, draws directly to the framebuffer, handles PS/2 input, manages physical pages and a kernel heap, and includes an experimental storage and networking stack. Version `0.2.0-beta.4` smooths wallpaper scaling with bilinear interpolation, gives Files, Network, Clock, Settings and About a consistent app design, and runs the existing interactive shell inside a Terminal window. Terminal supports pointer movement and can be closed with Escape or its title-bar close control.
 
 ## What's included
 
 - **Bare-metal Rust kernel** for `x86_64-unknown-none`, booted with Limine.
 - **Framebuffer UI** with a custom bitmap font, a full-screen cover-scaled scenic wallpaper, a top menu bar, and a redesigned glass-style app dock with custom vector icons and a custom mouse pointer sourced from a transparent 64×64 PNG and rendered at 28×28 pixels with alpha blending and a contrast halo.
-- **Mouse and keyboard interaction:** polled PS/2 mouse when available, keyboard dock navigation as a fallback, selectable app icons, Escape to close preview windows, and a Terminal app that opens the existing shell.
+- **Mouse and keyboard interaction:** polled PS/2 mouse when available, keyboard dock navigation as a fallback, selectable app icons, Escape to close preview windows, and a windowed Terminal that opens the existing shell.
 - **Preview apps:** Files lists VFS entries, Network shows the E1000/IPv4 configuration, Clock displays the wall clock, Settings provides an interactive display-resolution panel, and About describes the build. These app windows are early in-kernel preview panels, not independent user processes.
-- **Interactive shell:** command history, line editing, Up/Down history, Tab completion, user accounts, filesystem tools, diagnostics, and the neofetch-style `SYSINFO` screen. The shell keeps draining the polled mouse stream so keyboard input is not blocked while Terminal is open. Type `DESKTOP` in Terminal to return to the desktop.
+- **Interactive shell:** command history, line editing, Up/Down history, Tab completion, user accounts, filesystem tools, diagnostics, and the neofetch-style `SYSINFO` screen. The shell keeps draining the polled mouse stream so keyboard input is not blocked while Terminal is open. Press `Escape` or click the red title-bar control to close Terminal, or type `DESKTOP` to return to the desktop.
 - **Memory management:** Limine memory map, PMM, HHDM, heap, IDT exception reporting, PIC/PIT timer and keyboard IRQ.
 - **Storage:** ATA PIO, read-only XVRFS initramfs, VFS dispatcher and writable XVDISKFS on a persistent QEMU disk.
 - **Experimental networking:** QEMU E1000, DHCP client with fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, and a bounded HTTP client.
@@ -55,13 +55,13 @@ The build produces `build/xavieros.iso`. `run.py` attaches a persistent 16 MiB d
 
 - **Mouse:** move the pointer and click a dock icon, if the PS/2 auxiliary device is available.
 - **Keyboard:** Left/Right to select a dock icon, Enter to open it, Escape to close an app preview, and `T` to open Terminal. `F`, `N`, `C`, `S`, and `A` open Files, Network, Clock, Settings, and About.
-- **Terminal:** type `DESKTOP` to return to the desktop. All existing shell commands remain available.
+- **Terminal:** the existing shell runs inside the Terminal window. Press `Escape`, click the red title-bar control, or type `DESKTOP` to return to the desktop. All existing shell commands remain available.
 
-The desktop is intentionally a preview: Terminal is the real shell; the other apps are simple framebuffer panels backed by existing kernel subsystems. Keyboard shortcuts supplement dock navigation: `T`, `F`, `N`, `C`, `S`, and `A` open Terminal, Files, Network, Clock, Settings, and About.
+The desktop is intentionally a preview: Terminal is the real shell rendered inside an app window; the other apps are framebuffer panels backed by existing kernel subsystems. Terminal currently takes keyboard focus while its shell is active, so other apps cannot be focused until Terminal closes. Keyboard shortcuts supplement dock navigation: `T`, `F`, `N`, `C`, `S`, and `A` open Terminal, Files, Network, Clock, Settings, and About.
 
 ### Display resolution
 
-Limine still offers `1024x768`, `1280x720`, and `1366x768` at startup. Settings now lets you select a mode card and choose Apply Mode or Use Current. The selected mode applies to the current QEMU session; the Limine boot selection remains the startup default after a restart. `run.py` explicitly starts QEMU with standard VGA; when the Bochs VBE interface is present and enough video memory is available, Apply Mode switches resolution immediately and updates the framebuffer layout. If live switching is not supported, Settings displays an error and the Limine startup menu remains the fallback. The scenic wallpaper is scaled with a centered cover crop to fill the display without distortion or letterboxing.
+Limine still offers `1024x768`, `1280x720`, and `1366x768` at startup. Settings now lets you select a mode card and choose Apply Mode or Use Current. The selected mode applies to the current QEMU session; the Limine boot selection remains the startup default after a restart. `run.py` explicitly starts QEMU with standard VGA; when the Bochs VBE interface is present and enough video memory is available, Apply Mode switches resolution immediately and updates the framebuffer layout. If live switching is not supported, Settings displays an error and the Limine startup menu remains the fallback. The scenic wallpaper uses bilinear cover scaling with a centered crop to reduce pixelation while filling the display without distortion or letterboxing.
 
 
 ## Console commands

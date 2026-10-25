@@ -1,3 +1,22 @@
+## 0.2.0-beta.4 — Smoother Desktop and Windowed Terminal
+
+### ✨ What's New
+- Replaced nearest-neighbour wallpaper scaling with fixed-point bilinear interpolation to reduce visible pixelation at common QEMU resolutions.
+- Unified Files, Network, Clock and About panels with the same sidebar, heading, status-card and information-card design language as Settings.
+- Changed Terminal from a full-screen framebuffer console to an in-window shell surface that preserves the existing command set, line editor, command history and Tab completion.
+- Kept mouse movement active while Terminal is open and added close controls through Escape and the Terminal title-bar close button. Terminal currently owns keyboard focus while the shell is active.
+- Updated kernel, package, shell, rootfs and documentation version metadata to `0.2.0-beta.4`.
+
+### 🐛 Fixes
+- Windowed Terminal now draws only into a sub-framebuffer inside its application window instead of taking over the entire screen.
+- Terminal console text layout adapts to the window content size and uses a compact font scale to improve the visible command history.
+- The wallpaper's source pixels are interpolated rather than repeatedly magnified as hard-edged blocks.
+
+### 📦 Release
+`0.2.0-beta.4` is a development beta. Host-side tests and archive-integrity checks do not replace a Rust build and QEMU runtime test. Verify drawing, command input, mouse movement and closing Terminal in QEMU before publishing.
+
+---
+
 # XavierOS Changelog
 
 ## 0.2.0-beta.3 — Compact Cursor and Display Settings
