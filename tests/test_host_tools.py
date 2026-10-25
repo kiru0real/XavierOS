@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.0-beta.4.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.0.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_preview_is_wired_and_version_is_beta_4(self) -> None:
+    def test_desktop_preview_is_wired_and_version_is_release_020(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,9 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.0-beta.4"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.4"', release)
-        self.assertIn('Current version: `0.2.0-beta.4`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0"', cargo)
+        self.assertIn('VERSION = "0.2.0"', release)
+        self.assertIn('Current version: `0.2.0`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_beta4_wallpaper_uses_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -216,6 +216,10 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("fn draw_stat_card(", desktop)
         self.assertIn("fn draw_content_row(", desktop)
         self.assertIn('"FILES & STORAGE"', desktop)
+        self.assertIn("run_network_action(&mut state, NetworkHit::Gateway)", desktop)
+        self.assertIn("run_network_action(&mut state, NetworkHit::Dns)", desktop)
+        self.assertIn("run_clock_action(&mut state, ClockHit::SyncNtp)", desktop)
+        self.assertIn("run_clock_action(&mut state, ClockHit::SaveTimezone)", desktop)
         self.assertIn('"NETWORK OVERVIEW"', desktop)
         self.assertIn('"TIME & DATE"', desktop)
         self.assertIn('"MEET XAVIEROS"', desktop)
@@ -238,9 +242,9 @@ class RepositoryShapeTests(unittest.TestCase):
         limine = (ROOT / "limine.conf").read_text(encoding="utf-8")
         wallpaper = ROOT / "assets" / "wallpaper.rgb"
         self.assertIn('include_bytes!("../assets/wallpaper.rgb")', desktop)
-        self.assertIn('const WALLPAPER_WIDTH: usize = 735;', desktop)
-        self.assertIn('const WALLPAPER_HEIGHT: usize = 452;', desktop)
-        self.assertEqual(wallpaper.stat().st_size, 735 * 452 * 3)
+        self.assertIn('const WALLPAPER_WIDTH: usize = 1470;', desktop)
+        self.assertIn('const WALLPAPER_HEIGHT: usize = 904;', desktop)
+        self.assertEqual(wallpaper.stat().st_size, 1470 * 904 * 3)
         self.assertIn('"DISPLAY & RESOLUTION"', desktop)
         self.assertIn('fn settings_hit_test(', desktop)
         self.assertIn('fn apply_selected_resolution(', desktop)
@@ -254,6 +258,14 @@ class RepositoryShapeTests(unittest.TestCase):
             self.assertIn(f"resolution: {mode}", limine)
         self.assertIn("timeout: 5", limine)
 
+    def test_release_system_menu_has_desktop_terminal_about_restart_shutdown(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        for item in ("DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "RESTART", "SHUT DOWN"):
+            self.assertIn(item, desktop)
+        self.assertIn("fn reboot_from_desktop() -> !", desktop)
+        self.assertIn("fn shutdown_from_desktop() -> !", desktop)
+        self.assertIn("b'X' => { state.system_menu_open = true", desktop)
+
     def test_custom_cursor_is_drawn_after_saving_background(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         start = desktop.index("fn draw_mouse_cursor_saved(")
@@ -261,22 +273,22 @@ class RepositoryShapeTests(unittest.TestCase):
         body = desktop[start:end]
         self.assertLess(body.index("save_cursor_background("), body.index("draw_mouse_cursor("))
 
-    def test_custom_cursor_source_is_64px_but_embedded_sprite_is_28px(self) -> None:
+    def test_custom_cursor_source_is_512px_but_embedded_sprite_is_24px(self) -> None:
         png = (ROOT / "assets" / "cursor.png").read_bytes()
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
         width, height, bit_depth, color_type, _compression, _filter, _interlace = struct.unpack(">IIBBBBB", png[16:29])
-        self.assertEqual((width, height), (64, 64))
+        self.assertEqual((width, height), (512, 512))
         self.assertEqual(color_type, 6, "PNG must retain RGBA transparency")
         self.assertEqual(bit_depth, 8)
         rgba = (ROOT / "assets" / "cursor.rgba").read_bytes()
-        self.assertEqual(len(rgba), 28 * 28 * 4)
+        self.assertEqual(len(rgba), 24 * 24 * 4)
         alpha = rgba[3::4]
         self.assertIn(0, alpha, "scaled sprite should preserve transparent pixels")
         self.assertTrue(any(value > 0 for value in alpha), "cursor pixels should remain visible")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         self.assertIn('include_bytes!("../assets/cursor.rgba")', desktop)
-        self.assertIn('const CURSOR_WIDTH: usize = 28;', desktop)
-        self.assertIn('const CURSOR_HEIGHT: usize = 28;', desktop)
+        self.assertIn('const CURSOR_WIDTH: usize = 24;', desktop)
+        self.assertIn('const CURSOR_HEIGHT: usize = 24;', desktop)
         self.assertIn("fn blend_cursor_pixel(", desktop)
         self.assertIn("fn cursor_has_neighbor(", desktop)
 
@@ -308,6 +320,49 @@ class RepositoryShapeTests(unittest.TestCase):
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.glob("*.md")}
         self.assertEqual(docs, {"README.md", "README.ru.md", "CHANGELOG.md"})
 
+    def test_files_panel_supports_directory_navigation_preview_and_writable_operations(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        for declaration in ("struct FilesView", "impl FilesView", "struct FileRow", "struct FilesLayout", "enum FilesHit", "enum NetworkHit", "enum ClockHit"):
+            self.assertIn(declaration, desktop)
+        for feature in (
+            "fn files_set_path(", "fn files_parent_path(", "fn files_activate_row(",
+            "fn files_hit_test(", "fn handle_files_hit(", "fn files_commit_prompt(",
+            "crate::vfs::list_directory", "crate::vfs::read_file(target, &mut contents)",
+            "crate::vfs::mkdir(path)", "crate::vfs::touch(path)", "crate::vfs::remove(path)",
+            '"PREV"', '"NEXT"', '"NEW DIR"', '"NEW FILE"', '"DELETE"',
+            '"FILE PREVIEW LOADED"', '"WRITES REQUIRE /DISK; OPEN DISK FIRST"',
+        ):
+            self.assertIn(feature, desktop)
+        # Writes are deliberately limited to the writable /DISK mount.
+        helper = desktop[desktop.index("fn files_is_writable_path("):desktop.index("fn files_begin_prompt(")]
+        self.assertIn('eq_ignore_ascii_case("/DISK")', helper)
+        self.assertIn('eq_ignore_ascii_case("/DISK/")', helper)
+
+    def test_closing_apps_restores_window_backdrop_without_full_wallpaper_redraw(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        run_body = desktop[desktop.index("pub(super) fn run("):desktop.index("\nfn render_desktop(")]
+        render_body = desktop[desktop.index("fn render_desktop("):desktop.index("\nfn draw_wallpaper(")]
+        self.assertIn("restore_window_backdrop(&active_framebuffer)", run_body)
+        self.assertIn("draw_desktop_chrome(&active_framebuffer", run_body)
+        self.assertIn("fn save_window_backdrop(", desktop)
+        self.assertIn("fn restore_window_backdrop(", desktop)
+        self.assertIn("&& state.open_window == window_before_input", run_body)
+        self.assertIn("if window_before_input.is_some() && state.open_window.is_none()", run_body)
+        self.assertIn("render_window_only(&active_framebuffer", run_body)
+        self.assertNotIn("draw_wallpaper(&active_framebuffer);", run_body)
+        self.assertIn("KeyboardKey::Escape => { state.open_window = None; repaint = true; }", run_body)
+
+    def test_wallpaper_has_higher_resolution_source_for_smoother_scaling(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        wallpaper_png = ROOT / "assets" / "wallpaper-hq.png"
+        self.assertTrue(wallpaper_png.is_file())
+        png = wallpaper_png.read_bytes()
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        width, height = struct.unpack(">II", png[16:24])
+        self.assertEqual((width, height), (1470, 904))
+        self.assertIn("bilinear interpolation", desktop.lower())
+        self.assertIn('include_bytes!("../assets/wallpaper.rgb")', desktop)
+
     def test_timezone_accepts_compact_offset_without_colon(self) -> None:
         clock = (ROOT / "src" / "clock.rs").read_text(encoding="utf-8")
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
@@ -316,13 +371,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_beta_4(self) -> None:
+    def test_version_metadata_is_consistent_for_release_020(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.0-beta.4"', cargo)
-        self.assertIn('VERSION = "0.2.0-beta.4"', package)
-        self.assertIn("Current version: `0.2.0-beta.4`", readme)
+        self.assertIn('version = "0.2.0"', cargo)
+        self.assertIn('VERSION = "0.2.0"', package)
+        self.assertIn("Current version: `0.2.0`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -369,7 +424,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0-BETA.4")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -411,7 +466,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.0-BETA.4', main)
+        self.assertIn('VERSION: 0.2.0', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -489,8 +544,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.0-beta.4"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.0-beta.4"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.0"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.0"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -543,9 +598,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.0-beta.4`", readme)
-        self.assertIn('VERSION = "0.2.0-beta.4"', release)
-        self.assertIn('version = "0.2.0-beta.4"', cargo)
+        self.assertIn("Current version: `0.2.0`", readme)
+        self.assertIn('VERSION = "0.2.0"', release)
+        self.assertIn('version = "0.2.0"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:

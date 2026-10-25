@@ -1,19 +1,19 @@
-//! XavierOS Desktop Preview for v0.2.0-beta.4.
+//! XavierOS in-kernel desktop for v0.2.0.
 //!
-//! A small framebuffer compositor with a macOS-inspired dock. This is an in-kernel
-//! preview: non-terminal apps are information windows, while Terminal opens the
-//! existing shell. Mouse input is polled from the legacy PS/2 auxiliary port;
-//! keyboard navigation remains available when no mouse is detected.
+//! This module provides the framebuffer compositor, desktop windows, file manager,
+//! system actions, and application panels. Applications still run in kernel space;
+//! this is not a user-mode GUI process model. Mouse input is polled from the legacy
+//! PS/2 auxiliary port and keyboard navigation remains available.
 
 use crate::{clock, config, interrupts, net, users, Framebuffer, KeyboardKey, MemoryStats};
 
 const APP_COUNT: usize = 6;
-const CURSOR_WIDTH: usize = 28;
-const CURSOR_HEIGHT: usize = 28;
+const CURSOR_WIDTH: usize = 24;
+const CURSOR_HEIGHT: usize = 24;
 const CURSOR_SAVE_WIDTH: usize = CURSOR_WIDTH;
 const CURSOR_SAVE_HEIGHT: usize = CURSOR_HEIGHT;
-const CURSOR_HOTSPOT_X: i32 = 7;
-const CURSOR_HOTSPOT_Y: i32 = 3;
+const CURSOR_HOTSPOT_X: i32 = 4;
+const CURSOR_HOTSPOT_Y: i32 = 2;
 const CURSOR_RGBA: &[u8] = include_bytes!("../assets/cursor.rgba");
 const DOCK_LABEL_SAVE_WIDTH: usize = 64;
 const DOCK_LABEL_SAVE_HEIGHT: usize = 21;
@@ -23,13 +23,30 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.0-BETA.4";
-const WALLPAPER_WIDTH: usize = 735;
-const WALLPAPER_HEIGHT: usize = 452;
+const BUILD_LABEL: &str = "XAVIEROS 0.2.0";
+const WALLPAPER_WIDTH: usize = 1470;
+const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
 // raw RGB avoids needing a JPEG decoder inside this no_std kernel.
 const WALLPAPER_RGB: &[u8] = include_bytes!("../assets/wallpaper.rgb");
 const APP_NAMES: [&str; APP_COUNT] = ["FILES", "TERMINAL", "NETWORK", "CLOCK", "SETTINGS", "ABOUT"];
+
+const FILE_PATH_CAPACITY: usize = 192;
+const FILE_NAME_CAPACITY: usize = 64;
+const FILE_PREVIEW_CAPACITY: usize = 160;
+const FILES_PAGE_SIZE: usize = 6;
+const WINDOW_BACKDROP_WIDTH: usize = 705;
+const WINDOW_BACKDROP_HEIGHT: usize = 428;
+
+// A window is at most 700x420, plus its drop shadow. Saving just this region
+// avoids repainting the wallpaper line-by-line when closing an application.
+static mut WINDOW_BACKDROP_PIXELS: [u32; WINDOW_BACKDROP_WIDTH * WINDOW_BACKDROP_HEIGHT] =
+    [0; WINDOW_BACKDROP_WIDTH * WINDOW_BACKDROP_HEIGHT];
+static mut WINDOW_BACKDROP_X: usize = 0;
+static mut WINDOW_BACKDROP_Y: usize = 0;
+static mut WINDOW_BACKDROP_W: usize = 0;
+static mut WINDOW_BACKDROP_H: usize = 0;
+static mut WINDOW_BACKDROP_VALID: bool = false;
 
 #[derive(Clone, Copy)]
 struct DisplayMode {
@@ -84,6 +101,103 @@ enum SettingsHit {
     UseCurrent,
 }
 
+#[derive(Clone, Copy)]
+struct FileRow {
+    name: [u8; FILE_NAME_CAPACITY],
+    len: usize,
+    is_dir: bool,
+}
+
+impl FileRow {
+    fn empty() -> Self {
+        Self { name: [0; FILE_NAME_CAPACITY], len: 0, is_dir: false }
+    }
+}
+
+struct FilesView {
+    path: [u8; FILE_PATH_CAPACITY],
+    path_len: usize,
+    page_start: usize,
+    highlighted: usize,
+    selected_path: [u8; FILE_PATH_CAPACITY],
+    selected_path_len: usize,
+    selected_name: [u8; FILE_NAME_CAPACITY],
+    selected_name_len: usize,
+    preview: [u8; FILE_PREVIEW_CAPACITY],
+    preview_len: usize,
+    notice: [u8; 96],
+    notice_len: usize,
+    prompt: [u8; FILE_NAME_CAPACITY],
+    prompt_len: usize,
+    prompt_mode: u8,
+}
+
+impl FilesView {
+    fn new() -> Self {
+        let mut path = [0; FILE_PATH_CAPACITY];
+        path[0] = b'/';
+        Self {
+            path,
+            path_len: 1,
+            page_start: 0,
+            highlighted: 0,
+            selected_path: [0; FILE_PATH_CAPACITY],
+            selected_path_len: 0,
+            selected_name: [0; FILE_NAME_CAPACITY],
+            selected_name_len: 0,
+            preview: [0; FILE_PREVIEW_CAPACITY],
+            preview_len: 0,
+            notice: [0; 96],
+            notice_len: 0,
+            prompt: [0; FILE_NAME_CAPACITY],
+            prompt_len: 0,
+            prompt_mode: 0,
+        }
+    }
+}
+
+struct FilesLayout {
+    content_x: usize,
+    content_w: usize,
+    path: Rect,
+    up: Rect,
+    previous: Rect,
+    next: Rect,
+    new_directory: Rect,
+    new_file: Rect,
+    delete: Rect,
+    rows: Rect,
+    preview: Rect,
+}
+
+#[derive(Clone, Copy)]
+enum FilesHit {
+    Home,
+    Disk,
+    System,
+    Up,
+    Previous,
+    Next,
+    NewDirectory,
+    NewFile,
+    Delete,
+    Row(usize),
+}
+
+#[derive(Clone, Copy)]
+enum NetworkHit {
+    Gateway,
+    Dns,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClockHit {
+    SyncNtp,
+    TimezoneMinus,
+    TimezonePlus,
+    SaveTimezone,
+}
+
 struct DesktopState {
     selected: usize,
     open_window: Option<usize>,
@@ -93,6 +207,12 @@ struct DesktopState {
     mouse_ready: bool,
     selected_resolution: usize,
     display_notice: DisplayNotice,
+    system_menu_open: bool,
+    system_menu_selected: usize,
+    files: FilesView,
+    app_notice: [u8; 96],
+    app_notice_len: usize,
+    about_tab: usize,
 }
 
 // Save only the pixels underneath the small pointer. Redrawing the full desktop
@@ -156,6 +276,12 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         mouse_ready,
         selected_resolution: display_mode_index(width, height),
         display_notice: DisplayNotice::None,
+        system_menu_open: false,
+        system_menu_selected: 0,
+        files: FilesView::new(),
+        app_notice: [0; 96],
+        app_notice_len: 0,
+        about_tab: 0,
     };
     let mut cursor_background = CursorBackground::new();
     let mut dock_label_background = DockLabelBackground::new();
@@ -166,7 +292,15 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
     }
 
+    let mut last_dynamic_second = interrupts::timer_ticks() / 100;
     loop {
+        let window_before_input = state.open_window;
+        let system_menu_before_input = state.system_menu_open;
+        let now_second = interrupts::timer_ticks() / 100;
+        let dynamic_refresh = now_second != last_dynamic_second
+            && matches!(state.open_window, Some(APP_CLOCK) | Some(APP_NETWORK));
+        last_dynamic_second = now_second;
+        let mut force_full_repaint = false;
         let mut repaint = false;
         let mut dock_repaint = false;
         let mut cursor_moved = false;
@@ -191,7 +325,20 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
             let left_now = packet.buttons & 0x01 != 0;
             let left_before = state.mouse_buttons & 0x01 != 0;
             if left_now && !left_before {
-                if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
+                if state.system_menu_open {
+                    match system_menu_hit(state.mouse_x, state.mouse_y) {
+                        Some(0) => { state.open_window = None; state.system_menu_open = false; repaint = true; }
+                        Some(1) => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
+                        Some(2) => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
+                        Some(3) => reboot_from_desktop(),
+                        Some(4) => shutdown_from_desktop(),
+                        _ => { state.system_menu_open = false; repaint = true; }
+                    }
+                } else if state.mouse_y < 42 && state.mouse_x < 132 {
+                    state.system_menu_open = true;
+                    state.system_menu_selected = 0;
+                    repaint = true;
+                } else if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
                     state.selected = index;
                     if index == APP_TERMINAL {
                         state.open_window = Some(APP_TERMINAL);
@@ -199,6 +346,38 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                         repaint = true;
                     } else {
                         state.open_window = Some(index);
+                        repaint = true;
+                    }
+                } else if state.open_window == Some(APP_FILES) {
+                    if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.open_window = None;
+                        repaint = true;
+                    } else if let Some(hit) = files_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y, &state.files) {
+                        handle_files_hit(&mut state, hit);
+                        repaint = true;
+                    }
+                } else if state.open_window == Some(APP_NETWORK) {
+                    if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.open_window = None;
+                        repaint = true;
+                    } else if let Some(action) = network_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        run_network_action(&mut state, action);
+                        repaint = true;
+                    }
+                } else if state.open_window == Some(APP_CLOCK) {
+                    if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.open_window = None;
+                        repaint = true;
+                    } else if let Some(action) = clock_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        run_clock_action(&mut state, action);
+                        repaint = true;
+                    }
+                } else if state.open_window == Some(APP_ABOUT) {
+                    if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.open_window = None;
+                        repaint = true;
+                    } else if let Some(tab) = about_tab_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.about_tab = tab;
                         repaint = true;
                     }
                 } else if state.open_window == Some(APP_SETTINGS) {
@@ -209,13 +388,14 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                             repaint = true;
                         }
                         Some(SettingsHit::Apply) => {
-                            let _changed = apply_selected_resolution(
+                            let changed = apply_selected_resolution(
                                 &mut active_framebuffer,
                                 &mut state,
                                 &mut width,
                                 &mut height,
                                 memory_summary,
                             );
+                            force_full_repaint |= changed;
                             repaint = true;
                         }
                         Some(SettingsHit::UseCurrent) => {
@@ -239,7 +419,47 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         }
 
         if let Some(key) = crate::keyboard_poll_key() {
-            match key {
+            if state.system_menu_open {
+                match key {
+                    KeyboardKey::HistoryUp => { state.system_menu_selected = (state.system_menu_selected + 4) % 5; repaint = true; }
+                    KeyboardKey::HistoryDown | KeyboardKey::Tab => { state.system_menu_selected = (state.system_menu_selected + 1) % 5; repaint = true; }
+                    KeyboardKey::Escape => { state.system_menu_open = false; repaint = true; }
+                    KeyboardKey::Enter => match state.system_menu_selected {
+                        0 => { state.open_window = None; state.system_menu_open = false; repaint = true; }
+                        1 => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
+                        2 => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
+                        3 => reboot_from_desktop(),
+                        _ => shutdown_from_desktop(),
+                    },
+                    _ => {}
+                }
+            } else if state.open_window == Some(APP_FILES) {
+                handle_files_key(&mut state, key);
+                repaint = true;
+            } else if state.open_window == Some(APP_NETWORK) {
+                match key {
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'G' => { run_network_action(&mut state, NetworkHit::Gateway); repaint = true; }
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'D' => { run_network_action(&mut state, NetworkHit::Dns); repaint = true; }
+                    KeyboardKey::Escape => { state.open_window = None; repaint = true; }
+                    _ => {}
+                }
+            } else if state.open_window == Some(APP_CLOCK) {
+                match key {
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'N' => { run_clock_action(&mut state, ClockHit::SyncNtp); repaint = true; }
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'M' => { run_clock_action(&mut state, ClockHit::TimezoneMinus); repaint = true; }
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'P' => { run_clock_action(&mut state, ClockHit::TimezonePlus); repaint = true; }
+                    KeyboardKey::Character(byte) if byte.to_ascii_uppercase() == b'S' => { run_clock_action(&mut state, ClockHit::SaveTimezone); repaint = true; }
+                    KeyboardKey::Escape => { state.open_window = None; repaint = true; }
+                    _ => {}
+                }
+            } else if state.open_window == Some(APP_ABOUT) {
+                match key {
+                    KeyboardKey::HistoryUp => { state.about_tab = (state.about_tab + 2) % 3; repaint = true; }
+                    KeyboardKey::HistoryDown | KeyboardKey::Tab => { state.about_tab = (state.about_tab + 1) % 3; repaint = true; }
+                    KeyboardKey::Escape => { state.open_window = None; repaint = true; }
+                    _ => {}
+                }
+            } else { match key {
                 KeyboardKey::CursorLeft | KeyboardKey::HistoryUp => {
                     if state.open_window == Some(APP_SETTINGS) {
                         state.selected_resolution = (state.selected_resolution + DISPLAY_MODES.len() - 1) % DISPLAY_MODES.len();
@@ -262,13 +482,14 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                 }
                 KeyboardKey::Enter => {
                     if state.open_window == Some(APP_SETTINGS) {
-                        let _changed = apply_selected_resolution(
+                        let changed = apply_selected_resolution(
                             &mut active_framebuffer,
                             &mut state,
                             &mut width,
                             &mut height,
                             memory_summary,
                         );
+                        force_full_repaint |= changed;
                         repaint = true;
                     } else if state.selected == APP_TERMINAL {
                         state.open_window = Some(APP_TERMINAL);
@@ -292,10 +513,11 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     b'C' => { state.selected = APP_CLOCK; state.open_window = Some(APP_CLOCK); repaint = true; }
                     b'S' => { state.selected = APP_SETTINGS; state.open_window = Some(APP_SETTINGS); repaint = true; }
                     b'A' => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); repaint = true; }
+                    b'X' => { state.system_menu_open = true; state.system_menu_selected = 0; repaint = true; }
                     _ => {}
                 },
                 _ => {}
-            }
+            }}
         }
 
         if launch_terminal {
@@ -329,13 +551,38 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                 &mut cursor_background,
             );
             state.open_window = None;
-            repaint = true;
+            repaint = false;
+            restore_cursor_background(&active_framebuffer, &mut cursor_background);
+            restore_window_backdrop(&active_framebuffer);
+            draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
+            if state.mouse_ready {
+                draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
+            }
         }
 
         if repaint {
-            cursor_background.valid = false;
-            dock_label_background.valid = false;
-            render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+            if window_before_input.is_some() && state.open_window.is_none() {
+                restore_cursor_background(&active_framebuffer, &mut cursor_background);
+                restore_window_backdrop(&active_framebuffer);
+                draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
+            } else if !force_full_repaint
+                && window_before_input.is_some()
+                && state.open_window == window_before_input
+                && state.system_menu_open == system_menu_before_input
+            {
+                restore_cursor_background(&active_framebuffer, &mut cursor_background);
+                render_window_only(&active_framebuffer, &state, memory_summary);
+            } else {
+                cursor_background.valid = false;
+                dock_label_background.valid = false;
+                render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+            }
+            if state.mouse_ready {
+                draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
+            }
+        } else if dynamic_refresh && state.open_window.is_some() {
+            restore_cursor_background(&active_framebuffer, &mut cursor_background);
+            render_window_only(&active_framebuffer, &state, memory_summary);
             if state.mouse_ready {
                 draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
@@ -365,11 +612,73 @@ fn render_desktop(
 ) {
     draw_wallpaper(fb);
     if let Some(app) = state.open_window {
+        save_window_backdrop(fb);
         draw_app_window(fb, app, memory_summary, state);
     }
     draw_menu_bar(fb, state.mouse_ready);
     save_dock_label_background(fb, state.selected, dock_label_background);
     draw_dock(fb, state.selected);
+    if state.system_menu_open { draw_system_menu(fb, state.system_menu_selected); }
+}
+
+fn draw_desktop_chrome(fb: &Framebuffer, state: &DesktopState, dock_label_background: &mut DockLabelBackground) {
+    restore_dock_label_background(fb, dock_label_background);
+    draw_menu_bar(fb, state.mouse_ready);
+    save_dock_label_background(fb, state.selected, dock_label_background);
+    draw_dock(fb, state.selected);
+    if state.system_menu_open { draw_system_menu(fb, state.system_menu_selected); }
+}
+
+fn render_window_only(fb: &Framebuffer, state: &DesktopState, memory_summary: Option<(MemoryStats, bool)>) {
+    if let Some(app) = state.open_window {
+        restore_window_backdrop(fb);
+        save_window_backdrop(fb);
+        draw_app_window(fb, app, memory_summary, state);
+        draw_menu_bar(fb, state.mouse_ready);
+        if state.system_menu_open { draw_system_menu(fb, state.system_menu_selected); }
+    }
+}
+
+fn save_window_backdrop(fb: &Framebuffer) {
+    let (x, y, window_w, window_h) = app_window_geometry(fb);
+    let width = (window_w + 5).min(WINDOW_BACKDROP_WIDTH).min((fb.width as usize).saturating_sub(x));
+    let height = (window_h + 8).min(WINDOW_BACKDROP_HEIGHT).min((fb.height as usize).saturating_sub(y));
+    if width == 0 || height == 0 { return; }
+    unsafe {
+        WINDOW_BACKDROP_X = x;
+        WINDOW_BACKDROP_Y = y;
+        WINDOW_BACKDROP_W = width;
+        WINDOW_BACKDROP_H = height;
+        WINDOW_BACKDROP_VALID = false;
+        let cache = core::ptr::addr_of_mut!(WINDOW_BACKDROP_PIXELS).cast::<u32>();
+        for row_index in 0..height {
+            let source = fb.address.add((y + row_index) * fb.pitch as usize).cast::<u32>();
+            for column in 0..width {
+                core::ptr::write(cache.add(row_index * WINDOW_BACKDROP_WIDTH + column),
+                    core::ptr::read_volatile(source.add(x + column)));
+            }
+        }
+        WINDOW_BACKDROP_VALID = true;
+    }
+}
+
+fn restore_window_backdrop(fb: &Framebuffer) {
+    unsafe {
+        if !WINDOW_BACKDROP_VALID { return; }
+        let x = WINDOW_BACKDROP_X;
+        let y = WINDOW_BACKDROP_Y;
+        let width = WINDOW_BACKDROP_W.min((fb.width as usize).saturating_sub(x));
+        let height = WINDOW_BACKDROP_H.min((fb.height as usize).saturating_sub(y));
+        let cache = core::ptr::addr_of!(WINDOW_BACKDROP_PIXELS).cast::<u32>();
+        for row_index in 0..height {
+            let destination = fb.address.add((y + row_index) * fb.pitch as usize).cast::<u32>();
+            for column in 0..width {
+                core::ptr::write_volatile(destination.add(x + column),
+                    core::ptr::read(cache.add(row_index * WINDOW_BACKDROP_WIDTH + column)));
+            }
+        }
+        WINDOW_BACKDROP_VALID = false;
+    }
 }
 
 fn draw_wallpaper(fb: &Framebuffer) {
@@ -379,8 +688,9 @@ fn draw_wallpaper(fb: &Framebuffer) {
         return;
     }
 
-    // Cover scaling with bilinear interpolation. Nearest-neighbour scaling made
-    // the 735x452 source visibly blocky at common 1024x768 and 1280x720 modes.
+    // The original 735x452 wallpaper is stored as a high-quality 2x Lanczos
+    // upscale with a restrained unsharp mask, then bilinear interpolation during cover mapping gives
+    // smoother gradients and fewer block edges at the supported display modes.
     const FP_SHIFT: u32 = 16;
     const FP_ONE: u64 = 1 << FP_SHIFT;
     let width_u = width as u64;
@@ -448,6 +758,63 @@ fn draw_menu_bar(fb: &Framebuffer, mouse_ready: bool) {
     let right_x = width.saturating_sub(time_width + if mouse_ready { 124 } else { 102 });
     crate::draw_text(fb, right_x, 16, time, 1, color(fb, 228, 237, 250));
     crate::draw_text(fb, width.saturating_sub(if mouse_ready { 96 } else { 80 }), 16, if mouse_ready { "MOUSE" } else { "KEYS" }, 1, color(fb, 107, 229, 181));
+}
+
+const SYSTEM_MENU_ITEMS: [&str; 5] = ["DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "RESTART", "SHUT DOWN"];
+
+fn draw_system_menu(fb: &Framebuffer, selected: usize) {
+    let x = 12usize;
+    let y = 46usize;
+    let w = 224usize;
+    let row_h = 34usize;
+    let h = row_h * SYSTEM_MENU_ITEMS.len() + 16;
+    rounded_rect(fb, x + 3, y + 5, w, h, 10, color(fb, 3, 5, 12));
+    rounded_rect(fb, x, y, w, h, 10, color(fb, 22, 31, 51));
+    crate::draw_text(fb, x + 14, y + 12, "XAVIEROS SYSTEM", 1, color(fb, 100, 220, 255));
+    for (i, item) in SYSTEM_MENU_ITEMS.iter().enumerate() {
+        let row_y = y + 31 + i * row_h;
+        if i == selected {
+            rounded_rect(fb, x + 7, row_y, w - 14, row_h - 2, 6, color(fb, 43, 72, 103));
+        }
+        let text_color = if i >= 3 { color(fb, 255, 170, 160) } else { color(fb, 226, 237, 251) };
+        crate::draw_text(fb, x + 17, row_y + 11, item, 1, text_color);
+    }
+}
+
+fn system_menu_hit(x: i32, y: i32) -> Option<usize> {
+    if !(12..=236).contains(&x) || !(77..247).contains(&y) { return None; }
+    let index = ((y - 77) / 34) as usize;
+    if index < SYSTEM_MENU_ITEMS.len() { Some(index) } else { None }
+}
+
+fn reboot_from_desktop() -> ! {
+    crate::serial_write("Desktop requested reboot.\r\n");
+    unsafe {
+        for _ in 0..100_000 {
+            let status: u8;
+            core::arch::asm!("in al, dx", in("dx") 0x64u16, out("al") status, options(nomem, nostack, preserves_flags));
+            if status & 0x02 == 0 {
+                core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0xFEu8, options(nomem, nostack, preserves_flags));
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    halt_desktop()
+}
+
+fn shutdown_from_desktop() -> ! {
+    crate::serial_write("Desktop requested shutdown.\r\n");
+    unsafe {
+        // QEMU/Bochs-compatible ACPI shutdown ports. Firmware may ignore these on real hardware.
+        core::arch::asm!("out dx, ax", in("dx") 0x604u16, in("ax") 0x2000u16, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("out dx, ax", in("dx") 0xB004u16, in("ax") 0x2000u16, options(nomem, nostack, preserves_flags));
+    }
+    halt_desktop()
+}
+
+fn halt_desktop() -> ! {
+    loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
 }
 
 fn format_clock(buffer: &mut [u8; 24]) -> &str {
@@ -661,31 +1028,7 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
     let gap = 23;
     match app {
         APP_FILES => {
-            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "FILES", &["HOME", "DISK", "SYSTEM"], 0);
-            let content_x = x + 160;
-            let content_w = win_w.saturating_sub(180);
-            draw_page_heading(fb, content_x, y + 56, "FILES & STORAGE", "Browse the virtual filesystem.");
-            let stat_w = content_w.saturating_sub(16) / 3;
-            draw_stat_card(fb, content_x, y + 96, stat_w, 58, "LOCATION", "/", color(fb, 97, 211, 255));
-            draw_stat_card(fb, content_x + stat_w + 8, y + 96, stat_w, 58, "FILESYSTEM", "XVRFS", color(fb, 100, 231, 184));
-            draw_stat_card(fb, content_x + (stat_w + 8) * 2, y + 96, stat_w, 58, "DISK", "WRITABLE", color(fb, 255, 196, 100));
-            crate::draw_text(fb, content_x, y + 169, "ROOT DIRECTORY", 1, color(fb, 115, 222, 255));
-            let mut count = 0usize;
-            let mut row_y = y + 184;
-            let _ = crate::vfs::list_directory("/", |name, is_dir| {
-                if count < 5 {
-                    draw_content_row(
-                        fb, content_x, row_y + count * 35, content_w, 31,
-                        if is_dir { APP_FILES } else { APP_TERMINAL },
-                        name, if is_dir { "DIRECTORY" } else { "FILE" },
-                        if is_dir { color(fb, 101, 216, 255) } else { color(fb, 117, 226, 184) },
-                    );
-                }
-                count += 1;
-            });
-            if count == 0 {
-                crate::draw_text(fb, content_x + 8, y + 197, "THIS DIRECTORY IS EMPTY.", 1, color(fb, 177, 194, 220));
-            }
+            draw_files_panel(fb, state);
         }
         APP_TERMINAL => {
             draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "TERMINAL", &["SESSION", "COMMANDS", "HELP"], 0);
@@ -726,6 +1069,21 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
                 crate::draw_text(fb, content_x + 14, y + 173, "NO NETWORK INFORMATION AVAILABLE", 1, color(fb, 255, 171, 158));
                 crate::draw_text(fb, content_x + 14, y + 196, "CHECK THE VIRTUAL NIC AND DHCP STATUS.", 1, color(fb, 194, 202, 221));
             }
+            let gateway_button = network_action_rects(fb).0;
+            let dns_button = network_action_rects(fb).1;
+            draw_action_button(fb, gateway_button, "CHECK GATEWAY", color(fb, 26, 92, 111));
+            draw_action_button(fb, dns_button, "CHECK DNS", color(fb, 24, 91, 78));
+            let stats = net::statistics();
+            let status_text = core::str::from_utf8(&state.app_notice[..state.app_notice_len]).unwrap_or("");
+            crate::draw_text(fb, content_x, y + 347, if status_text.is_empty() { "CHECK GATEWAY CONNECTIVITY OR RESOLVE EXAMPLE.COM." } else { status_text }, 1, color(fb, 158, 214, 240));
+            let mut tx = [0u8; 24];
+            let mut rx = [0u8; 24];
+            let tx_text = push_decimal_text(&mut tx, stats.tx_frames as u64);
+            let rx_text = push_decimal_text(&mut rx, stats.rx_frames as u64);
+            crate::draw_text(fb, content_x, y + 367, "TX FRAMES:", 1, color(fb, 119, 147, 183));
+            crate::draw_text(fb, content_x + 66, y + 367, tx_text, 1, color(fb, 225, 237, 252));
+            crate::draw_text(fb, content_x + 180, y + 367, "RX FRAMES:", 1, color(fb, 119, 147, 183));
+            crate::draw_text(fb, content_x + 246, y + 367, rx_text, 1, color(fb, 225, 237, 252));
         }
         APP_CLOCK => {
             draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "CLOCK", &["LOCAL TIME", "TIMEZONE", "SYNC"], 0);
@@ -748,26 +1106,58 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
             let timezone = format_timezone(clock::timezone_offset_minutes());
             draw_stat_card(fb, content_x, y + 219, card_w, 58, "TIMEZONE", bytes_text(&timezone), color(fb, 98, 215, 255));
             draw_stat_card(fb, content_x + card_w + 12, y + 219, card_w, 58, "TIME SOURCE", if clock::is_ntp_synchronized() { "NTP SYNCED" } else { "CMOS RTC" }, color(fb, 103, 230, 183));
+            let clock_buttons = clock_action_rects(fb);
+            draw_action_button(fb, clock_buttons.0, "SYNC NTP", color(fb, 26, 92, 111));
+            draw_action_button(fb, clock_buttons.1, "TZ -1H", color(fb, 28, 43, 65));
+            draw_action_button(fb, clock_buttons.2, "TZ +1H", color(fb, 28, 43, 65));
+            draw_action_button(fb, clock_buttons.3, "SAVE TZ", color(fb, 24, 91, 78));
+            let notice = core::str::from_utf8(&state.app_notice[..state.app_notice_len]).unwrap_or("");
+            crate::draw_text(fb, content_x, y + 320, if notice.is_empty() { "SYNC THE CLOCK OR ADJUST TIMEZONE BELOW." } else { notice }, 1, color(fb, 158, 214, 240));
+            crate::draw_text(fb, content_x, y + 344, "TIMEZONE IS A FIXED UTC OFFSET; DST IS NOT AUTOMATIC.", 1, color(fb, 119, 147, 183));
         }
         APP_SETTINGS => {
             draw_settings_panel(fb, state);
         }
         APP_ABOUT => {
-            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "SYSTEM", &["OVERVIEW", "KERNEL", "LICENSE"], 0);
+            let items = &["OVERVIEW", "KERNEL", "LICENSE"];
+            draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "SYSTEM", items, state.about_tab.min(2));
             let content_x = x + 160;
             let content_w = win_w.saturating_sub(180);
-            draw_page_heading(fb, content_x, y + 56, "MEET XAVIEROS", "A small operating system built from the kernel up.");
-            rounded_rect(fb, content_x, y + 100, content_w, 79, 10, color(fb, 13, 26, 44));
-            rounded_rect(fb, content_x + 14, y + 113, 51, 51, 12, color(fb, 23, 81, 112));
-            draw_thick_line(fb, (content_x + 25) as i32, (y + 125) as i32, (content_x + 54) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
-            draw_thick_line(fb, (content_x + 54) as i32, (y + 125) as i32, (content_x + 25) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
-            crate::draw_text(fb, content_x + 79, y + 119, "XAVIEROS", 2, color(fb, 243, 248, 255));
-            crate::draw_text(fb, content_x + 79, y + 151, BUILD_LABEL, 1, color(fb, 110, 225, 255));
-            let card_w = content_w.saturating_sub(16) / 3;
-            draw_stat_card(fb, content_x, y + 193, card_w, 62, "KERNEL", "RUST NO_STD", color(fb, 101, 215, 255));
-            draw_stat_card(fb, content_x + card_w + 8, y + 193, card_w, 62, "BOOT", "LIMINE", color(fb, 103, 230, 183));
-            draw_stat_card(fb, content_x + (card_w + 8) * 2, y + 193, card_w, 62, "ARCH", "X86_64", color(fb, 255, 199, 108));
-            crate::draw_text(fb, content_x, y + 278, "EXPERIMENTAL HOBBY OS  /  DIRECT FRAMEBUFFER UI", 1, color(fb, 162, 184, 215));
+            match state.about_tab {
+                0 => {
+                    draw_page_heading(fb, content_x, y + 56, "MEET XAVIEROS", "A small operating system built from the kernel up.");
+                    rounded_rect(fb, content_x, y + 100, content_w, 79, 10, color(fb, 13, 26, 44));
+                    rounded_rect(fb, content_x + 14, y + 113, 51, 51, 12, color(fb, 23, 81, 112));
+                    draw_thick_line(fb, (content_x + 25) as i32, (y + 125) as i32, (content_x + 54) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
+                    draw_thick_line(fb, (content_x + 54) as i32, (y + 125) as i32, (content_x + 25) as i32, (y + 153) as i32, 4, color(fb, 112, 233, 255));
+                    crate::draw_text(fb, content_x + 79, y + 119, "XAVIEROS", 2, color(fb, 243, 248, 255));
+                    crate::draw_text(fb, content_x + 79, y + 151, BUILD_LABEL, 1, color(fb, 110, 225, 255));
+                    let card_w = content_w.saturating_sub(16) / 3;
+                    draw_stat_card(fb, content_x, y + 193, card_w, 62, "KERNEL", "RUST NO_STD", color(fb, 101, 215, 255));
+                    draw_stat_card(fb, content_x + card_w + 8, y + 193, card_w, 62, "BOOT", "LIMINE", color(fb, 103, 230, 183));
+                    draw_stat_card(fb, content_x + (card_w + 8) * 2, y + 193, card_w, 62, "ARCH", "X86_64", color(fb, 255, 199, 108));
+                    crate::draw_text(fb, content_x, y + 278, "EXPERIMENTAL HOBBY OS  /  DIRECT FRAMEBUFFER UI", 1, color(fb, 162, 184, 215));
+                }
+                1 => {
+                    draw_page_heading(fb, content_x, y + 56, "KERNEL ARCHITECTURE", "Core components currently included in the release.");
+                    let card_w = content_w.saturating_sub(12) / 2;
+                    draw_stat_card(fb, content_x, y + 101, card_w, 60, "BOOT", "LIMINE", color(fb, 98, 215, 255));
+                    draw_stat_card(fb, content_x + card_w + 12, y + 101, card_w, 60, "MEMORY", "PMM / HEAP", color(fb, 103, 230, 183));
+                    draw_stat_card(fb, content_x, y + 171, card_w, 60, "INPUT", "PS/2 KEY + MOUSE", color(fb, 255, 199, 108));
+                    draw_stat_card(fb, content_x + card_w + 12, y + 171, card_w, 60, "NETWORK", "E1000 / IPV4", color(fb, 188, 145, 255));
+                    crate::draw_text(fb, content_x, y + 253, "SHELL, VFS, XVDISKFS, CLOCK AND TASKING PROTOTYPE.", 1, color(fb, 162, 184, 215));
+                    crate::draw_text(fb, content_x, y + 274, "APPS RUN IN KERNEL SPACE; PROCESS ISOLATION IS NOT PRESENT.", 1, color(fb, 255, 190, 137));
+                }
+                _ => {
+                    draw_page_heading(fb, content_x, y + 56, "LICENSE & ACKNOWLEDGEMENTS", "Project license and third-party bootloader.");
+                    rounded_rect(fb, content_x, y + 101, content_w, 100, 10, color(fb, 13, 26, 44));
+                    crate::draw_text(fb, content_x + 15, y + 118, "MIT LICENSE", 2, color(fb, 112, 233, 255));
+                    crate::draw_text(fb, content_x + 15, y + 150, "PERMISSION TO USE, COPY, MODIFY AND DISTRIBUTE.", 1, color(fb, 225, 234, 249));
+                    crate::draw_text(fb, content_x + 15, y + 173, "SEE LICENSE FILE IN THE SOURCE ARCHIVE.", 1, color(fb, 155, 179, 211));
+                    crate::draw_text(fb, content_x, y + 224, "BOOTLOADER: LIMINE", 1, color(fb, 103, 222, 255));
+                    crate::draw_text(fb, content_x, y + 248, "HARDWARE SUPPORT AND USER-MODE ISOLATION ARE EXPERIMENTAL.", 1, color(fb, 255, 190, 137));
+                }
+            }
         }
         _ => {}
     }
@@ -776,6 +1166,8 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
         crate::draw_text(fb, layout.cards[0].x, y + win_h.saturating_sub(18), "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS", 1, color(fb, 123, 150, 190));
     } else if app == APP_TERMINAL {
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), "ESC TO CLOSE TERMINAL  /  SHELL INPUT ACTIVE", 1, color(fb, 123, 150, 190));
+    } else if app == APP_FILES {
+        crate::draw_text(fb, left, y + win_h.saturating_sub(18), "CLICK A FOLDER TO OPEN  /  ESC GOES UP", 1, color(fb, 123, 150, 190));
     } else {
         let hint = "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
@@ -786,6 +1178,514 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
 fn draw_page_heading(fb: &Framebuffer, x: usize, y: usize, title: &str, subtitle: &str) {
     crate::draw_text(fb, x, y, title, 2, color(fb, 239, 246, 255));
     crate::draw_text(fb, x, y + 24, subtitle, 1, color(fb, 155, 179, 211));
+}
+
+fn set_app_notice(state: &mut DesktopState, text: &str) {
+    state.app_notice.fill(0);
+    state.app_notice_len = text.len().min(state.app_notice.len());
+    for (destination, source) in state.app_notice[..state.app_notice_len].iter_mut().zip(text.as_bytes()) {
+        *destination = source.to_ascii_uppercase();
+    }
+}
+
+fn app_window_content(fb: &Framebuffer) -> (usize, usize, usize) {
+    let (x, y, win_w, _) = app_window_geometry(fb);
+    (x + 160, y, win_w.saturating_sub(180))
+}
+
+fn network_action_rects(fb: &Framebuffer) -> (Rect, Rect) {
+    let (content_x, y, _) = app_window_content(fb);
+    (Rect { x: content_x, y: y + 305, width: 122, height: 29 }, Rect { x: content_x + 132, y: y + 305, width: 100, height: 29 })
+}
+
+fn clock_action_rects(fb: &Framebuffer) -> (Rect, Rect, Rect, Rect) {
+    let (x, y, _) = app_window_content(fb);
+    (Rect { x, y: y + 286, width: 88, height: 29 }, Rect { x: x + 96, y: y + 286, width: 63, height: 29 }, Rect { x: x + 167, y: y + 286, width: 63, height: 29 }, Rect { x: x + 238, y: y + 286, width: 75, height: 29 })
+}
+
+fn about_tab_hit_test(fb: &Framebuffer, x: i32, y: i32) -> Option<usize> {
+    if x < 0 || y < 0 { return None; }
+    let (left, top, _, height) = app_window_geometry(fb);
+    let sidebar_x = left + 12;
+    if x < sidebar_x as i32 || x >= (sidebar_x + 132) as i32 { return None; }
+    for index in 0..3 {
+        let row_y = top + 83 + index * 36;
+        if y >= row_y as i32 && y < (row_y + 29) as i32 && row_y + 29 < top + height - 30 {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn network_hit_test(fb: &Framebuffer, x: i32, y: i32) -> Option<NetworkHit> {
+    let (gateway, dns) = network_action_rects(fb);
+    if gateway.contains(x, y) { Some(NetworkHit::Gateway) }
+    else if dns.contains(x, y) { Some(NetworkHit::Dns) }
+    else { None }
+}
+
+fn clock_hit_test(fb: &Framebuffer, x: i32, y: i32) -> Option<ClockHit> {
+    let (sync, minus, plus, save) = clock_action_rects(fb);
+    if sync.contains(x, y) { Some(ClockHit::SyncNtp) }
+    else if minus.contains(x, y) { Some(ClockHit::TimezoneMinus) }
+    else if plus.contains(x, y) { Some(ClockHit::TimezonePlus) }
+    else if save.contains(x, y) { Some(ClockHit::SaveTimezone) }
+    else { None }
+}
+
+fn draw_action_button(fb: &Framebuffer, rect: Rect, label: &str, shade: u32) {
+    rounded_rect(fb, rect.x, rect.y, rect.width, rect.height, 5, shade);
+    let max_chars = rect.width.saturating_sub(10) / 6;
+    crate::draw_text(fb, rect.x + 5, rect.y + 11, &label[..label.len().min(max_chars)], 1, color(fb, 237, 246, 255));
+}
+
+fn run_network_action(state: &mut DesktopState, action: NetworkHit) {
+    match action {
+        NetworkHit::Gateway => match crate::net::check_gateway() {
+            Ok(()) => set_app_notice(state, "GATEWAY CHECK PASSED"),
+            Err(error) => set_app_notice(state, error),
+        },
+        NetworkHit::Dns => match crate::net::check_dns() {
+            Ok(_address) => set_app_notice(state, "DNS RESOLUTION SUCCEEDED"),
+            Err(error) => set_app_notice(state, error),
+        },
+    }
+}
+
+fn run_clock_action(state: &mut DesktopState, action: ClockHit) {
+    match action {
+        ClockHit::SyncNtp => {
+            let settings = crate::config::current();
+            match crate::clock::synchronize(settings.ntp_server_str()) {
+                Ok(_) => set_app_notice(state, "TIME SYNCHRONIZED WITH NTP"),
+                Err(error) => set_app_notice(state, error),
+            }
+        }
+        ClockHit::TimezoneMinus | ClockHit::TimezonePlus => {
+            let delta = if matches!(action, ClockHit::TimezoneMinus) { -60 } else { 60 };
+            let current = crate::clock::timezone_offset_minutes();
+            let next = current.saturating_add(delta);
+            match crate::config::set_timezone_minutes(next) {
+                Ok(()) => set_app_notice(state, "TIMEZONE CHANGED IN MEMORY; PRESS SAVE TZ"),
+                Err(error) => set_app_notice(state, error),
+            }
+        }
+        ClockHit::SaveTimezone => match crate::config::save() {
+            Ok(()) => set_app_notice(state, "TIMEZONE SAVED TO DISK"),
+            Err(error) => set_app_notice(state, error),
+        },
+    }
+}
+
+fn push_decimal_text(buffer: &mut [u8; 24], mut value: u64) -> &str {
+    let mut reversed = [0u8; 20];
+    let mut count = 0usize;
+    loop {
+        reversed[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 { break; }
+    }
+    for index in 0..count { buffer[index] = reversed[count - index - 1]; }
+    core::str::from_utf8(&buffer[..count]).unwrap_or("0")
+}
+
+fn files_layout(fb: &Framebuffer) -> FilesLayout {
+    let (x, y, win_w, _win_h) = app_window_geometry(fb);
+    let content_x = x + 160;
+    let content_w = win_w.saturating_sub(180);
+    let buttons_y = y + 132;
+    let mut bx = content_x;
+    let up = Rect { x: bx, y: buttons_y, width: 43, height: 27 }; bx += 47;
+    let previous = Rect { x: bx, y: buttons_y, width: 42, height: 27 }; bx += 46;
+    let next = Rect { x: bx, y: buttons_y, width: 42, height: 27 }; bx += 46;
+    let new_directory = Rect { x: bx, y: buttons_y, width: 67, height: 27 }; bx += 71;
+    let new_file = Rect { x: bx, y: buttons_y, width: 65, height: 27 }; bx += 69;
+    let delete = Rect { x: bx, y: buttons_y, width: 56, height: 27 };
+    FilesLayout {
+        content_x, content_w,
+        path: Rect { x: content_x, y: y + 96, width: content_w, height: 30 },
+        up, previous, next, new_directory, new_file, delete,
+        rows: Rect { x: content_x, y: y + 166, width: content_w, height: FILES_PAGE_SIZE * 25 },
+        preview: Rect { x: content_x, y: y + 321, width: content_w, height: 74 },
+    }
+}
+
+fn files_path(view: &FilesView) -> &str {
+    core::str::from_utf8(&view.path[..view.path_len]).unwrap_or("/")
+}
+
+fn files_set_path(view: &mut FilesView, path: &str) -> Result<(), &'static str> {
+    if path.is_empty() || path.len() > FILE_PATH_CAPACITY { return Err("PATH TOO LONG"); }
+    view.path.fill(0);
+    view.path[..path.len()].copy_from_slice(path.as_bytes());
+    view.path_len = path.len();
+    view.page_start = 0;
+    view.highlighted = 0;
+    view.selected_path.fill(0);
+    view.selected_path_len = 0;
+    view.selected_name.fill(0);
+    view.selected_name_len = 0;
+    view.preview.fill(0);
+    view.preview_len = 0;
+    view.notice.fill(0);
+    view.notice_len = 0;
+    Ok(())
+}
+
+fn files_set_notice(view: &mut FilesView, notice: &str) {
+    view.notice.fill(0);
+    view.notice_len = notice.len().min(view.notice.len());
+    view.notice[..view.notice_len].copy_from_slice(&notice.as_bytes()[..view.notice_len]);
+}
+
+fn files_join_path(base: &str, leaf: &str, output: &mut [u8; FILE_PATH_CAPACITY]) -> Option<usize> {
+    if leaf.is_empty() || leaf.contains('/') || leaf.contains('\\') || leaf == "." || leaf == ".." { return None; }
+    let prefix = if base == "/" { 0 } else { base.len() };
+    let required = prefix.checked_add(1)?.checked_add(leaf.len())?;
+    if required > output.len() { return None; }
+    output.fill(0);
+    let mut used = 0;
+    if prefix > 0 { output[..prefix].copy_from_slice(base.as_bytes()); used = prefix; }
+    output[used] = b'/'; used += 1;
+    output[used..used + leaf.len()].copy_from_slice(leaf.as_bytes());
+    Some(used + leaf.len())
+}
+
+fn files_parent_path(path: &str) -> &str {
+    if path == "/" { return "/"; }
+    match path.rfind('/') {
+        Some(0) | None => "/",
+        Some(index) => &path[..index],
+    }
+}
+
+fn files_get_row(path: &str, wanted: usize) -> Result<Option<FileRow>, &'static str> {
+    let mut index = 0usize;
+    let mut found = None;
+    crate::vfs::list_directory(path, |name, is_dir| {
+        if index == wanted && name.len() <= FILE_NAME_CAPACITY {
+            let mut row = FileRow::empty();
+            row.name[..name.len()].copy_from_slice(name.as_bytes());
+            row.len = name.len();
+            row.is_dir = is_dir;
+            found = Some(row);
+        }
+        index += 1;
+    })?;
+    Ok(found)
+}
+
+fn files_activate_row(state: &mut DesktopState, index: usize) {
+    let current = files_path(&state.files);
+    let mut path_buf = [0u8; FILE_PATH_CAPACITY];
+    path_buf[..current.len()].copy_from_slice(current.as_bytes());
+    let current_owned = core::str::from_utf8(&path_buf[..current.len()]).unwrap_or("/");
+    let row = match files_get_row(current_owned, index) {
+        Ok(Some(row)) => row,
+        Ok(None) => { files_set_notice(&mut state.files, "NO ITEM AT THIS POSITION"); return; }
+        Err(error) => { files_set_notice(&mut state.files, error); return; }
+    };
+    let name = core::str::from_utf8(&row.name[..row.len]).unwrap_or("");
+    let mut target_buf = [0u8; FILE_PATH_CAPACITY];
+    let Some(target_len) = files_join_path(current_owned, name, &mut target_buf) else {
+        files_set_notice(&mut state.files, "PATH TOO LONG OR INVALID NAME"); return;
+    };
+    let target = core::str::from_utf8(&target_buf[..target_len]).unwrap_or("");
+    if !crate::users::may_access_path(target) {
+        files_set_notice(&mut state.files, "ACCESS DENIED FOR THIS PATH");
+        return;
+    }
+    if row.is_dir {
+        if let Err(error) = files_set_path(&mut state.files, target) { files_set_notice(&mut state.files, error); }
+        return;
+    }
+    state.files.selected_path.fill(0);
+    state.files.selected_path[..target_len].copy_from_slice(target.as_bytes());
+    state.files.selected_path_len = target_len;
+    state.files.selected_name.fill(0);
+    state.files.selected_name[..row.len].copy_from_slice(&row.name[..row.len]);
+    state.files.selected_name_len = row.len;
+    state.files.preview.fill(0);
+    state.files.preview_len = 0;
+    let mut contents = [0u8; 512];
+    match crate::vfs::read_file(target, &mut contents) {
+        Ok(size) => {
+            let mut used = 0usize;
+            for byte in contents[..size.min(contents.len())].iter().copied() {
+                if used >= state.files.preview.len() { break; }
+                if byte == b'\r' { continue; }
+                if byte == b'\n' {
+                    if used > 0 && state.files.preview[used - 1] != b'\n' { state.files.preview[used] = b'\n'; used += 1; }
+                } else if byte == b'\t' {
+                    state.files.preview[used] = b' ';
+                    used += 1;
+                } else if (32..=126).contains(&byte) {
+                    state.files.preview[used] = byte.to_ascii_uppercase();
+                    used += 1;
+                } else {
+                    state.files.preview[used] = b'.';
+                    used += 1;
+                }
+            }
+            while used > 0 && state.files.preview[used - 1] == b'\n' { used -= 1; }
+            state.files.preview_len = used;
+            files_set_notice(&mut state.files, "FILE PREVIEW LOADED");
+        }
+        Err(error) => files_set_notice(&mut state.files, error),
+    }
+}
+
+fn files_is_writable_path(path: &str) -> bool {
+    path.eq_ignore_ascii_case("/DISK")
+        || path.get(..6).map(|prefix| prefix.eq_ignore_ascii_case("/DISK/")).unwrap_or(false)
+}
+
+fn files_begin_prompt(view: &mut FilesView, mode: u8) {
+    let path = files_path(view);
+    if !files_is_writable_path(path) {
+        files_set_notice(view, "WRITES REQUIRE /DISK; OPEN DISK FIRST");
+        return;
+    }
+    view.prompt_mode = mode;
+    view.prompt.fill(0);
+    view.prompt_len = 0;
+    files_set_notice(view, if mode == 1 { "TYPE FOLDER NAME, THEN ENTER" } else { "TYPE FILE NAME, THEN ENTER" });
+}
+
+fn files_commit_prompt(view: &mut FilesView) {
+    if view.prompt_mode == 0 { return; }
+    let name = match core::str::from_utf8(&view.prompt[..view.prompt_len]) {
+        Ok(name) => name,
+        Err(_) => { files_set_notice(view, "INVALID UTF-8 NAME"); view.prompt_mode = 0; return; }
+    };
+    let base = files_path(view);
+    let mut base_buf = [0u8; FILE_PATH_CAPACITY];
+    base_buf[..base.len()].copy_from_slice(base.as_bytes());
+    let base = core::str::from_utf8(&base_buf[..base.len()]).unwrap_or("/DISK");
+    let mut path_buf = [0u8; FILE_PATH_CAPACITY];
+    let Some(path_len) = files_join_path(base, name, &mut path_buf) else {
+        files_set_notice(view, "INVALID NAME OR PATH TOO LONG"); view.prompt_mode = 0; return;
+    };
+    let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("");
+    if !crate::users::may_access_path(path) {
+        files_set_notice(view, "ACCESS DENIED FOR THIS PATH"); view.prompt_mode = 0; return;
+    }
+    let result = if view.prompt_mode == 1 { crate::vfs::mkdir(path) } else { crate::vfs::touch(path) };
+    view.prompt_mode = 0;
+    view.prompt_len = 0;
+    match result {
+        Ok(()) => { view.page_start = 0; files_set_notice(view, "ITEM CREATED"); }
+        Err(error) => files_set_notice(view, error),
+    }
+}
+
+fn handle_files_key(state: &mut DesktopState, key: KeyboardKey) {
+    if state.files.prompt_mode != 0 {
+        match key {
+            KeyboardKey::Escape => { state.files.prompt_mode = 0; state.files.prompt_len = 0; files_set_notice(&mut state.files, "CREATE CANCELLED"); }
+            KeyboardKey::Backspace => {
+                if state.files.prompt_len > 0 { state.files.prompt_len -= 1; state.files.prompt[state.files.prompt_len] = 0; }
+            }
+            KeyboardKey::Enter => files_commit_prompt(&mut state.files),
+            KeyboardKey::Character(byte) if (32..=126).contains(&byte) && state.files.prompt_len < 48 => {
+                state.files.prompt[state.files.prompt_len] = byte;
+                state.files.prompt_len += 1;
+            }
+            _ => {}
+        }
+        return;
+    }
+    match key {
+        KeyboardKey::HistoryUp => {
+            if state.files.highlighted > 0 { state.files.highlighted -= 1; }
+            else if state.files.page_start >= FILES_PAGE_SIZE { state.files.page_start -= FILES_PAGE_SIZE; }
+        }
+        KeyboardKey::HistoryDown => {
+            let total = crate::vfs::list_directory(files_path(&state.files), |_, _| {}).unwrap_or(0);
+            if state.files.highlighted + 1 < FILES_PAGE_SIZE && state.files.page_start + state.files.highlighted + 1 < total {
+                state.files.highlighted += 1;
+            } else if state.files.page_start + FILES_PAGE_SIZE < total {
+                state.files.page_start += FILES_PAGE_SIZE;
+                state.files.highlighted = 0;
+            }
+        }
+        KeyboardKey::Enter => files_activate_row(state, state.files.page_start + state.files.highlighted),
+        KeyboardKey::Escape => {
+            let path = files_path(&state.files);
+            if path != "/" {
+                let parent = files_parent_path(path);
+                let mut parent_buf = [0u8; FILE_PATH_CAPACITY];
+                parent_buf[..parent.len()].copy_from_slice(parent.as_bytes());
+                let parent = core::str::from_utf8(&parent_buf[..parent.len()]).unwrap_or("/");
+                let _ = files_set_path(&mut state.files, parent);
+            } else { state.open_window = None; }
+        }
+        KeyboardKey::Character(byte) => match byte.to_ascii_uppercase() {
+            b'U' => { let path = files_path(&state.files); if path != "/" { let parent = files_parent_path(path); let mut buffer = [0u8; FILE_PATH_CAPACITY]; buffer[..parent.len()].copy_from_slice(parent.as_bytes()); let parent = core::str::from_utf8(&buffer[..parent.len()]).unwrap_or("/"); let _ = files_set_path(&mut state.files, parent); } }
+            b'N' => files_begin_prompt(&mut state.files, 2),
+            b'D' => files_begin_prompt(&mut state.files, 1),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn files_hit_test(fb: &Framebuffer, x: i32, y: i32, view: &FilesView) -> Option<FilesHit> {
+    if x < 0 || y < 0 { return None; }
+    let (window_x, window_y, _, _) = app_window_geometry(fb);
+    let side_x = window_x + 12;
+    let side_y = window_y + 83;
+    if x >= side_x as i32 && x < (side_x + 112) as i32 {
+        for index in 0..3 {
+            let row_y = side_y + index * 36;
+            if y >= row_y as i32 && y < (row_y + 29) as i32 {
+                return Some(match index { 0 => FilesHit::Home, 1 => FilesHit::Disk, _ => FilesHit::System });
+            }
+        }
+    }
+    let layout = files_layout(fb);
+    if layout.up.contains(x, y) { return Some(FilesHit::Up); }
+    if layout.previous.contains(x, y) { return Some(FilesHit::Previous); }
+    if layout.next.contains(x, y) { return Some(FilesHit::Next); }
+    if layout.new_directory.contains(x, y) { return Some(FilesHit::NewDirectory); }
+    if layout.new_file.contains(x, y) { return Some(FilesHit::NewFile); }
+    if layout.delete.contains(x, y) { return Some(FilesHit::Delete); }
+    if layout.rows.contains(x, y) {
+        let row = ((y as usize - layout.rows.y) / 25).min(FILES_PAGE_SIZE - 1);
+        let total = crate::vfs::list_directory(files_path(view), |_, _| {}).ok()?;
+        let index = view.page_start + row;
+        if index < total { return Some(FilesHit::Row(index)); }
+    }
+    None
+}
+
+fn handle_files_hit(state: &mut DesktopState, hit: FilesHit) {
+    match hit {
+        FilesHit::Home => { let _ = files_set_path(&mut state.files, "/"); }
+        FilesHit::Disk => {
+            if !crate::users::may_access_path("/DISK") {
+                files_set_notice(&mut state.files, "ACCESS DENIED FOR THIS DISK PATH");
+            } else if crate::vfs::exists("/DISK") {
+                let _ = files_set_path(&mut state.files, "/DISK");
+            } else { files_set_notice(&mut state.files, "WRITABLE DISK IS NOT MOUNTED"); }
+        }
+        FilesHit::System => { let _ = files_set_path(&mut state.files, "/ETC"); }
+        FilesHit::Up => {
+            let path = files_path(&state.files);
+            if path == "/" { files_set_notice(&mut state.files, "ALREADY AT ROOT"); }
+            else { let parent = files_parent_path(path); let mut buffer = [0u8; FILE_PATH_CAPACITY]; buffer[..parent.len()].copy_from_slice(parent.as_bytes()); let parent = core::str::from_utf8(&buffer[..parent.len()]).unwrap_or("/"); let _ = files_set_path(&mut state.files, parent); }
+        }
+        FilesHit::Previous => { state.files.page_start = state.files.page_start.saturating_sub(FILES_PAGE_SIZE); state.files.highlighted = 0; }
+        FilesHit::Next => {
+            let total = crate::vfs::list_directory(files_path(&state.files), |_, _| {}).unwrap_or(0);
+            if state.files.page_start + FILES_PAGE_SIZE < total { state.files.page_start += FILES_PAGE_SIZE; state.files.highlighted = 0; }
+        }
+        FilesHit::NewDirectory => files_begin_prompt(&mut state.files, 1),
+        FilesHit::NewFile => files_begin_prompt(&mut state.files, 2),
+        FilesHit::Delete => {
+            if state.files.selected_path_len == 0 { files_set_notice(&mut state.files, "SELECT A FILE BEFORE DELETE"); }
+            else {
+                let path = core::str::from_utf8(&state.files.selected_path[..state.files.selected_path_len]).unwrap_or("");
+                if files_is_writable_path(path) && !path.eq_ignore_ascii_case("/DISK") && crate::users::may_access_path(path) {
+                    match crate::vfs::remove(path) {
+                        Ok(()) => { state.files.selected_path_len = 0; state.files.selected_name_len = 0; state.files.preview_len = 0; files_set_notice(&mut state.files, "FILE DELETED"); }
+                        Err(error) => files_set_notice(&mut state.files, error),
+                    }
+                } else { files_set_notice(&mut state.files, "DELETE IS LIMITED TO /DISK FILES"); }
+            }
+        }
+        FilesHit::Row(index) => { state.files.highlighted = index.saturating_sub(state.files.page_start); files_activate_row(state, index); }
+    }
+}
+
+fn draw_files_panel(fb: &Framebuffer, state: &DesktopState) {
+    let (x, y, win_w, win_h) = app_window_geometry(fb);
+    let active_sidebar = if files_path(&state.files).eq_ignore_ascii_case("/DISK") || files_path(&state.files).get(..6).map(|prefix| prefix.eq_ignore_ascii_case("/DISK/")).unwrap_or(false) { 1 } else if files_path(&state.files).eq_ignore_ascii_case("/ETC") || files_path(&state.files).get(..5).map(|prefix| prefix.eq_ignore_ascii_case("/ETC/")).unwrap_or(false) { 2 } else { 0 };
+    draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "FILES", &["HOME", "DISK", "SYSTEM"], active_sidebar);
+    let layout = files_layout(fb);
+    draw_page_heading(fb, layout.content_x, y + 56, "FILES & STORAGE", "Browse folders and manage writable disk files.");
+    rounded_rect(fb, layout.path.x, layout.path.y, layout.path.width, layout.path.height, 7, color(fb, 19, 29, 47));
+    crate::draw_text(fb, layout.path.x + 10, layout.path.y + 11, "PATH", 1, color(fb, 103, 222, 255));
+    let current_path = files_path(&state.files);
+    let max_path = layout.path.width.saturating_sub(66) / 6;
+    let visible_path = if current_path.len() > max_path { &current_path[current_path.len().saturating_sub(max_path)..] } else { current_path };
+    crate::draw_text(fb, layout.path.x + 52, layout.path.y + 11, visible_path, 1, color(fb, 232, 242, 255));
+    let buttons = [
+        (layout.up, "UP", color(fb, 30, 75, 103)),
+        (layout.previous, "PREV", color(fb, 28, 43, 65)),
+        (layout.next, "NEXT", color(fb, 28, 43, 65)),
+        (layout.new_directory, "NEW DIR", color(fb, 25, 91, 78)),
+        (layout.new_file, "NEW FILE", color(fb, 25, 91, 78)),
+        (layout.delete, "DELETE", color(fb, 105, 40, 52)),
+    ];
+    for (rect, label, shade) in buttons {
+        rounded_rect(fb, rect.x, rect.y, rect.width, rect.height, 5, shade);
+        crate::draw_text(fb, rect.x + 5, rect.y + 10, label, 1, color(fb, 237, 246, 255));
+    }
+    crate::draw_text(fb, layout.content_x + 5, layout.rows.y - 13, "NAME", 1, color(fb, 111, 222, 255));
+    crate::draw_text(fb, layout.content_x + layout.content_w.saturating_sub(94), layout.rows.y - 13, "TYPE / SIZE", 1, color(fb, 111, 222, 255));
+    let mut rows = [FileRow::empty(); FILES_PAGE_SIZE];
+    let mut total = 0usize;
+    let list_result = crate::vfs::list_directory(current_path, |name, is_dir| {
+        let index = total;
+        if index >= state.files.page_start && index < state.files.page_start + FILES_PAGE_SIZE && name.len() <= FILE_NAME_CAPACITY {
+            let visible = index - state.files.page_start;
+            rows[visible].name[..name.len()].copy_from_slice(name.as_bytes());
+            rows[visible].len = name.len();
+            rows[visible].is_dir = is_dir;
+        }
+        total += 1;
+    });
+    if list_result.is_err() {
+        crate::draw_text(fb, layout.content_x + 8, layout.rows.y + 12, "CANNOT READ THIS DIRECTORY.", 1, color(fb, 255, 164, 153));
+    } else if total == 0 {
+        crate::draw_text(fb, layout.content_x + 8, layout.rows.y + 12, "THIS DIRECTORY IS EMPTY.", 1, color(fb, 177, 194, 220));
+    } else {
+        for (index, row) in rows.iter().enumerate() {
+            if row.len == 0 { continue; }
+            let row_y = layout.rows.y + index * 25;
+            let name = core::str::from_utf8(&row.name[..row.len]).unwrap_or("?");
+            let mut target = [0u8; FILE_PATH_CAPACITY];
+            let target_path = files_join_path(current_path, name, &mut target)
+                .and_then(|length| core::str::from_utf8(&target[..length]).ok());
+            let selected = target_path.map(|p| p.eq_ignore_ascii_case(core::str::from_utf8(&state.files.selected_path[..state.files.selected_path_len]).unwrap_or(""))).unwrap_or(false);
+            let highlighted = index == state.files.highlighted;
+            let bg = if selected { color(fb, 27, 76, 83) } else if highlighted { color(fb, 25, 48, 73) } else { color(fb, 14, 23, 39) };
+            rounded_rect(fb, layout.rows.x, row_y, layout.rows.width, 22, 4, bg);
+            draw_app_icon(fb, if row.is_dir { APP_FILES } else { APP_TERMINAL }, layout.content_x + 5, row_y + 1, 19);
+            let name_max = layout.content_w.saturating_sub(135) / 6;
+            let shown_name = &name[..name.len().min(name_max)];
+            crate::draw_text(fb, layout.content_x + 31, row_y + 8, shown_name, 1, color(fb, 231, 241, 254));
+            let kind = if row.is_dir { "FOLDER" } else { "FILE" };
+            crate::draw_text(fb, layout.content_x + layout.content_w.saturating_sub(55), row_y + 8, kind, 1, color(fb, if row.is_dir { 99 } else { 111 }, if row.is_dir { 222 } else { 228 }, if row.is_dir { 255 } else { 184 }));
+        }
+    }
+    rounded_rect(fb, layout.preview.x, layout.preview.y, layout.preview.width, layout.preview.height, 7, color(fb, 13, 21, 37));
+    if state.files.prompt_mode != 0 {
+        let label = if state.files.prompt_mode == 1 { "NEW DIRECTORY:" } else { "NEW FILE:" };
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 10, label, 1, color(fb, 101, 226, 255));
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 29, core::str::from_utf8(&state.files.prompt[..state.files.prompt_len]).unwrap_or(""), 1, color(fb, 240, 247, 255));
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 48, "ENTER SAVE  /  ESC CANCEL", 1, color(fb, 147, 173, 207));
+    } else if state.files.selected_name_len > 0 {
+        let selected_name = core::str::from_utf8(&state.files.selected_name[..state.files.selected_name_len]).unwrap_or("FILE");
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 9, selected_name, 1, color(fb, 104, 230, 189));
+        let preview = core::str::from_utf8(&state.files.preview[..state.files.preview_len]).unwrap_or("");
+        // The preview is deliberately capped to two rows to keep the file list responsive.
+        let first = preview.split('\n').next().unwrap_or("");
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 27, &first[..first.len().min(layout.content_w.saturating_sub(20) / 6)], 1, color(fb, 224, 237, 252));
+        let second = preview.split('\n').nth(1).unwrap_or("");
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 45, &second[..second.len().min(layout.content_w.saturating_sub(20) / 6)], 1, color(fb, 165, 188, 219));
+    } else {
+        let notice = core::str::from_utf8(&state.files.notice[..state.files.notice_len]).unwrap_or("");
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 12, if notice.is_empty() { "SELECT A FILE TO PREVIEW ITS CONTENTS." } else { notice }, 1, color(fb, 222, 234, 249));
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 33, "CREATE / DELETE WORKS INSIDE /DISK ONLY.", 1, color(fb, 139, 165, 201));
+        crate::draw_text(fb, layout.preview.x + 10, layout.preview.y + 52, "UP ARROW = PARENT  /  ENTER = OPEN HIGHLIGHTED ITEM", 1, color(fb, 139, 165, 201));
+    }
+    let page_count = (total + FILES_PAGE_SIZE - 1) / FILES_PAGE_SIZE;
+    let current_page = if total == 0 { 0 } else { state.files.page_start / FILES_PAGE_SIZE + 1 };
+    let page_text = if total == 0 { "EMPTY" } else if current_page == 1 { "PAGE 1" } else if page_count > 1 { "MORE PAGES" } else { "PAGE 1" };
+    crate::draw_text(fb, layout.content_x + layout.content_w.saturating_sub(66), y + 56, page_text, 1, color(fb, 117, 147, 185));
 }
 
 fn draw_app_sidebar(fb: &Framebuffer, x: usize, y: usize, width: usize, height: usize, title: &str, items: &[&str], active: usize) {
