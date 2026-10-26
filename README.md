@@ -8,9 +8,9 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-0.2.0%20Release-blue)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/Status-0.2.1%20Release-blue)](#status-and-limitations)
 
-**Current version: `0.2.0`**
+**Current version: `0.2.1`**
 
 [Русская версия README](README.ru.md)
 
@@ -20,13 +20,13 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 ## About
 
-XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.0 adds navigable Files, faster window redraws, smoother wallpaper scaling, a compact custom cursor, display settings, and a top-left XavierOS system menu.
+XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.1 improves Files mouse controls with Back history, session favorites, clear status feedback, and keyboard shortcuts.
 
 ## Features
 
 - **Kernel and boot:** `x86_64-unknown-none`, Limine boot protocol, IDT exception handlers, PMM bitmap allocator, HHDM, heap, PIC/PIT, PS/2 keyboard and polled PS/2 mouse.
 - **Desktop compositor:** fullscreen wallpaper with cover scaling and fixed-point bilinear interpolation, updated dock and icons, a 24×24 custom alpha-blended cursor, a top menu bar, window panels, and saved-window-background restoration to avoid the old full-screen “printer” redraw on close.
-- **Files:** click directories to navigate, use Up/Home/Disk/System, page through entries, select and preview a text file, create a directory or empty file, and delete a selected file on the writable `/DISK` mount. The embedded root is read-only; preview is bounded and not a full text editor.
+- **Files:** click directories to navigate, use Back/Up/Home/Disk/System/Favorite, page through entries, select and preview a text file, create a directory or empty file, and delete a selected file on the writable `/DISK` mount. Back history and Favorite are session-only. The embedded root is read-only; preview is bounded and not a full text editor.
 - **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running.
 - **Network:** E1000 for QEMU, DHCP/static fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, experimental TCP/HTTP, gateway/DNS diagnostics, and packet counters.
 - **Clock:** local time, fixed UTC offset, RTC and experimental NTP synchronization controls.
@@ -52,7 +52,7 @@ The ISO is written under `build/`. `run.py` attaches `data/xavieros-disk.img`, a
 
 - Mouse: click Dock icons and app controls when a PS/2 auxiliary device is available.
 - Keyboard: `F` Files, `T` Terminal, `N` Network, `C` Clock, `S` Settings, `A` About, `X` system menu. Arrow keys navigate the menu, Files list, and About tabs; Enter activates; Escape closes or moves up in Files. In Network, `G` checks the gateway and `D` checks DNS. In Clock, `N` syncs NTP, `M`/`P` adjust timezone by one hour, and `S` saves it.
-- Files: click a folder to enter it; use `UP`/Escape to go to the parent, `PREV`/`NEXT` to page, select a file to preview, `NEW DIR` or `NEW FILE` to create an item under `/DISK`, and `DELETE` to remove a selected `/DISK` file. During name entry, type ASCII and press Enter; Escape cancels.
+- Files: click a folder to enter it; use `BACK`/Backspace/`B` for history, `UP`/Escape for parent, `PIN`/`P` to save a session favorite and `FAVORITE`/`V` to open it; `PREV`/`NEXT` page the list. Select a file to preview, `NEW DIR` or `NEW FILE` to create an item under `/DISK`, and `DELETE` to remove a selected `/DISK` file. During name entry, type ASCII and press Enter; Escape cancels.
 - Terminal: type `DESKTOP` or press Escape/close to return to the desktop.
 - System menu: click `XAVIEROS` or press `X`; choose Desktop, Open Terminal, About, Restart, or Shut Down with arrows and Enter.
 - Display: choose a mode in Settings and click Apply Mode. Live changes depend on the emulated VGA adapter. Limine has boot-time mode entries if live switching is unsupported.

@@ -1,6 +1,23 @@
 # Changelog
 
-All notable XavierOS changes are documented here. The release-kit file `XavierOS-0.2.0-Release-Notes.md` contains the expanded history and detailed release notes.
+All notable XavierOS changes are documented here. The release-kit file `XavierOS-0.2.1-Release-Notes.md` contains the expanded history and detailed release notes.
+
+## 0.2.1 — Files interaction fix and Quick Access
+
+### Fixed
+- Added a dedicated **BACK** action backed by an eight-step in-session folder history; `Backspace` and `B` provide keyboard equivalents. `UP` and `Escape` continue to navigate to the parent directory.
+- Added small hit-target tolerance to compact toolbar controls to make PS/2 mouse interaction less finicky.
+- Made Files status feedback visible independently of the currently selected file preview, so errors such as “writes require /DISK” are no longer hidden behind a selected item.
+- Added clear feedback for Previous/Next when the current directory has no additional pages.
+
+### Added
+- Added a session-pinned Favorite folder: use **PIN** (or `P`) in the current directory and **FAVORITE** in the sidebar (or `V`) to jump back to it.
+- Added tests covering visible button labels, Back/history routing, Favorite pin/open actions, and visible status feedback.
+
+### Limitations
+- The folder history and favorite are in-memory for the current Files session and are not persistent across reboot.
+- Writable create/delete actions remain limited to `/DISK`; embedded root files are read-only.
+- Rust compilation and QEMU runtime behavior must be confirmed locally because those tools are unavailable in the packaging environment.
 
 ## 0.2.0 — Desktop and File Manager Update
 

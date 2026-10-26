@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.0.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.1.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_preview_is_wired_and_version_is_release_020(self) -> None:
+    def test_desktop_is_wired_and_version_is_release_021(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,9 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.0"', cargo)
-        self.assertIn('VERSION = "0.2.0"', release)
-        self.assertIn('Current version: `0.2.0`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.1"', cargo)
+        self.assertIn('VERSION = "0.2.1"', release)
+        self.assertIn('Current version: `0.2.1`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_beta4_wallpaper_uses_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -287,6 +287,8 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertTrue(any(value > 0 for value in alpha), "cursor pixels should remain visible")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         self.assertIn('include_bytes!("../assets/cursor.rgba")', desktop)
+        self.assertIn('const CURSOR_HOTSPOT_X: i32 = 7;', desktop)
+        self.assertIn('const CURSOR_HOTSPOT_Y: i32 = 4;', desktop)
         self.assertIn('const CURSOR_WIDTH: usize = 24;', desktop)
         self.assertIn('const CURSOR_HEIGHT: usize = 24;', desktop)
         self.assertIn("fn blend_cursor_pixel(", desktop)
@@ -329,14 +331,38 @@ class RepositoryShapeTests(unittest.TestCase):
             "fn files_hit_test(", "fn handle_files_hit(", "fn files_commit_prompt(",
             "crate::vfs::list_directory", "crate::vfs::read_file(target, &mut contents)",
             "crate::vfs::mkdir(path)", "crate::vfs::touch(path)", "crate::vfs::remove(path)",
-            '"PREV"', '"NEXT"', '"NEW DIR"', '"NEW FILE"', '"DELETE"',
+            '"BACK"', '"UP"', '"PREV"', '"NEXT"', '"PIN"', '"FAVORITE"', '"NEW DIR"', '"NEW FILE"', '"DELETE"',
             '"FILE PREVIEW LOADED"', '"WRITES REQUIRE /DISK; OPEN DISK FIRST"',
+            'fn files_go_back(', 'fn files_pin_current(', 'fn files_open_favorite(', 'contains_slop(',
         ):
             self.assertIn(feature, desktop)
         # Writes are deliberately limited to the writable /DISK mount.
         helper = desktop[desktop.index("fn files_is_writable_path("):desktop.index("fn files_begin_prompt(")]
         self.assertIn('eq_ignore_ascii_case("/DISK")', helper)
         self.assertIn('eq_ignore_ascii_case("/DISK/")', helper)
+
+    def test_files_toolbar_has_back_favorite_and_visible_status_feedback(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        for feature in (
+            "FilesHit::Back => files_go_back(&mut state.files)",
+            "FilesHit::Pin => files_pin_current(&mut state.files)",
+            "FilesHit::Favorite => files_open_favorite(&mut state.files)",
+            "KeyboardKey::Backspace => files_go_back(&mut state.files)",
+            "b'B' => files_go_back(&mut state.files)",
+            "b'P' => files_pin_current(&mut state.files)",
+            "b'V' => files_open_favorite(&mut state.files)",
+            '"RETURNED TO PREVIOUS FOLDER"',
+            '"CURRENT FOLDER PINNED AS FAVORITE"',
+            '"NO FAVORITE YET - OPEN A FOLDER AND PIN IT"',
+            'if state.files.notice_len > 0',
+        ):
+            self.assertIn(feature, desktop)
+        self.assertIn('"BACK"', desktop)
+        self.assertIn('"FAVORITE"', desktop)
+        self.assertIn("side_x + 125", desktop)
+        self.assertIn("contains_slop(x, y, 2, 5)", desktop)
+        self.assertIn('"ALREADY ON FIRST PAGE"', desktop)
+        self.assertIn('"ALREADY ON LAST PAGE"', desktop)
 
     def test_closing_apps_restores_window_backdrop_without_full_wallpaper_redraw(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -371,13 +397,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_release_020(self) -> None:
+    def test_version_metadata_is_consistent_for_release_021(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.0"', cargo)
-        self.assertIn('VERSION = "0.2.0"', package)
-        self.assertIn("Current version: `0.2.0`", readme)
+        self.assertIn('version = "0.2.1"', cargo)
+        self.assertIn('VERSION = "0.2.1"', package)
+        self.assertIn("Current version: `0.2.1`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -424,7 +450,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.0")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.1")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -466,7 +492,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.0', main)
+        self.assertIn('VERSION: 0.2.1', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -544,8 +570,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.0"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.0"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.1"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.1"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -598,9 +624,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.0`", readme)
-        self.assertIn('VERSION = "0.2.0"', release)
-        self.assertIn('version = "0.2.0"', cargo)
+        self.assertIn("Current version: `0.2.1`", readme)
+        self.assertIn('VERSION = "0.2.1"', release)
+        self.assertIn('version = "0.2.1"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:

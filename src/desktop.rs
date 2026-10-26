@@ -1,4 +1,4 @@
-//! XavierOS in-kernel desktop for v0.2.0.
+//! XavierOS in-kernel desktop for v0.2.1.
 //!
 //! This module provides the framebuffer compositor, desktop windows, file manager,
 //! system actions, and application panels. Applications still run in kernel space;
@@ -12,8 +12,8 @@ const CURSOR_WIDTH: usize = 24;
 const CURSOR_HEIGHT: usize = 24;
 const CURSOR_SAVE_WIDTH: usize = CURSOR_WIDTH;
 const CURSOR_SAVE_HEIGHT: usize = CURSOR_HEIGHT;
-const CURSOR_HOTSPOT_X: i32 = 4;
-const CURSOR_HOTSPOT_Y: i32 = 2;
+const CURSOR_HOTSPOT_X: i32 = 7;
+const CURSOR_HOTSPOT_Y: i32 = 4;
 const CURSOR_RGBA: &[u8] = include_bytes!("../assets/cursor.rgba");
 const DOCK_LABEL_SAVE_WIDTH: usize = 64;
 const DOCK_LABEL_SAVE_HEIGHT: usize = 21;
@@ -23,7 +23,7 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.0";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.1";
 const WALLPAPER_WIDTH: usize = 1470;
 const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
@@ -35,6 +35,7 @@ const FILE_PATH_CAPACITY: usize = 192;
 const FILE_NAME_CAPACITY: usize = 64;
 const FILE_PREVIEW_CAPACITY: usize = 160;
 const FILES_PAGE_SIZE: usize = 6;
+const FILES_HISTORY_CAPACITY: usize = 8;
 const WINDOW_BACKDROP_WIDTH: usize = 705;
 const WINDOW_BACKDROP_HEIGHT: usize = 428;
 
@@ -86,6 +87,13 @@ impl Rect {
             && x < (self.x + self.width) as i32
             && y < (self.y + self.height) as i32
     }
+
+    fn contains_slop(self, x: i32, y: i32, horizontal: usize, vertical: usize) -> bool {
+        x >= self.x.saturating_sub(horizontal) as i32
+            && y >= self.y.saturating_sub(vertical) as i32
+            && x < self.x.saturating_add(self.width).saturating_add(horizontal) as i32
+            && y < self.y.saturating_add(self.height).saturating_add(vertical) as i32
+    }
 }
 
 struct SettingsLayout {
@@ -130,6 +138,11 @@ struct FilesView {
     prompt: [u8; FILE_NAME_CAPACITY],
     prompt_len: usize,
     prompt_mode: u8,
+    history_paths: [[u8; FILE_PATH_CAPACITY]; FILES_HISTORY_CAPACITY],
+    history_lens: [usize; FILES_HISTORY_CAPACITY],
+    history_count: usize,
+    favorite_path: [u8; FILE_PATH_CAPACITY],
+    favorite_path_len: usize,
 }
 
 impl FilesView {
@@ -152,6 +165,11 @@ impl FilesView {
             prompt: [0; FILE_NAME_CAPACITY],
             prompt_len: 0,
             prompt_mode: 0,
+            history_paths: [[0; FILE_PATH_CAPACITY]; FILES_HISTORY_CAPACITY],
+            history_lens: [0; FILES_HISTORY_CAPACITY],
+            history_count: 0,
+            favorite_path: [0; FILE_PATH_CAPACITY],
+            favorite_path_len: 0,
         }
     }
 }
@@ -160,9 +178,11 @@ struct FilesLayout {
     content_x: usize,
     content_w: usize,
     path: Rect,
+    back: Rect,
     up: Rect,
     previous: Rect,
     next: Rect,
+    pin: Rect,
     new_directory: Rect,
     new_file: Rect,
     delete: Rect,
@@ -175,9 +195,12 @@ enum FilesHit {
     Home,
     Disk,
     System,
+    Favorite,
+    Back,
     Up,
     Previous,
     Next,
+    Pin,
     NewDirectory,
     NewFile,
     Delete,
@@ -1167,7 +1190,7 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
     } else if app == APP_TERMINAL {
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), "ESC TO CLOSE TERMINAL  /  SHELL INPUT ACTIVE", 1, color(fb, 123, 150, 190));
     } else if app == APP_FILES {
-        crate::draw_text(fb, left, y + win_h.saturating_sub(18), "CLICK A FOLDER TO OPEN  /  ESC GOES UP", 1, color(fb, 123, 150, 190));
+        crate::draw_text(fb, left, y + win_h.saturating_sub(18), "BACK/BACKSPACE  UP/ESC=PARENT  PIN=P  FAVORITE=V", 1, color(fb, 123, 150, 190));
     } else {
         let hint = "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
@@ -1296,16 +1319,18 @@ fn files_layout(fb: &Framebuffer) -> FilesLayout {
     let content_w = win_w.saturating_sub(180);
     let buttons_y = y + 132;
     let mut bx = content_x;
-    let up = Rect { x: bx, y: buttons_y, width: 43, height: 27 }; bx += 47;
-    let previous = Rect { x: bx, y: buttons_y, width: 42, height: 27 }; bx += 46;
-    let next = Rect { x: bx, y: buttons_y, width: 42, height: 27 }; bx += 46;
-    let new_directory = Rect { x: bx, y: buttons_y, width: 67, height: 27 }; bx += 71;
-    let new_file = Rect { x: bx, y: buttons_y, width: 65, height: 27 }; bx += 69;
-    let delete = Rect { x: bx, y: buttons_y, width: 56, height: 27 };
+    let back = Rect { x: bx, y: buttons_y, width: 43, height: 29 }; bx += 46;
+    let up = Rect { x: bx, y: buttons_y, width: 34, height: 29 }; bx += 37;
+    let previous = Rect { x: bx, y: buttons_y, width: 42, height: 29 }; bx += 45;
+    let next = Rect { x: bx, y: buttons_y, width: 42, height: 29 }; bx += 45;
+    let pin = Rect { x: bx, y: buttons_y, width: 42, height: 29 }; bx += 45;
+    let new_directory = Rect { x: bx, y: buttons_y, width: 62, height: 29 }; bx += 65;
+    let new_file = Rect { x: bx, y: buttons_y, width: 58, height: 29 }; bx += 61;
+    let delete = Rect { x: bx, y: buttons_y, width: 52, height: 29 };
     FilesLayout {
         content_x, content_w,
         path: Rect { x: content_x, y: y + 96, width: content_w, height: 30 },
-        up, previous, next, new_directory, new_file, delete,
+        back, up, previous, next, pin, new_directory, new_file, delete,
         rows: Rect { x: content_x, y: y + 166, width: content_w, height: FILES_PAGE_SIZE * 25 },
         preview: Rect { x: content_x, y: y + 321, width: content_w, height: 74 },
     }
@@ -1315,7 +1340,7 @@ fn files_path(view: &FilesView) -> &str {
     core::str::from_utf8(&view.path[..view.path_len]).unwrap_or("/")
 }
 
-fn files_set_path(view: &mut FilesView, path: &str) -> Result<(), &'static str> {
+fn files_assign_path(view: &mut FilesView, path: &str) -> Result<(), &'static str> {
     if path.is_empty() || path.len() > FILE_PATH_CAPACITY { return Err("PATH TOO LONG"); }
     view.path.fill(0);
     view.path[..path.len()].copy_from_slice(path.as_bytes());
@@ -1331,6 +1356,98 @@ fn files_set_path(view: &mut FilesView, path: &str) -> Result<(), &'static str> 
     view.notice.fill(0);
     view.notice_len = 0;
     Ok(())
+}
+
+fn files_push_history(view: &mut FilesView) {
+    let current_len = view.path_len;
+    if current_len == 0 { return; }
+    if view.history_count > 0 {
+        let last = view.history_count - 1;
+        if view.history_lens[last] == current_len
+            && view.history_paths[last][..current_len] == view.path[..current_len]
+        { return; }
+    }
+    if view.history_count == FILES_HISTORY_CAPACITY {
+        for index in 1..FILES_HISTORY_CAPACITY {
+            view.history_paths[index - 1] = view.history_paths[index];
+            view.history_lens[index - 1] = view.history_lens[index];
+        }
+        view.history_count -= 1;
+    }
+    let slot = view.history_count;
+    view.history_paths[slot].fill(0);
+    view.history_paths[slot][..current_len].copy_from_slice(&view.path[..current_len]);
+    view.history_lens[slot] = current_len;
+    view.history_count += 1;
+}
+
+fn files_set_path(view: &mut FilesView, path: &str) -> Result<(), &'static str> {
+    if path == files_path(view) {
+        view.page_start = 0;
+        view.highlighted = 0;
+        view.selected_path.fill(0);
+        view.selected_path_len = 0;
+        view.selected_name.fill(0);
+        view.selected_name_len = 0;
+        view.preview.fill(0);
+        view.preview_len = 0;
+        files_set_notice(view, "ALREADY IN THIS FOLDER");
+        return Ok(());
+    }
+    files_push_history(view);
+    files_assign_path(view, path)
+}
+
+fn files_go_back(view: &mut FilesView) {
+    if view.history_count == 0 {
+        files_set_notice(view, "NO PREVIOUS FOLDER IN HISTORY");
+        return;
+    }
+    view.history_count -= 1;
+    let index = view.history_count;
+    let length = view.history_lens[index].min(FILE_PATH_CAPACITY);
+    let mut target = [0u8; FILE_PATH_CAPACITY];
+    target[..length].copy_from_slice(&view.history_paths[index][..length]);
+    let path = core::str::from_utf8(&target[..length]).unwrap_or("/");
+    if let Err(error) = files_assign_path(view, path) {
+        files_set_notice(view, error);
+    } else {
+        files_set_notice(view, "RETURNED TO PREVIOUS FOLDER");
+    }
+}
+
+fn files_pin_current(view: &mut FilesView) {
+    // Copy the current path first so the mutable favorite fields do not alias the
+    // shared borrow returned by files_path().
+    let path = files_path(view);
+    let path_len = path.len();
+    let mut current = [0u8; FILE_PATH_CAPACITY];
+    if path_len == 0 || path_len > FILE_PATH_CAPACITY {
+        files_set_notice(view, "FAVORITE PATH TOO LONG");
+        return;
+    }
+    current[..path_len].copy_from_slice(path.as_bytes());
+    view.favorite_path.fill(0);
+    view.favorite_path[..path_len].copy_from_slice(&current[..path_len]);
+    view.favorite_path_len = path_len;
+    files_set_notice(view, "CURRENT FOLDER PINNED AS FAVORITE");
+}
+
+fn files_open_favorite(view: &mut FilesView) {
+    if view.favorite_path_len == 0 {
+        files_set_notice(view, "NO FAVORITE YET - OPEN A FOLDER AND PIN IT");
+        return;
+    }
+    let favorite_len = view.favorite_path_len.min(FILE_PATH_CAPACITY);
+    let mut target = [0u8; FILE_PATH_CAPACITY];
+    target[..favorite_len].copy_from_slice(&view.favorite_path[..favorite_len]);
+    let path = core::str::from_utf8(&target[..favorite_len]).unwrap_or("/");
+    match crate::vfs::stat(path) {
+        Ok(info) if info.is_dir && crate::users::may_access_path(path) => {
+            let _ = files_set_path(view, path);
+        }
+        _ => files_set_notice(view, "FAVORITE FOLDER IS NO LONGER AVAILABLE"),
+    }
 }
 
 fn files_set_notice(view: &mut FilesView, notice: &str) {
@@ -1511,6 +1628,7 @@ fn handle_files_key(state: &mut DesktopState, key: KeyboardKey) {
             }
         }
         KeyboardKey::Enter => files_activate_row(state, state.files.page_start + state.files.highlighted),
+        KeyboardKey::Backspace => files_go_back(&mut state.files),
         KeyboardKey::Escape => {
             let path = files_path(&state.files);
             if path != "/" {
@@ -1525,6 +1643,9 @@ fn handle_files_key(state: &mut DesktopState, key: KeyboardKey) {
             b'U' => { let path = files_path(&state.files); if path != "/" { let parent = files_parent_path(path); let mut buffer = [0u8; FILE_PATH_CAPACITY]; buffer[..parent.len()].copy_from_slice(parent.as_bytes()); let parent = core::str::from_utf8(&buffer[..parent.len()]).unwrap_or("/"); let _ = files_set_path(&mut state.files, parent); } }
             b'N' => files_begin_prompt(&mut state.files, 2),
             b'D' => files_begin_prompt(&mut state.files, 1),
+            b'B' => files_go_back(&mut state.files),
+            b'P' => files_pin_current(&mut state.files),
+            b'V' => files_open_favorite(&mut state.files),
             _ => {}
         },
         _ => {}
@@ -1536,21 +1657,25 @@ fn files_hit_test(fb: &Framebuffer, x: i32, y: i32, view: &FilesView) -> Option<
     let (window_x, window_y, _, _) = app_window_geometry(fb);
     let side_x = window_x + 12;
     let side_y = window_y + 83;
-    if x >= side_x as i32 && x < (side_x + 112) as i32 {
-        for index in 0..3 {
+    if x >= (side_x - 7) as i32 && x < (side_x + 125) as i32 {
+        for index in 0..4 {
             let row_y = side_y + index * 36;
-            if y >= row_y as i32 && y < (row_y + 29) as i32 {
-                return Some(match index { 0 => FilesHit::Home, 1 => FilesHit::Disk, _ => FilesHit::System });
+            if y >= row_y as i32 - 3 && y < (row_y + 29) as i32 + 3 {
+                return Some(match index { 0 => FilesHit::Home, 1 => FilesHit::Disk, 2 => FilesHit::System, _ => FilesHit::Favorite });
             }
         }
     }
     let layout = files_layout(fb);
-    if layout.up.contains(x, y) { return Some(FilesHit::Up); }
-    if layout.previous.contains(x, y) { return Some(FilesHit::Previous); }
-    if layout.next.contains(x, y) { return Some(FilesHit::Next); }
-    if layout.new_directory.contains(x, y) { return Some(FilesHit::NewDirectory); }
-    if layout.new_file.contains(x, y) { return Some(FilesHit::NewFile); }
-    if layout.delete.contains(x, y) { return Some(FilesHit::Delete); }
+    // The cursor hotspot is aligned to the visible arrow tip; a small target slop
+    // compensates for relative PS/2 motion granularity on compact toolbar buttons.
+    if layout.back.contains_slop(x, y, 2, 5) { return Some(FilesHit::Back); }
+    if layout.up.contains_slop(x, y, 2, 5) { return Some(FilesHit::Up); }
+    if layout.previous.contains_slop(x, y, 2, 5) { return Some(FilesHit::Previous); }
+    if layout.next.contains_slop(x, y, 2, 5) { return Some(FilesHit::Next); }
+    if layout.pin.contains_slop(x, y, 2, 5) { return Some(FilesHit::Pin); }
+    if layout.new_directory.contains_slop(x, y, 2, 5) { return Some(FilesHit::NewDirectory); }
+    if layout.new_file.contains_slop(x, y, 2, 5) { return Some(FilesHit::NewFile); }
+    if layout.delete.contains_slop(x, y, 2, 5) { return Some(FilesHit::Delete); }
     if layout.rows.contains(x, y) {
         let row = ((y as usize - layout.rows.y) / 25).min(FILES_PAGE_SIZE - 1);
         let total = crate::vfs::list_directory(files_path(view), |_, _| {}).ok()?;
@@ -1571,15 +1696,28 @@ fn handle_files_hit(state: &mut DesktopState, hit: FilesHit) {
             } else { files_set_notice(&mut state.files, "WRITABLE DISK IS NOT MOUNTED"); }
         }
         FilesHit::System => { let _ = files_set_path(&mut state.files, "/ETC"); }
+        FilesHit::Favorite => files_open_favorite(&mut state.files),
+        FilesHit::Back => files_go_back(&mut state.files),
+        FilesHit::Pin => files_pin_current(&mut state.files),
         FilesHit::Up => {
             let path = files_path(&state.files);
             if path == "/" { files_set_notice(&mut state.files, "ALREADY AT ROOT"); }
             else { let parent = files_parent_path(path); let mut buffer = [0u8; FILE_PATH_CAPACITY]; buffer[..parent.len()].copy_from_slice(parent.as_bytes()); let parent = core::str::from_utf8(&buffer[..parent.len()]).unwrap_or("/"); let _ = files_set_path(&mut state.files, parent); }
         }
-        FilesHit::Previous => { state.files.page_start = state.files.page_start.saturating_sub(FILES_PAGE_SIZE); state.files.highlighted = 0; }
+        FilesHit::Previous => {
+            if state.files.page_start > 0 {
+                state.files.page_start = state.files.page_start.saturating_sub(FILES_PAGE_SIZE);
+                state.files.highlighted = 0;
+                files_set_notice(&mut state.files, "PREVIOUS PAGE");
+            } else { files_set_notice(&mut state.files, "ALREADY ON FIRST PAGE"); }
+        }
         FilesHit::Next => {
             let total = crate::vfs::list_directory(files_path(&state.files), |_, _| {}).unwrap_or(0);
-            if state.files.page_start + FILES_PAGE_SIZE < total { state.files.page_start += FILES_PAGE_SIZE; state.files.highlighted = 0; }
+            if state.files.page_start + FILES_PAGE_SIZE < total {
+                state.files.page_start += FILES_PAGE_SIZE;
+                state.files.highlighted = 0;
+                files_set_notice(&mut state.files, "NEXT PAGE");
+            } else { files_set_notice(&mut state.files, "ALREADY ON LAST PAGE"); }
         }
         FilesHit::NewDirectory => files_begin_prompt(&mut state.files, 1),
         FilesHit::NewFile => files_begin_prompt(&mut state.files, 2),
@@ -1601,10 +1739,19 @@ fn handle_files_hit(state: &mut DesktopState, hit: FilesHit) {
 
 fn draw_files_panel(fb: &Framebuffer, state: &DesktopState) {
     let (x, y, win_w, win_h) = app_window_geometry(fb);
-    let active_sidebar = if files_path(&state.files).eq_ignore_ascii_case("/DISK") || files_path(&state.files).get(..6).map(|prefix| prefix.eq_ignore_ascii_case("/DISK/")).unwrap_or(false) { 1 } else if files_path(&state.files).eq_ignore_ascii_case("/ETC") || files_path(&state.files).get(..5).map(|prefix| prefix.eq_ignore_ascii_case("/ETC/")).unwrap_or(false) { 2 } else { 0 };
-    draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "FILES", &["HOME", "DISK", "SYSTEM"], active_sidebar);
+    let current_path = files_path(&state.files);
+    let active_sidebar = if state.files.favorite_path_len > 0 && current_path == core::str::from_utf8(&state.files.favorite_path[..state.files.favorite_path_len]).unwrap_or("") { 3 }
+        else if current_path.eq_ignore_ascii_case("/DISK") || current_path.get(..6).map(|prefix| prefix.eq_ignore_ascii_case("/DISK/")).unwrap_or(false) { 1 }
+        else if current_path.eq_ignore_ascii_case("/ETC") || current_path.get(..5).map(|prefix| prefix.eq_ignore_ascii_case("/ETC/")).unwrap_or(false) { 2 }
+        else { 0 };
+    draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "FILES", &["HOME", "DISK", "SYSTEM", "FAVORITE"], active_sidebar);
     let layout = files_layout(fb);
     draw_page_heading(fb, layout.content_x, y + 56, "FILES & STORAGE", "Browse folders and manage writable disk files.");
+    if state.files.notice_len > 0 {
+        let status = core::str::from_utf8(&state.files.notice[..state.files.notice_len]).unwrap_or("");
+        let visible = &status[..status.len().min(layout.content_w / 6)];
+        crate::draw_text(fb, layout.content_x, y + 80, visible, 1, color(fb, 113, 231, 192));
+    }
     rounded_rect(fb, layout.path.x, layout.path.y, layout.path.width, layout.path.height, 7, color(fb, 19, 29, 47));
     crate::draw_text(fb, layout.path.x + 10, layout.path.y + 11, "PATH", 1, color(fb, 103, 222, 255));
     let current_path = files_path(&state.files);
@@ -1612,16 +1759,19 @@ fn draw_files_panel(fb: &Framebuffer, state: &DesktopState) {
     let visible_path = if current_path.len() > max_path { &current_path[current_path.len().saturating_sub(max_path)..] } else { current_path };
     crate::draw_text(fb, layout.path.x + 52, layout.path.y + 11, visible_path, 1, color(fb, 232, 242, 255));
     let buttons = [
+        (layout.back, "BACK", color(fb, 30, 75, 103)),
         (layout.up, "UP", color(fb, 30, 75, 103)),
         (layout.previous, "PREV", color(fb, 28, 43, 65)),
         (layout.next, "NEXT", color(fb, 28, 43, 65)),
+        (layout.pin, "PIN", color(fb, 66, 62, 104)),
         (layout.new_directory, "NEW DIR", color(fb, 25, 91, 78)),
         (layout.new_file, "NEW FILE", color(fb, 25, 91, 78)),
         (layout.delete, "DELETE", color(fb, 105, 40, 52)),
     ];
     for (rect, label, shade) in buttons {
         rounded_rect(fb, rect.x, rect.y, rect.width, rect.height, 5, shade);
-        crate::draw_text(fb, rect.x + 5, rect.y + 10, label, 1, color(fb, 237, 246, 255));
+        let max_chars = rect.width.saturating_sub(8) / 6;
+        crate::draw_text(fb, rect.x + 4, rect.y + 11, &label[..label.len().min(max_chars)], 1, color(fb, 237, 246, 255));
     }
     crate::draw_text(fb, layout.content_x + 5, layout.rows.y - 13, "NAME", 1, color(fb, 111, 222, 255));
     crate::draw_text(fb, layout.content_x + layout.content_w.saturating_sub(94), layout.rows.y - 13, "TYPE / SIZE", 1, color(fb, 111, 222, 255));
