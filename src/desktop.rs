@@ -1,4 +1,4 @@
-//! XavierOS in-kernel desktop for v0.2.1.
+//! XavierOS in-kernel desktop and login manager for v0.2.2.
 //!
 //! This module provides the framebuffer compositor, desktop windows, file manager,
 //! system actions, and application panels. Applications still run in kernel space;
@@ -23,7 +23,7 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.1";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.2";
 const WALLPAPER_WIDTH: usize = 1470;
 const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
@@ -148,10 +148,17 @@ struct FilesView {
 impl FilesView {
     fn new() -> Self {
         let mut path = [0; FILE_PATH_CAPACITY];
+        let mut path_len = 1usize;
         path[0] = b'/';
+        let mut home_buffer = [0u8; 48];
+        if let Some(home) = users::home_path(&mut home_buffer) {
+            let length = home.len().min(path.len());
+            path[..length].copy_from_slice(&home.as_bytes()[..length]);
+            path_len = length;
+        }
         Self {
             path,
-            path_len: 1,
+            path_len,
             page_start: 0,
             highlighted: 0,
             selected_path: [0; FILE_PATH_CAPACITY],
@@ -285,11 +292,22 @@ impl DockLabelBackground {
 }
 
 pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats, bool)>, mouse_ready: bool) -> ! {
+    // The graphical Login Manager runs before the terminal is opened. Enable IRQ0/IRQ1
+    // here so keyboard scancodes reach keyboard_poll_key() during first-run setup.
+    // interactive_shell() enables interrupts too, but it is reached only after login.
+    interrupts::enable_interrupts();
+
     // The desktop keeps a local copy because QEMU's Bochs VBE adapter may change
     // the live framebuffer dimensions while Settings is open.
     let mut active_framebuffer = *framebuffer;
     let mut width = active_framebuffer.width as usize;
     let mut height = active_framebuffer.height as usize;
+    if users::is_initialized() {
+        crate::serial_write("Starting graphical Login Manager.\r\n");
+        login_manager(&active_framebuffer, mouse_ready);
+    } else {
+        crate::serial_write("Login Manager skipped: local user database is unavailable.\r\n");
+    }
     let mut state = DesktopState {
         selected: APP_TERMINAL,
         open_window: None,
@@ -353,8 +371,33 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                         Some(0) => { state.open_window = None; state.system_menu_open = false; repaint = true; }
                         Some(1) => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
                         Some(2) => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
-                        Some(3) => reboot_from_desktop(),
-                        Some(4) => shutdown_from_desktop(),
+                        Some(3) => {
+                            state.open_window = None;
+                            state.system_menu_open = false;
+                            lock_screen(&active_framebuffer, state.mouse_ready);
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        Some(4) => {
+                            open_login_manager_after_session_end(
+                                &active_framebuffer,
+                                &mut state,
+                                "SELECT AN ACCOUNT TO SWITCH TO",
+                            );
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        Some(5) => {
+                            open_login_manager_after_session_end(
+                                &active_framebuffer,
+                                &mut state,
+                                "SIGNED OUT — SELECT AN ACCOUNT",
+                            );
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        Some(6) => reboot_from_desktop(),
+                        Some(7) => shutdown_from_desktop(),
                         _ => { state.system_menu_open = false; repaint = true; }
                     }
                 } else if state.mouse_y < 42 && state.mouse_x < 132 {
@@ -444,14 +487,39 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         if let Some(key) = crate::keyboard_poll_key() {
             if state.system_menu_open {
                 match key {
-                    KeyboardKey::HistoryUp => { state.system_menu_selected = (state.system_menu_selected + 4) % 5; repaint = true; }
-                    KeyboardKey::HistoryDown | KeyboardKey::Tab => { state.system_menu_selected = (state.system_menu_selected + 1) % 5; repaint = true; }
+                    KeyboardKey::HistoryUp => { state.system_menu_selected = (state.system_menu_selected + SYSTEM_MENU_ITEMS.len() - 1) % SYSTEM_MENU_ITEMS.len(); repaint = true; }
+                    KeyboardKey::HistoryDown | KeyboardKey::Tab => { state.system_menu_selected = (state.system_menu_selected + 1) % SYSTEM_MENU_ITEMS.len(); repaint = true; }
                     KeyboardKey::Escape => { state.system_menu_open = false; repaint = true; }
                     KeyboardKey::Enter => match state.system_menu_selected {
                         0 => { state.open_window = None; state.system_menu_open = false; repaint = true; }
                         1 => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
                         2 => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
-                        3 => reboot_from_desktop(),
+                        3 => {
+                            state.open_window = None;
+                            state.system_menu_open = false;
+                            lock_screen(&active_framebuffer, state.mouse_ready);
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        4 => {
+                            open_login_manager_after_session_end(
+                                &active_framebuffer,
+                                &mut state,
+                                "SELECT AN ACCOUNT TO SWITCH TO",
+                            );
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        5 => {
+                            open_login_manager_after_session_end(
+                                &active_framebuffer,
+                                &mut state,
+                                "SIGNED OUT — SELECT AN ACCOUNT",
+                            );
+                            force_full_repaint = true;
+                            repaint = true;
+                        }
+                        6 => reboot_from_desktop(),
                         _ => shutdown_from_desktop(),
                     },
                     _ => {}
@@ -584,7 +652,11 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         }
 
         if repaint {
-            if window_before_input.is_some() && state.open_window.is_none() {
+            if force_full_repaint {
+                cursor_background.valid = false;
+                dock_label_background.valid = false;
+                render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+            } else if window_before_input.is_some() && state.open_window.is_none() {
                 restore_cursor_background(&active_framebuffer, &mut cursor_background);
                 restore_window_backdrop(&active_framebuffer);
                 draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
@@ -626,6 +698,404 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         interrupts::wait_for_interrupt();
     }
 }
+
+fn open_login_manager_after_session_end(
+    fb: &Framebuffer,
+    state: &mut DesktopState,
+    notice: &'static str,
+) {
+    let mouse_ready = state.mouse_ready;
+    // Logging out leaves the kernel in the passwordless LIVE-USER context. Always
+    // show the picker afterwards so the user gets visible confirmation and can
+    // sign in to another account instead of silently remaining on the desktop.
+    if !users::is_live() {
+        if let Err(error) = users::logout() {
+            crate::serial_write("Desktop: logout failed: ");
+            crate::serial_write(error);
+            crate::serial_write("\r\n");
+            return;
+        }
+    }
+    state.open_window = None;
+    state.system_menu_open = false;
+    state.files = FilesView::new();
+    login_manager_with_notice(fb, mouse_ready, notice);
+    // A successful sign-in may have changed the current account and therefore
+    // its home directory; rebuild the Files view after returning from the picker.
+    state.files = FilesView::new();
+}
+
+const LOGIN_USER_LIMIT: usize = 8;
+const LOGIN_NAME_CAPACITY: usize = 16;
+const LOGIN_PASSWORD_CAPACITY: usize = 63;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginView { ChooseUser, Password }
+
+// The first-run/login screens are rendered before the regular desktop mouse loop.
+// Keep a small independent pointer state so the supplied cursor remains visible
+// while the user creates an account or enters a password.
+struct LoginPointer {
+    x: i32,
+    y: i32,
+    ready: bool,
+    background: CursorBackground,
+}
+
+impl LoginPointer {
+    fn new(fb: &Framebuffer, ready: bool) -> Self {
+        let width = fb.width as usize;
+        let height = fb.height as usize;
+        Self {
+            x: (width / 2) as i32,
+            y: (height / 2).max(1) as i32,
+            ready,
+            background: CursorBackground::new(),
+        }
+    }
+
+    fn after_repaint(&mut self, fb: &Framebuffer) {
+        // The whole login screen has just been repainted, so the old saved cursor
+        // background is stale and must not be copied over the new screen.
+        self.background.valid = false;
+        if self.ready {
+            draw_mouse_cursor_saved(fb, self.x, self.y, &mut self.background);
+        }
+    }
+
+    fn poll(&mut self, fb: &Framebuffer) {
+        if !self.ready { return; }
+        let Some(packet) = interrupts::poll_mouse_packet() else { return; };
+        let width = fb.width as usize;
+        let height = fb.height as usize;
+        let next_x = (self.x + packet.dx as i32).clamp(1, width.saturating_sub(2) as i32);
+        let next_y = (self.y - packet.dy as i32).clamp(1, height.saturating_sub(2) as i32);
+        let moved = next_x != self.x || next_y != self.y;
+        if moved {
+            restore_cursor_background(fb, &mut self.background);
+            self.x = next_x;
+            self.y = next_y;
+            draw_mouse_cursor_saved(fb, self.x, self.y, &mut self.background);
+        }
+    }
+}
+
+fn login_manager(fb: &Framebuffer, mouse_ready: bool) {
+    login_manager_with_notice(fb, mouse_ready, "SELECT AN ACCOUNT, THEN PRESS ENTER");
+}
+
+fn login_manager_with_notice(fb: &Framebuffer, mouse_ready: bool, initial_notice: &'static str) {
+    if !users::is_initialized() { return; }
+    let mut pointer = LoginPointer::new(fb, mouse_ready);
+    if users::count() == 0 {
+        first_run_setup(fb, mouse_ready);
+        return;
+    }
+
+    let mut view = LoginView::ChooseUser;
+    let mut selected = 0usize;
+    let mut selected_name = [0u8; LOGIN_NAME_CAPACITY];
+    let mut selected_name_len = 0usize;
+    let mut password = [0u8; LOGIN_PASSWORD_CAPACITY];
+    let mut password_len = 0usize;
+    let mut notice = initial_notice;
+    let mut repaint = true;
+
+    loop {
+        if repaint {
+            match view {
+                LoginView::ChooseUser => draw_user_picker(fb, selected, notice),
+                LoginView::Password => draw_password_prompt(fb, &selected_name[..selected_name_len], &password[..password_len], notice, false),
+            }
+            pointer.after_repaint(fb);
+            repaint = false;
+        }
+        pointer.poll(fb);
+        match crate::keyboard_poll_key() {
+            Some(crate::KeyboardKey::HistoryUp) if view == LoginView::ChooseUser => {
+                let rows = users::count() + 1;
+                selected = (selected + rows - 1) % rows;
+                notice = "SELECT AN ACCOUNT, THEN PRESS ENTER";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::HistoryDown) if view == LoginView::ChooseUser => {
+                let rows = users::count() + 1;
+                selected = (selected + 1) % rows;
+                notice = "SELECT AN ACCOUNT, THEN PRESS ENTER";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Enter) if view == LoginView::ChooseUser => {
+                if selected == users::count() {
+                    crate::serial_write("Login Manager: LIVE-USER guest session selected.\r\n");
+                    return;
+                }
+                if let Some((name, length)) = login_username_at(selected) {
+                    selected_name = name;
+                    selected_name_len = length;
+                    password.fill(0);
+                    password_len = 0;
+                    notice = "ENTER YOUR PASSWORD";
+                    view = LoginView::Password;
+                    repaint = true;
+                }
+            }
+            Some(crate::KeyboardKey::Character(byte)) if view == LoginView::Password && is_login_character(byte) && password_len < LOGIN_PASSWORD_CAPACITY => {
+                password[password_len] = byte;
+                password_len += 1;
+                notice = "PRESS ENTER TO SIGN IN";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Backspace) if view == LoginView::Password && password_len > 0 => {
+                password_len -= 1;
+                password[password_len] = 0;
+                notice = "PRESS ENTER TO SIGN IN";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Enter) if view == LoginView::Password => {
+                let name = core::str::from_utf8(&selected_name[..selected_name_len]).unwrap_or("");
+                match users::authenticate(name, &password[..password_len]) {
+                    Ok(()) => {
+                        password.fill(0);
+                        crate::serial_write("Login Manager: user authenticated.\r\n");
+                        return;
+                    }
+                    Err(error) => {
+                        notice = error;
+                        password.fill(0);
+                        password_len = 0;
+                        repaint = true;
+                    }
+                }
+            }
+            Some(crate::KeyboardKey::Escape) if view == LoginView::Password => {
+                password.fill(0);
+                password_len = 0;
+                view = LoginView::ChooseUser;
+                notice = "SELECT AN ACCOUNT, THEN PRESS ENTER";
+                repaint = true;
+            }
+            _ => {}
+        }
+        // Repaint only after an input/state change; PIT wakeups must not redraw the full screen.
+        interrupts::wait_for_interrupt();
+    }
+}
+
+fn first_run_setup(fb: &Framebuffer, mouse_ready: bool) {
+    let mut pointer = LoginPointer::new(fb, mouse_ready);
+    let mut username = [0u8; LOGIN_NAME_CAPACITY];
+    let mut username_len = 0usize;
+    let mut password = [0u8; LOGIN_PASSWORD_CAPACITY];
+    let mut password_len = 0usize;
+    let mut confirm = [0u8; LOGIN_PASSWORD_CAPACITY];
+    let mut confirm_len = 0usize;
+    let mut field = 0usize;
+    let mut notice = "CREATE THE FIRST ADMINISTRATOR ACCOUNT";
+    let mut repaint = true;
+
+    loop {
+        if repaint {
+            draw_first_run(fb, &username[..username_len], &password[..password_len], &confirm[..confirm_len], field, notice);
+            pointer.after_repaint(fb);
+            repaint = false;
+        }
+        pointer.poll(fb);
+        match crate::keyboard_poll_key() {
+            Some(crate::KeyboardKey::Character(byte)) if field == 0 && is_login_character(byte) && username_len < 15 => {
+                username[username_len] = byte.to_ascii_lowercase();
+                username_len += 1;
+                notice = "USERNAME: 1-15 CHARS; USE LETTERS, DIGITS, _ OR -";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Character(byte)) if field == 1 && is_login_character(byte) && password_len < LOGIN_PASSWORD_CAPACITY => {
+                password[password_len] = byte;
+                password_len += 1;
+                notice = "PASSWORD MUST HAVE AT LEAST 8 CHARACTERS";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Character(byte)) if field == 2 && is_login_character(byte) && confirm_len < LOGIN_PASSWORD_CAPACITY => {
+                confirm[confirm_len] = byte;
+                confirm_len += 1;
+                notice = "RE-ENTER THE PASSWORD TO CONFIRM";
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Backspace) if field == 0 && username_len > 0 => { username_len -= 1; username[username_len] = 0; repaint = true; }
+            Some(crate::KeyboardKey::Backspace) if field == 1 && password_len > 0 => { password_len -= 1; password[password_len] = 0; repaint = true; }
+            Some(crate::KeyboardKey::Backspace) if field == 2 && confirm_len > 0 => { confirm_len -= 1; confirm[confirm_len] = 0; repaint = true; }
+            Some(crate::KeyboardKey::Tab) => { field = (field + 1) % 3; notice = "TAB CHANGES FIELD; ENTER ADVANCES"; repaint = true; }
+            Some(crate::KeyboardKey::Enter) if field < 2 => { field += 1; notice = "ENTER THE NEXT FIELD"; repaint = true; }
+            Some(crate::KeyboardKey::Enter) if field == 2 => {
+                if password_len != confirm_len || password[..password_len] != confirm[..confirm_len] {
+                    notice = "PASSWORDS DO NOT MATCH";
+                    confirm.fill(0);
+                    confirm_len = 0;
+                    repaint = true;
+                } else {
+                    let name = core::str::from_utf8(&username[..username_len]).unwrap_or("");
+                    match users::create(name, &password[..password_len]) {
+                        Ok(()) => match users::authenticate(name, &password[..password_len]) {
+                            Ok(()) => {
+                                password.fill(0);
+                                confirm.fill(0);
+                                crate::serial_write("Login Manager: first administrator account created and signed in.\r\n");
+                                return;
+                            }
+                            Err(error) => { notice = error; repaint = true; }
+                        },
+                        Err(error) => { notice = error; repaint = true; }
+                    }
+                }
+            }
+            _ => {}
+        }
+        interrupts::wait_for_interrupt();
+    }
+}
+
+fn lock_screen(fb: &Framebuffer, mouse_ready: bool) {
+    if users::is_live() {
+        login_manager(fb, mouse_ready);
+        return;
+    }
+    let mut pointer = LoginPointer::new(fb, mouse_ready);
+    let mut name_buffer = [0u8; LOGIN_NAME_CAPACITY];
+    let name = users::current_name(&mut name_buffer);
+    let name_bytes = name.as_bytes();
+    let mut password = [0u8; LOGIN_PASSWORD_CAPACITY];
+    let mut password_len = 0usize;
+    let mut notice = "THIS SESSION IS LOCKED - ENTER YOUR PASSWORD";
+    let mut repaint = true;
+    loop {
+        if repaint {
+            draw_password_prompt(fb, name_bytes, &password[..password_len], notice, true);
+            pointer.after_repaint(fb);
+            repaint = false;
+        }
+        pointer.poll(fb);
+        match crate::keyboard_poll_key() {
+            Some(crate::KeyboardKey::Character(byte)) if is_login_character(byte) && password_len < LOGIN_PASSWORD_CAPACITY => {
+                password[password_len] = byte;
+                password_len += 1;
+                repaint = true;
+            }
+            Some(crate::KeyboardKey::Backspace) if password_len > 0 => { password_len -= 1; password[password_len] = 0; repaint = true; }
+            Some(crate::KeyboardKey::Enter) => match users::verify_current_password(&password[..password_len]) {
+                Ok(()) => { password.fill(0); crate::serial_write("Login Manager: session unlocked.\r\n"); return; }
+                Err(error) => { notice = error; password.fill(0); password_len = 0; repaint = true; }
+            },
+            _ => {}
+        }
+        interrupts::wait_for_interrupt();
+    }
+}
+
+fn login_username_at(wanted: usize) -> Option<([u8; LOGIN_NAME_CAPACITY], usize)> {
+    let mut names = [[0u8; LOGIN_NAME_CAPACITY]; LOGIN_USER_LIMIT];
+    let mut lengths = [0usize; LOGIN_USER_LIMIT];
+    let mut count = 0usize;
+    users::list(|name| {
+        if count < LOGIN_USER_LIMIT {
+            lengths[count] = name.len().min(LOGIN_NAME_CAPACITY);
+            names[count][..lengths[count]].copy_from_slice(&name.as_bytes()[..lengths[count]]);
+            count += 1;
+        }
+    });
+    if wanted >= count { return None; }
+    Some((names[wanted], lengths[wanted]))
+}
+
+fn draw_user_picker(fb: &Framebuffer, selected: usize, notice: &str) {
+    let width = fb.width as usize;
+    let height = fb.height as usize;
+    crate::fill_rect(fb, 0, 0, width, height, color(fb, 12, 18, 31));
+    let rows = users::count() + 1;
+    let panel_w = 560usize.min(width.saturating_sub(24));
+    let panel_h = (174 + rows * 34).min(height.saturating_sub(24));
+    let x = width.saturating_sub(panel_w) / 2;
+    let y = height.saturating_sub(panel_h) / 2;
+    rounded_rect(fb, x, y, panel_w, panel_h, 16, color(fb, 23, 33, 53));
+    crate::draw_text(fb, x + 28, y + 24, "XAVIEROS", 2, color(fb, 106, 218, 255));
+    crate::draw_text(fb, x + 28, y + 46, "LOGIN MANAGER", 1, color(fb, 231, 238, 248));
+    crate::draw_text(fb, x + 28, y + 72, "CHOOSE A USER ACCOUNT", 1, color(fb, 151, 170, 196));
+    let row_x = x + 20;
+    let row_y = y + 96;
+    let mut row = 0usize;
+    users::list(|name| {
+        let py = row_y + row * 34;
+        if row == selected { rounded_rect(fb, row_x, py, panel_w.saturating_sub(40), 30, 6, color(fb, 42, 81, 116)); }
+        crate::draw_text(fb, row_x + 14, py + 10, name, 1, color(fb, 235, 243, 252));
+        crate::draw_text(fb, row_x + panel_w.saturating_sub(116), py + 10, if row == 0 { "ADMIN" } else { "USER" }, 1, color(fb, 123, 211, 186));
+        row += 1;
+    });
+    let py = row_y + row * 34;
+    if selected == row { rounded_rect(fb, row_x, py, panel_w.saturating_sub(40), 30, 6, color(fb, 42, 81, 116)); }
+    crate::draw_text(fb, row_x + 14, py + 10, "LIVE-USER", 1, color(fb, 235, 243, 252));
+    crate::draw_text(fb, row_x + panel_w.saturating_sub(116), py + 10, "GUEST", 1, color(fb, 226, 194, 124));
+    crate::draw_text(fb, x + 28, y + panel_h.saturating_sub(28), notice, 1, color(fb, 163, 186, 213));
+    crate::draw_text(fb, x + 28, height.saturating_sub(20), "UP/DOWN SELECT  ENTER CONTINUE", 1, color(fb, 105, 128, 157));
+}
+
+fn draw_password_prompt(fb: &Framebuffer, name: &[u8], password: &[u8], notice: &str, locked: bool) {
+    let width = fb.width as usize;
+    let height = fb.height as usize;
+    crate::fill_rect(fb, 0, 0, width, height, color(fb, 12, 18, 31));
+    let panel_w = 500usize.min(width.saturating_sub(24));
+    let panel_h = 330usize.min(height.saturating_sub(24));
+    let x = width.saturating_sub(panel_w) / 2;
+    let y = height.saturating_sub(panel_h) / 2;
+    rounded_rect(fb, x, y, panel_w, panel_h, 16, color(fb, 23, 33, 53));
+    crate::draw_text(fb, x + 28, y + 28, if locked { "SESSION LOCKED" } else { "WELCOME BACK" }, 2, color(fb, 106, 218, 255));
+    let name = core::str::from_utf8(name).unwrap_or("USER");
+    crate::draw_text(fb, x + 28, y + 76, name, 2, color(fb, 235, 243, 252));
+    crate::draw_text(fb, x + 28, y + 130, "PASSWORD", 1, color(fb, 151, 170, 196));
+    rounded_rect(fb, x + 24, y + 150, panel_w.saturating_sub(48), 40, 6, color(fb, 10, 15, 26));
+    let mut mask = [0u8; LOGIN_PASSWORD_CAPACITY];
+    mask[..password.len()].fill(b'*');
+    let masked = core::str::from_utf8(&mask[..password.len()]).unwrap_or("");
+    crate::draw_text(fb, x + 36, y + 166, masked, 1, color(fb, 245, 248, 252));
+    let caret_x = x + 36 + masked.len() * 6;
+    crate::fill_rect(fb, caret_x, y + 165, 2, 9, color(fb, 106, 218, 255));
+    crate::draw_text(fb, x + 28, y + 218, notice, 1, color(fb, 239, 170, 146));
+    crate::draw_text(fb, x + 28, y + panel_h.saturating_sub(28), if locked { "ENTER UNLOCKS THIS SESSION" } else { "ENTER SIGN IN  ESC BACK" }, 1, color(fb, 105, 128, 157));
+}
+
+fn draw_first_run(fb: &Framebuffer, username: &[u8], password: &[u8], confirm: &[u8], field: usize, notice: &str) {
+    let width = fb.width as usize;
+    let height = fb.height as usize;
+    crate::fill_rect(fb, 0, 0, width, height, color(fb, 12, 18, 31));
+    let panel_w = 560usize.min(width.saturating_sub(24));
+    let panel_h = 400usize.min(height.saturating_sub(24));
+    let x = width.saturating_sub(panel_w) / 2;
+    let y = height.saturating_sub(panel_h) / 2;
+    rounded_rect(fb, x, y, panel_w, panel_h, 16, color(fb, 23, 33, 53));
+    crate::draw_text(fb, x + 28, y + 24, "WELCOME TO XAVIEROS", 2, color(fb, 106, 218, 255));
+    crate::draw_text(fb, x + 28, y + 58, "FIRST-RUN ACCOUNT SETUP", 1, color(fb, 231, 238, 248));
+    crate::draw_text(fb, x + 28, y + 94, "CREATE THE FIRST ADMINISTRATOR", 1, color(fb, 151, 170, 196));
+    let labels = ["USERNAME", "PASSWORD", "CONFIRM PASSWORD"];
+    let values: [&[u8]; 3] = [username, password, confirm];
+    for index in 0..3 {
+        let py = y + 126 + index * 58;
+        crate::draw_text(fb, x + 28, py, labels[index], 1, color(fb, if field == index { 106 } else { 151 }, if field == index { 218 } else { 170 }, if field == index { 255 } else { 196 }));
+        rounded_rect(fb, x + 24, py + 14, panel_w.saturating_sub(48), 32, 5, color(fb, if field == index { 36 } else { 10 }, if field == index { 53 } else { 15 }, if field == index { 75 } else { 26 }));
+        let mut mask = [0u8; LOGIN_PASSWORD_CAPACITY];
+        let show = if index == 0 {
+            core::str::from_utf8(values[index]).unwrap_or("")
+        } else {
+            mask[..values[index].len()].fill(b'*');
+            core::str::from_utf8(&mask[..values[index].len()]).unwrap_or("")
+        };
+        crate::draw_text(fb, x + 36, py + 26, show, 1, color(fb, 245, 248, 252));
+        if field == index {
+            let caret_x = x + 36 + show.len() * 6;
+            let caret_y = py + 25;
+            crate::fill_rect(fb, caret_x, caret_y, 2, 9, color(fb, 106, 218, 255));
+        }
+    }
+    crate::draw_text(fb, x + 28, y + panel_h.saturating_sub(42), notice, 1, color(fb, 239, 170, 146));
+    crate::draw_text(fb, x + 28, y + panel_h.saturating_sub(22), "TAB SELECTS FIELD  ENTER CONTINUES", 1, color(fb, 105, 128, 157));
+}
+
+fn is_login_character(byte: u8) -> bool { (0x20..=0x7E).contains(&byte) }
 
 fn render_desktop(
     fb: &Framebuffer,
@@ -783,14 +1253,17 @@ fn draw_menu_bar(fb: &Framebuffer, mouse_ready: bool) {
     crate::draw_text(fb, width.saturating_sub(if mouse_ready { 96 } else { 80 }), 16, if mouse_ready { "MOUSE" } else { "KEYS" }, 1, color(fb, 107, 229, 181));
 }
 
-const SYSTEM_MENU_ITEMS: [&str; 5] = ["DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "RESTART", "SHUT DOWN"];
+const SYSTEM_MENU_ITEMS: [&str; 8] = [
+    "DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "LOCK SCREEN",
+    "SWITCH USER", "LOG OUT", "RESTART", "SHUT DOWN",
+];
 
 fn draw_system_menu(fb: &Framebuffer, selected: usize) {
     let x = 12usize;
     let y = 46usize;
     let w = 224usize;
     let row_h = 34usize;
-    let h = row_h * SYSTEM_MENU_ITEMS.len() + 16;
+    let h = 49 + row_h * SYSTEM_MENU_ITEMS.len();
     rounded_rect(fb, x + 3, y + 5, w, h, 10, color(fb, 3, 5, 12));
     rounded_rect(fb, x, y, w, h, 10, color(fb, 22, 31, 51));
     crate::draw_text(fb, x + 14, y + 12, "XAVIEROS SYSTEM", 1, color(fb, 100, 220, 255));
@@ -799,13 +1272,13 @@ fn draw_system_menu(fb: &Framebuffer, selected: usize) {
         if i == selected {
             rounded_rect(fb, x + 7, row_y, w - 14, row_h - 2, 6, color(fb, 43, 72, 103));
         }
-        let text_color = if i >= 3 { color(fb, 255, 170, 160) } else { color(fb, 226, 237, 251) };
+        let text_color = if i >= 6 { color(fb, 255, 170, 160) } else { color(fb, 226, 237, 251) };
         crate::draw_text(fb, x + 17, row_y + 11, item, 1, text_color);
     }
 }
 
 fn system_menu_hit(x: i32, y: i32) -> Option<usize> {
-    if !(12..=236).contains(&x) || !(77..247).contains(&y) { return None; }
+    if !(12..=236).contains(&x) || y < 77 || y >= 77 + (SYSTEM_MENU_ITEMS.len() as i32 * 34) { return None; }
     let index = ((y - 77) / 34) as usize;
     if index < SYSTEM_MENU_ITEMS.len() { Some(index) } else { None }
 }

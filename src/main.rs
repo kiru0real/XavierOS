@@ -115,7 +115,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
     });
-    serial_write("\r\nXavierOS v0.2.1\r\n");
+    serial_write("\r\nXavierOS v0.2.2\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -478,7 +478,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.2.1 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.2 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -704,7 +704,7 @@ fn run_console_window(
 
     let mut console = Console::new(*framebuffer, true);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.1");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.2");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -1483,7 +1483,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.2.1");
+            console.write_line("PROJECT VERSION: 0.2.2");
             console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
@@ -1492,7 +1492,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.2.1");
+            console.write_line("VERSION: 0.2.2");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1961,7 +1961,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.2.1"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.2"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2210,7 +2210,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.2.1");
+    let _ = writeln!(&mut out, "Version: 0.2.2");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2457,7 +2457,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.2.1 | DESKTOP PREVIEW AVAILABLE.");
+    console.write_line("VERSION 0.2.2 | DESKTOP PREVIEW AVAILABLE.");
     console.write_line("");
 }
 
@@ -2798,9 +2798,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.1");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.2");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.1");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.2");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2856,7 +2856,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.2.1"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.2"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);

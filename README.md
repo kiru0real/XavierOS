@@ -8,9 +8,9 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-0.2.1%20Release-blue)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/Status-0.2.2%20Pre-release-orange)](#status-and-limitations)
 
-**Current version: `0.2.1`**
+**Current version: `0.2.2`**
 
 [Русская версия README](README.ru.md)
 
@@ -20,13 +20,14 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 ## About
 
-XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.1 improves Files mouse controls with Back history, session favorites, clear status feedback, and keyboard shortcuts.
+XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.2 adds a graphical Login Manager, first-run administrator setup, password-protected account sign-in, a passwordless LIVE-USER guest choice, session lock/unlock, and switch-user/logout actions in the system menu.
 
 ## Features
 
 - **Kernel and boot:** `x86_64-unknown-none`, Limine boot protocol, IDT exception handlers, PMM bitmap allocator, HHDM, heap, PIC/PIT, PS/2 keyboard and polled PS/2 mouse.
+- **Login Manager:** first-run administrator creation with password confirmation, a startup account picker, password-protected sign-in, a passwordless `LIVE-USER` guest session, session lock/unlock, switch user, and log out. Keyboard input is enabled before the login UI starts. The custom mouse pointer remains visible and follows PS/2 mouse movement; selecting fields and activating controls still uses the keyboard.
 - **Desktop compositor:** fullscreen wallpaper with cover scaling and fixed-point bilinear interpolation, updated dock and icons, a 24×24 custom alpha-blended cursor, a top menu bar, window panels, and saved-window-background restoration to avoid the old full-screen “printer” redraw on close.
-- **Files:** click directories to navigate, use Back/Up/Home/Disk/System/Favorite, page through entries, select and preview a text file, create a directory or empty file, and delete a selected file on the writable `/DISK` mount. Back history and Favorite are session-only. The embedded root is read-only; preview is bounded and not a full text editor.
+- **Files:** opens in the current session home (`/DISK/HOME/<username>` or `/DISK/HOME/live`), then supports folder navigation, Back/Up/Home/Disk/System/Favorite, paging, bounded text preview, directory/empty-file creation, and deletion on writable `/DISK`. Back history and Favorite are session-only. The embedded root is read-only; preview is bounded and not a full text editor.
 - **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running.
 - **Network:** E1000 for QEMU, DHCP/static fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, experimental TCP/HTTP, gateway/DNS diagnostics, and packet counters.
 - **Clock:** local time, fixed UTC offset, RTC and experimental NTP synchronization controls.
@@ -54,7 +55,7 @@ The ISO is written under `build/`. `run.py` attaches `data/xavieros-disk.img`, a
 - Keyboard: `F` Files, `T` Terminal, `N` Network, `C` Clock, `S` Settings, `A` About, `X` system menu. Arrow keys navigate the menu, Files list, and About tabs; Enter activates; Escape closes or moves up in Files. In Network, `G` checks the gateway and `D` checks DNS. In Clock, `N` syncs NTP, `M`/`P` adjust timezone by one hour, and `S` saves it.
 - Files: click a folder to enter it; use `BACK`/Backspace/`B` for history, `UP`/Escape for parent, `PIN`/`P` to save a session favorite and `FAVORITE`/`V` to open it; `PREV`/`NEXT` page the list. Select a file to preview, `NEW DIR` or `NEW FILE` to create an item under `/DISK`, and `DELETE` to remove a selected `/DISK` file. During name entry, type ASCII and press Enter; Escape cancels.
 - Terminal: type `DESKTOP` or press Escape/close to return to the desktop.
-- System menu: click `XAVIEROS` or press `X`; choose Desktop, Open Terminal, About, Restart, or Shut Down with arrows and Enter.
+- System menu: click `XAVIEROS` or press `X`; choose Desktop, Open Terminal, About, Lock Screen, Switch User, Log Out, Restart, or Shut Down with arrows and Enter. Switch User and Log Out return to Login Manager; Log Out first ends the current account session and shows a signed-out notice. Login Manager accepts `Up`/`Down` plus Enter; password fields are masked. First-run setup uses Tab or Enter to move through username, password, and confirmation. In QEMU, Shut Down sends the ACPI poweroff request and the emulator is allowed to exit.
 - Display: choose a mode in Settings and click Apply Mode. Live changes depend on the emulated VGA adapter. Limine has boot-time mode entries if live switching is unsupported.
 
 ## Shell commands
@@ -66,11 +67,11 @@ Run `HELP` for the current full list. Key groups include `SYSINFO`; `NET`, `NETS
 - [Changelog](CHANGELOG.md)
 - [MIT License](LICENSE)
 
-The root documentation is intentionally kept to `README.md`, `README.ru.md`, and `CHANGELOG.md`. A release kit includes a longer cumulative release-notes document.
+The root documentation is intentionally kept to `README.md`, `README.ru.md`, and `CHANGELOG.md`. Release Notes describe only the current release; the cumulative development history stays in `CHANGELOG.md`.
 
 ## Status and limitations
 
-XavierOS is experimental and is not a general-purpose or secure operating system. The desktop and its applications run inside the kernel rather than isolated user processes. Files supports directory navigation, bounded text preview, and selected operations on `/DISK`, but is not a complete file manager/editor. Network features target the QEMU E1000 and user-mode NAT; HTTPS/TLS, IPv6, and general-purpose networking are not implemented. XVDISKFS is not journaled or crash-safe. Live resolution switching depends on VGA/Bochs VBE support. Restart and shutdown are emulator-oriented; physical hardware is not validated.
+XavierOS is experimental and is not a general-purpose or secure operating system. The desktop and its applications run inside the kernel rather than isolated user processes. Account UI, password checks, and shell path restrictions are a prototype and are not a security boundary against arbitrary kernel code. Files supports directory navigation, bounded text preview, and selected operations on `/DISK`, but is not a complete file manager/editor. Network features target the QEMU E1000 and user-mode NAT; HTTPS/TLS, IPv6, and general-purpose networking are not implemented. XVDISKFS is not journaled or crash-safe. Live resolution switching depends on VGA/Bochs VBE support. Restart and shutdown are emulator-oriented; QEMU shutdown depends on ACPI support, and physical hardware is not validated.
 
 **Run XavierOS in QEMU or another disposable virtual machine. Do not rely on it to protect important data.**
 
@@ -86,4 +87,4 @@ XavierOS code and documentation are distributed under the [MIT License](LICENSE)
 - The DHCP client negotiates a lease for the QEMU E1000 network; the UDP NTP client can synchronize the clock after network setup. RTC is used before successful synchronization. `DATE`, `TIME`, `DATETIME`, `NTP`, and `TIMEZONE` are also available from the shell.
 - `REPORT SAVE` writes a diagnostic report to an allowed virtual-disk path. Shell path permissions are not a Ring 3 security boundary.
 - Automatic GitHub release checking is not implemented yet; HTTPS/TLS support is required before the kernel can query GitHub securely. The experimental `HTTPGET` and `FETCH` commands support plain HTTP only.
-- The shell has Up/Down command history and Tab completion for commands and paths. Accounts use salted password hashes but do not provide isolated user processes.
+- The shell has Up/Down command history and Tab completion for commands and paths. Accounts use salted password hashes, but do not provide isolated user processes. `LIVE-USER` is intentionally passwordless and can only access its own writable home path through shell-level path checks.

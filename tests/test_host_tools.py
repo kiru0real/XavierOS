@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.1.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.2.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_is_wired_and_version_is_release_021(self) -> None:
+    def test_desktop_is_wired_and_version_is_release_022(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,9 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.1"', cargo)
-        self.assertIn('VERSION = "0.2.1"', release)
-        self.assertIn('Current version: `0.2.1`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.2"', cargo)
+        self.assertIn('VERSION = "0.2.2"', release)
+        self.assertIn('Current version: `0.2.2`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_beta4_wallpaper_uses_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -258,13 +258,33 @@ class RepositoryShapeTests(unittest.TestCase):
             self.assertIn(f"resolution: {mode}", limine)
         self.assertIn("timeout: 5", limine)
 
-    def test_release_system_menu_has_desktop_terminal_about_restart_shutdown(self) -> None:
+    def test_release_system_menu_has_session_controls_and_power_actions(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
-        for item in ("DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "RESTART", "SHUT DOWN"):
+        for item in ("DESKTOP", "OPEN TERMINAL", "ABOUT XAVIEROS", "LOCK SCREEN", "SWITCH USER", "LOG OUT", "RESTART", "SHUT DOWN"):
             self.assertIn(item, desktop)
         self.assertIn("fn reboot_from_desktop() -> !", desktop)
         self.assertIn("fn shutdown_from_desktop() -> !", desktop)
         self.assertIn("b'X' => { state.system_menu_open = true", desktop)
+
+    def test_log_out_and_switch_user_both_return_to_login_manager(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        helper = desktop[desktop.index("fn open_login_manager_after_session_end("):desktop.index("const LOGIN_USER_LIMIT:")]
+        self.assertIn("if !users::is_live()", helper)
+        self.assertIn("users::logout()", helper)
+        self.assertIn("login_manager_with_notice(fb, mouse_ready, notice)", helper)
+        self.assertIn("state.files = FilesView::new();", helper)
+        self.assertIn('"SIGNED OUT — SELECT AN ACCOUNT"', desktop)
+        # Both mouse and keyboard menu handlers must use the same session transition.
+        self.assertEqual(desktop.count("open_login_manager_after_session_end("), 5)
+
+    def test_qemu_guest_shutdown_is_not_suppressed(self) -> None:
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        self.assertIn('command.extend(["-serial", "stdio", "-monitor", "none"])', run)
+        self.assertNotIn('"-no-shutdown"', run)
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        shutdown = desktop[desktop.index("fn shutdown_from_desktop() -> !"):desktop.index("fn halt_desktop() -> !")]
+        self.assertIn('in("dx") 0x604u16', shutdown)
+        self.assertIn('in("dx") 0xB004u16', shutdown)
 
     def test_custom_cursor_is_drawn_after_saving_background(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -397,13 +417,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_release_021(self) -> None:
+    def test_version_metadata_is_consistent_for_release_022(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.1"', cargo)
-        self.assertIn('VERSION = "0.2.1"', package)
-        self.assertIn("Current version: `0.2.1`", readme)
+        self.assertIn('version = "0.2.2"', cargo)
+        self.assertIn('VERSION = "0.2.2"', package)
+        self.assertIn("Current version: `0.2.2`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -430,6 +450,53 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "users.rs").is_file())
         self.assertTrue((ROOT / "src" / "crypto.rs").is_file())
 
+    def test_graphical_login_manager_first_run_and_session_controls_are_wired(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        users = (ROOT / "src" / "users.rs").read_text(encoding="utf-8")
+        self.assertIn("login_manager(&active_framebuffer, mouse_ready)", desktop)
+        self.assertIn("fn first_run_setup(", desktop)
+        self.assertIn("fn draw_user_picker(", desktop)
+        self.assertIn("LIVE-USER", desktop)
+        self.assertIn("fn lock_screen(", desktop)
+        self.assertIn("users::home_path(&mut home_buffer)", desktop)
+        self.assertIn("path[..length].copy_from_slice(&home.as_bytes()[..length])", desktop)
+        self.assertIn("pub fn verify_current_password(", users)
+        self.assertIn('owner.eq_ignore_ascii_case("live")', users)
+        self.assertIn('ensure_home("live")?;', users)
+        self.assertIn("first administrator account created and signed in", desktop)
+
+    def test_login_manager_enables_keyboard_interrupts_before_first_run(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        start = desktop.index("pub(super) fn run(")
+        login_call = desktop.index("login_manager(&active_framebuffer, mouse_ready)", start)
+        sti_call = desktop.index("interrupts::enable_interrupts();", start)
+        self.assertLess(sti_call, login_call)
+        self.assertIn("keyboard scancodes reach keyboard_poll_key() during first-run setup", desktop)
+
+    def test_first_run_setup_draws_mouse_and_text_cursors(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        setup_start = desktop.index("fn first_run_setup(")
+        setup_end = desktop.index("fn lock_screen(", setup_start)
+        setup = desktop[setup_start:setup_end]
+        self.assertIn("pointer.after_repaint(fb);", setup)
+        self.assertIn("pointer.poll(fb);", setup)
+        draw_start = desktop.index("fn draw_first_run(")
+        draw_end = desktop.index("fn is_login_character(", draw_start)
+        draw = desktop[draw_start:draw_end]
+        self.assertIn("let caret_x = x + 36 + show.len() * 6;", draw)
+        self.assertIn("crate::fill_rect(fb, caret_x, caret_y, 2, 9", draw)
+        self.assertIn("let caret_x = x + 36 + masked.len() * 6;", desktop)
+        self.assertIn("pub fn poll_mouse_packet()", (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8"))
+
+    def test_login_manager_repaints_only_on_input_changes(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        start = desktop.index("fn login_manager(")
+        end = desktop.index("fn first_run_setup(", start)
+        login = desktop[start:end]
+        self.assertIn("let mut repaint = true;", login)
+        self.assertIn("if repaint {", login)
+        self.assertIn("PIT wakeups must not redraw the full screen", login)
+
     def test_shell_line_editor_controls_are_wired(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         for feature in ("CursorLeft", "CursorRight", "CursorHome", "CursorEnd", "Delete", "ClearLine", "Cancel"):
@@ -450,7 +517,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.1")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.2")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -492,7 +559,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.1', main)
+        self.assertIn('VERSION: 0.2.2', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -570,8 +637,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.1"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.1"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.2"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.2"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -624,9 +691,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.1`", readme)
-        self.assertIn('VERSION = "0.2.1"', release)
-        self.assertIn('version = "0.2.1"', cargo)
+        self.assertIn("Current version: `0.2.2`", readme)
+        self.assertIn('VERSION = "0.2.2"', release)
+        self.assertIn('version = "0.2.2"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:

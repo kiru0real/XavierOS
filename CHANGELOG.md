@@ -1,6 +1,28 @@
 # Changelog
 
-All notable XavierOS changes are documented here. The release-kit file `XavierOS-0.2.1-Release-Notes.md` contains the expanded history and detailed release notes.
+All notable XavierOS changes are documented here. The release-kit file `XavierOS-0.2.2-Release-Notes.md` contains the expanded history and detailed release notes.
+
+## 0.2.2 — Session and Power Actions Fix
+
+- Log Out now ends the current account session and returns to Login Manager with a visible signed-out notice; Switch User uses the same account picker with a distinct notice.
+- The QEMU launcher no longer passes `-no-shutdown`, allowing the emulator to exit when XavierOS sends its ACPI poweroff request.
+- Fixed first-run account setup keyboard input by enabling IRQ0/IRQ1 before entering the graphical Login Manager.
+- Added the custom mouse pointer to first-run setup, account selection, password sign-in, and session lock screens, plus a visible insertion caret in first-run text fields.
+- 70 host-side Python tests pass after extracting the updated source archive. They cover source-level invariants and build/package helpers; they do not compile Rust or prove GUI runtime behavior. Rust compilation and QEMU interaction still require local verification before publication.
+
+## 0.2.2 — Accounts & Sessions Update
+
+### Added
+- Added a framebuffer Login Manager at startup, with a first-run wizard for the initial administrator account and password confirmation.
+- Added an account picker with password-masked sign-in and an explicit passwordless `LIVE-USER` guest option.
+- Added system-menu actions for Lock Screen, Switch User, and Log Out. Lock Screen verifies the current account password before resuming the same session.
+- Added a password verification path for unlocking a locked session and retained the existing account database format.
+- Restricted the passwordless guest session to `/DISK/HOME/live` for writable-disk paths enforced by the shell-level path checks.
+
+### Limitations
+- Login Manager controls are keyboard-driven; mouse-click account selection is not implemented yet.
+- Account checks and file-path checks execute in ring 0 and are not real user-mode isolation. Applications and shell commands remain kernel code.
+- Rust compilation and QEMU runtime behavior still require local verification; the packaging environment has no Rust toolchain or QEMU.
 
 ## 0.2.1 — Files interaction fix and Quick Access
 

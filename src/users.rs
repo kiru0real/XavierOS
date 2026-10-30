@@ -71,6 +71,7 @@ pub fn initialize() -> Result<(), &'static str> {
     }
     ensure_directory("/DISK/SYSTEM")?;
     ensure_directory("/DISK/HOME")?;
+    ensure_home("live")?;
 
     match vfs::stat(DB_PATH) {
         Ok(info) if info.is_dir => return Err("USER DATABASE PATH IS A DIRECTORY"),
@@ -215,6 +216,30 @@ pub fn authenticate(name: &str, password: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn verify_current_password(password: &[u8]) -> Result<(), &'static str> {
+    if !is_initialized() { return Err("USER DATABASE IS NOT AVAILABLE"); }
+    if is_live() { return Err("LIVE SESSION HAS NO PASSWORD"); }
+    if login_lockout_remaining_ticks() > 0 {
+        return Err("LOGIN TEMPORARILY LOCKED AFTER FAILED ATTEMPTS");
+    }
+    if password.is_empty() || password.len() > 63 {
+        record_login_failure();
+        return Err("INVALID PASSWORD");
+    }
+    let snapshot = unsafe { *STATE.get() };
+    let index = snapshot.current as usize;
+    if index >= snapshot.count || index >= MAX_USERS { return Err("CURRENT USER RECORD IS INVALID"); }
+    let actual = crypto::pbkdf2_sha256(password, &snapshot.accounts[index].salt, crypto::PASSWORD_ITERATIONS);
+    if !crypto::constant_time_eq(&actual, &snapshot.accounts[index].hash) {
+        record_login_failure();
+        return Err("INCORRECT PASSWORD");
+    }
+    let state = unsafe { &mut *STATE.get() };
+    state.failed_login_attempts = 0;
+    state.lockout_until_tick = 0;
+    Ok(())
+}
+
 pub fn logout() -> Result<(), &'static str> {
     let state_ptr = STATE.get();
     let state = unsafe { &mut *state_ptr };
@@ -253,14 +278,19 @@ pub fn may_access_path(path: &str) -> bool {
     if !state.initialized { return false; } // fail closed when the account database is unavailable
     if state.count == 0 && state.current < 0 { return true; } // first-run account setup
     if state.current == 0 { return true; } // first persistent account is administrator
-    if state.current < 0 { return false; } // live becomes unprivileged after setup
-    let current_index = state.current as usize;
-    if current_index >= state.count || current_index >= MAX_USERS { return false; }
     let clean = path.trim_matches('/');
     let mut pieces = clean.split('/');
     let Some(mount) = pieces.next() else { return false; };
     let Some(home) = pieces.next() else { return false; };
     let Some(owner) = pieces.next() else { return false; };
+    if state.current < 0 {
+        // The passwordless LIVE-USER guest session gets only its own writable home.
+        return mount.eq_ignore_ascii_case("DISK")
+            && home.eq_ignore_ascii_case("HOME")
+            && owner.eq_ignore_ascii_case("live");
+    }
+    let current_index = state.current as usize;
+    if current_index >= state.count || current_index >= MAX_USERS { return false; }
     mount.eq_ignore_ascii_case("DISK")
         && home.eq_ignore_ascii_case("HOME")
         && owner.eq_ignore_ascii_case(state.accounts[current_index].name())

@@ -102,7 +102,9 @@ def main() -> int:
             return 1
         command.extend(["-drive", f"file={disk.relative_to(ROOT).as_posix()},format=raw,if=ide,index=0,media=disk"])
         print(f"Persistent disk attached: {disk.relative_to(ROOT)} ({disk.stat().st_size // (1024 * 1024)} MiB)", flush=True)
-    command.extend(["-serial", "stdio", "-monitor", "none", "-no-shutdown"])
+    # Do not pass -no-shutdown: QEMU must be allowed to exit when the guest
+    # sends the ACPI poweroff request from the XavierOS system menu.
+    command.extend(["-serial", "stdio", "-monitor", "none"])
     return subprocess.run(command, cwd=ROOT, check=False).returncode
 
 
