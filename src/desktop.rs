@@ -1,4 +1,4 @@
-//! XavierOS in-kernel desktop and login manager for v0.2.2.
+//! XavierOS in-kernel desktop and login manager for v0.2.3.
 //!
 //! This module provides the framebuffer compositor, desktop windows, file manager,
 //! system actions, and application panels. Applications still run in kernel space;
@@ -23,7 +23,7 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.2";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.3";
 const WALLPAPER_WIDTH: usize = 1470;
 const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
@@ -38,9 +38,13 @@ const FILES_PAGE_SIZE: usize = 6;
 const FILES_HISTORY_CAPACITY: usize = 8;
 const WINDOW_BACKDROP_WIDTH: usize = 705;
 const WINDOW_BACKDROP_HEIGHT: usize = 428;
+const MENU_BACKDROP_X: usize = 0;
+const MENU_BACKDROP_Y: usize = 42;
+const MENU_BACKDROP_WIDTH: usize = 244;
+const MENU_BACKDROP_HEIGHT: usize = 336;
 
-// A window is at most 700x420, plus its drop shadow. Saving just this region
-// avoids repainting the wallpaper line-by-line when closing an application.
+// Saved underlays let the compositor restore only the window/menu rectangle.
+// Repainting ordinary UI states must never rescale the full-screen wallpaper.
 static mut WINDOW_BACKDROP_PIXELS: [u32; WINDOW_BACKDROP_WIDTH * WINDOW_BACKDROP_HEIGHT] =
     [0; WINDOW_BACKDROP_WIDTH * WINDOW_BACKDROP_HEIGHT];
 static mut WINDOW_BACKDROP_X: usize = 0;
@@ -48,6 +52,11 @@ static mut WINDOW_BACKDROP_Y: usize = 0;
 static mut WINDOW_BACKDROP_W: usize = 0;
 static mut WINDOW_BACKDROP_H: usize = 0;
 static mut WINDOW_BACKDROP_VALID: bool = false;
+static mut MENU_BACKDROP_PIXELS: [u32; MENU_BACKDROP_WIDTH * MENU_BACKDROP_HEIGHT] =
+    [0; MENU_BACKDROP_WIDTH * MENU_BACKDROP_HEIGHT];
+static mut MENU_BACKDROP_W: usize = 0;
+static mut MENU_BACKDROP_H: usize = 0;
+static mut MENU_BACKDROP_VALID: bool = false;
 
 #[derive(Clone, Copy)]
 struct DisplayMode {
@@ -333,14 +342,18 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
     }
 
-    let mut last_dynamic_second = interrupts::timer_ticks() / 100;
+    // The UI clock is displayed to minute precision. Refreshing every second
+    // used to repaint the whole Clock/Network panel and caused visible flashing.
+    let mut last_dynamic_minute = interrupts::timer_ticks() / 6_000;
     loop {
         let window_before_input = state.open_window;
         let system_menu_before_input = state.system_menu_open;
-        let now_second = interrupts::timer_ticks() / 100;
-        let dynamic_refresh = now_second != last_dynamic_second
-            && matches!(state.open_window, Some(APP_CLOCK) | Some(APP_NETWORK));
-        last_dynamic_second = now_second;
+        let now_minute = interrupts::timer_ticks() / 6_000;
+        let minute_changed = now_minute != last_dynamic_minute;
+        let clock_panel_refresh = minute_changed
+            && state.open_window == Some(APP_CLOCK)
+            && !state.system_menu_open;
+        last_dynamic_minute = now_minute;
         let mut force_full_repaint = false;
         let mut repaint = false;
         let mut dock_repaint = false;
@@ -357,10 +370,12 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
 
             // Update only the Dock when the pointer moves over a different icon.
             // The wallpaper and open windows must not be redrawn for mouse motion.
-            if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
-                if index != state.selected {
-                    state.selected = index;
-                    dock_repaint = true;
+            if !state.system_menu_open {
+                if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
+                    if index != state.selected {
+                        state.selected = index;
+                        dock_repaint = true;
+                    }
                 }
             }
             let left_now = packet.buttons & 0x01 != 0;
@@ -369,16 +384,18 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                 if state.system_menu_open {
                     match system_menu_hit(state.mouse_x, state.mouse_y) {
                         Some(0) => { state.open_window = None; state.system_menu_open = false; repaint = true; }
-                        Some(1) => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
-                        Some(2) => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
+                        Some(1) => { state.selected = APP_TERMINAL; state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; dock_repaint = true; }
+                        Some(2) => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; dock_repaint = true; }
                         Some(3) => {
                             state.open_window = None;
                             state.system_menu_open = false;
+                            discard_system_menu_backdrop();
                             lock_screen(&active_framebuffer, state.mouse_ready);
                             force_full_repaint = true;
                             repaint = true;
                         }
                         Some(4) => {
+                            discard_system_menu_backdrop();
                             open_login_manager_after_session_end(
                                 &active_framebuffer,
                                 &mut state,
@@ -388,6 +405,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                             repaint = true;
                         }
                         Some(5) => {
+                            discard_system_menu_backdrop();
                             open_login_manager_after_session_end(
                                 &active_framebuffer,
                                 &mut state,
@@ -406,6 +424,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     repaint = true;
                 } else if let Some(index) = dock_hit_test(width, height, state.mouse_x, state.mouse_y) {
                     state.selected = index;
+                    dock_repaint = true;
                     if index == APP_TERMINAL {
                         state.open_window = Some(APP_TERMINAL);
                         launch_terminal = true;
@@ -492,16 +511,18 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     KeyboardKey::Escape => { state.system_menu_open = false; repaint = true; }
                     KeyboardKey::Enter => match state.system_menu_selected {
                         0 => { state.open_window = None; state.system_menu_open = false; repaint = true; }
-                        1 => { state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; }
-                        2 => { state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; }
+                        1 => { state.selected = APP_TERMINAL; state.open_window = Some(APP_TERMINAL); state.system_menu_open = false; launch_terminal = true; repaint = true; dock_repaint = true; }
+                        2 => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); state.system_menu_open = false; repaint = true; dock_repaint = true; }
                         3 => {
                             state.open_window = None;
                             state.system_menu_open = false;
+                            discard_system_menu_backdrop();
                             lock_screen(&active_framebuffer, state.mouse_ready);
                             force_full_repaint = true;
                             repaint = true;
                         }
                         4 => {
+                            discard_system_menu_backdrop();
                             open_login_manager_after_session_end(
                                 &active_framebuffer,
                                 &mut state,
@@ -511,6 +532,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                             repaint = true;
                         }
                         5 => {
+                            discard_system_menu_backdrop();
                             open_login_manager_after_session_end(
                                 &active_framebuffer,
                                 &mut state,
@@ -598,12 +620,12 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     }
                 }
                 KeyboardKey::Character(byte) => match byte.to_ascii_uppercase() {
-                    b'T' => { state.open_window = Some(APP_TERMINAL); launch_terminal = true; repaint = true; },
-                    b'F' => { state.selected = APP_FILES; state.open_window = Some(APP_FILES); repaint = true; }
-                    b'N' => { state.selected = APP_NETWORK; state.open_window = Some(APP_NETWORK); repaint = true; }
-                    b'C' => { state.selected = APP_CLOCK; state.open_window = Some(APP_CLOCK); repaint = true; }
-                    b'S' => { state.selected = APP_SETTINGS; state.open_window = Some(APP_SETTINGS); repaint = true; }
-                    b'A' => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); repaint = true; }
+                    b'T' => { state.selected = APP_TERMINAL; state.open_window = Some(APP_TERMINAL); launch_terminal = true; repaint = true; dock_repaint = true; },
+                    b'F' => { state.selected = APP_FILES; state.open_window = Some(APP_FILES); repaint = true; dock_repaint = true; }
+                    b'N' => { state.selected = APP_NETWORK; state.open_window = Some(APP_NETWORK); repaint = true; dock_repaint = true; }
+                    b'C' => { state.selected = APP_CLOCK; state.open_window = Some(APP_CLOCK); repaint = true; dock_repaint = true; }
+                    b'S' => { state.selected = APP_SETTINGS; state.open_window = Some(APP_SETTINGS); repaint = true; dock_repaint = true; }
+                    b'A' => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); repaint = true; dock_repaint = true; }
                     b'X' => { state.system_menu_open = true; state.system_menu_selected = 0; repaint = true; }
                     _ => {}
                 },
@@ -612,11 +634,18 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         }
 
         if launch_terminal {
-            // Draw the normal app frame first, then render the existing shell into
-            // a sub-framebuffer clipped to the Terminal window's content area.
-            cursor_background.valid = false;
-            dock_label_background.valid = false;
-            render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+            // The desktop chrome is already present. Draw only the new window; do
+            // not rescale/repaint the wallpaper just to open Terminal.
+            restore_cursor_background(&active_framebuffer, &mut cursor_background);
+            // If Terminal was opened from the system menu, remove that overlay
+            // before saving the window underlay or it will reappear on close.
+            if system_menu_before_input && !state.system_menu_open {
+                restore_system_menu_backdrop(&active_framebuffer);
+            }
+            if window_before_input.is_none() {
+                save_window_backdrop(&active_framebuffer);
+            }
+            render_window_only(&active_framebuffer, &state, memory_summary);
             if state.mouse_ready {
                 draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
@@ -652,32 +681,71 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         }
 
         if repaint {
-            if force_full_repaint {
-                cursor_background.valid = false;
-                dock_label_background.valid = false;
-                render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
-            } else if window_before_input.is_some() && state.open_window.is_none() {
-                restore_cursor_background(&active_framebuffer, &mut cursor_background);
-                restore_window_backdrop(&active_framebuffer);
-                draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
-            } else if !force_full_repaint
-                && window_before_input.is_some()
+            // A system-menu open/close or selection change affects only its own
+            // overlay rectangle. Keep the underlying desktop/window untouched.
+            let menu_overlay_only = !force_full_repaint
                 && state.open_window == window_before_input
-                && state.system_menu_open == system_menu_before_input
-            {
+                && (state.system_menu_open || system_menu_before_input);
+            if menu_overlay_only {
                 restore_cursor_background(&active_framebuffer, &mut cursor_background);
-                render_window_only(&active_framebuffer, &state, memory_summary);
+                if state.system_menu_open {
+                    // If it was already open, remove the old highlight before
+                    // drawing the new selection over the original underlay.
+                    restore_system_menu_backdrop(&active_framebuffer);
+                    save_system_menu_backdrop(&active_framebuffer);
+                    draw_system_menu(&active_framebuffer, state.system_menu_selected);
+                } else {
+                    restore_system_menu_backdrop(&active_framebuffer);
+                }
             } else {
-                cursor_background.valid = false;
-                dock_label_background.valid = false;
-                render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+                if system_menu_before_input && !state.system_menu_open {
+                    restore_cursor_background(&active_framebuffer, &mut cursor_background);
+                    restore_system_menu_backdrop(&active_framebuffer);
+                }
+                if force_full_repaint {
+                    cursor_background.valid = false;
+                    dock_label_background.valid = false;
+                    discard_system_menu_backdrop();
+                    render_desktop(&active_framebuffer, &state, memory_summary, &mut dock_label_background);
+                } else if window_before_input.is_some() && state.open_window.is_none() {
+                    restore_cursor_background(&active_framebuffer, &mut cursor_background);
+                    restore_window_backdrop(&active_framebuffer);
+                    draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
+                } else if state.open_window.is_some() {
+                    restore_cursor_background(&active_framebuffer, &mut cursor_background);
+                    if window_before_input.is_none() {
+                        save_window_backdrop(&active_framebuffer);
+                    }
+                    render_window_only(&active_framebuffer, &state, memory_summary);
+                } else {
+                    // No window/menu state changed; a menu-bar or login transition
+                    // may still request a clean chrome repaint without touching wallpaper.
+                    draw_desktop_chrome(&active_framebuffer, &state, &mut dock_label_background);
+                }
+            }
+            if dock_repaint && !state.system_menu_open {
+                restore_dock_label_background(&active_framebuffer, &mut dock_label_background);
+                save_dock_label_background(&active_framebuffer, state.selected, &mut dock_label_background);
+                draw_dock(&active_framebuffer, state.selected);
             }
             if state.mouse_ready {
                 draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
-        } else if dynamic_refresh && state.open_window.is_some() {
+        } else if clock_panel_refresh || minute_changed {
+            // Clock values have minute precision. Update only their text cells and
+            // the top-bar clock, not the surrounding window, wallpaper, or Dock.
             restore_cursor_background(&active_framebuffer, &mut cursor_background);
-            render_window_only(&active_framebuffer, &state, memory_summary);
+            if clock_panel_refresh {
+                refresh_clock_live_text(&active_framebuffer);
+            }
+            if minute_changed {
+                draw_menu_clock(&active_framebuffer, state.mouse_ready);
+            }
+            if dock_repaint {
+                restore_dock_label_background(&active_framebuffer, &mut dock_label_background);
+                save_dock_label_background(&active_framebuffer, state.selected, &mut dock_label_background);
+                draw_dock(&active_framebuffer, state.selected);
+            }
             if state.mouse_ready {
                 draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
@@ -1124,11 +1192,10 @@ fn draw_desktop_chrome(fb: &Framebuffer, state: &DesktopState, dock_label_backgr
 
 fn render_window_only(fb: &Framebuffer, state: &DesktopState, memory_summary: Option<(MemoryStats, bool)>) {
     if let Some(app) = state.open_window {
-        restore_window_backdrop(fb);
-        save_window_backdrop(fb);
+        // draw_app_window paints an opaque rounded window frame before its content,
+        // replacing the previous frame in place. Restoring the wallpaper first
+        // produced a visible flash on every file/action update.
         draw_app_window(fb, app, memory_summary, state);
-        draw_menu_bar(fb, state.mouse_ready);
-        if state.system_menu_open { draw_system_menu(fb, state.system_menu_selected); }
     }
 }
 
@@ -1174,6 +1241,61 @@ fn restore_window_backdrop(fb: &Framebuffer) {
     }
 }
 
+fn save_system_menu_backdrop(fb: &Framebuffer) {
+    unsafe {
+        MENU_BACKDROP_VALID = false;
+        let width = MENU_BACKDROP_WIDTH.min((fb.width as usize).saturating_sub(MENU_BACKDROP_X));
+        let height = MENU_BACKDROP_HEIGHT.min((fb.height as usize).saturating_sub(MENU_BACKDROP_Y));
+        if width == 0 || height == 0 { return; }
+        MENU_BACKDROP_W = width;
+        MENU_BACKDROP_H = height;
+        let cache = core::ptr::addr_of_mut!(MENU_BACKDROP_PIXELS).cast::<u32>();
+        for row_index in 0..height {
+            let source = fb.address.add((MENU_BACKDROP_Y + row_index) * fb.pitch as usize).cast::<u32>();
+            for column in 0..width {
+                core::ptr::write(cache.add(row_index * MENU_BACKDROP_WIDTH + column),
+                    core::ptr::read_volatile(source.add(MENU_BACKDROP_X + column)));
+            }
+        }
+        MENU_BACKDROP_VALID = true;
+    }
+}
+
+fn restore_system_menu_backdrop(fb: &Framebuffer) {
+    unsafe {
+        if !MENU_BACKDROP_VALID { return; }
+        let width = MENU_BACKDROP_W.min((fb.width as usize).saturating_sub(MENU_BACKDROP_X));
+        let height = MENU_BACKDROP_H.min((fb.height as usize).saturating_sub(MENU_BACKDROP_Y));
+        let cache = core::ptr::addr_of!(MENU_BACKDROP_PIXELS).cast::<u32>();
+        for row_index in 0..height {
+            let destination = fb.address.add((MENU_BACKDROP_Y + row_index) * fb.pitch as usize).cast::<u32>();
+            for column in 0..width {
+                core::ptr::write_volatile(destination.add(MENU_BACKDROP_X + column),
+                    core::ptr::read(cache.add(row_index * MENU_BACKDROP_WIDTH + column)));
+            }
+        }
+        MENU_BACKDROP_VALID = false;
+    }
+}
+
+fn discard_system_menu_backdrop() {
+    unsafe { MENU_BACKDROP_VALID = false; }
+}
+
+#[inline(always)]
+fn interpolate_wallpaper_channel(a: u8, b: u8, c: u8, d: u8, fx: u32, fy: u32) -> u8 {
+    const ONE: u32 = 1 << 16;
+    let inverse_x = ONE - fx;
+    let inverse_y = ONE - fy;
+    // Both interpolation stages fit in u32 because each pair of 16.16 weights
+    // sums to 65536 and each source channel is at most 255.
+    let top = (a as u32 * inverse_x + b as u32 * fx + (ONE / 2)) >> 16;
+    let bottom = (c as u32 * inverse_x + d as u32 * fx + (ONE / 2)) >> 16;
+    // top/bottom are 8-bit values and the 16.16 weights sum to 65536, so
+    // the weighted sum plus rounding fits safely in u32.
+    ((top * inverse_y + bottom * fy + (1u32 << 15)) >> 16) as u8
+}
+
 fn draw_wallpaper(fb: &Framebuffer) {
     let width = fb.width as usize;
     let height = fb.height as usize;
@@ -1181,9 +1303,22 @@ fn draw_wallpaper(fb: &Framebuffer) {
         return;
     }
 
-    // The original 735x452 wallpaper is stored as a high-quality 2x Lanczos
-    // upscale with a restrained unsharp mask, then bilinear interpolation during cover mapping gives
-    // smoother gradients and fewer block edges at the supported display modes.
+    // Precompute the channel packing once. The old inner loop ran three channel
+    // mask/scaling operations for every framebuffer pixel, although the format
+    // is constant for the whole frame.
+    let mut red_lut = [0u32; 256];
+    let mut green_lut = [0u32; 256];
+    let mut blue_lut = [0u32; 256];
+    for value in 0..256 {
+        let value = value as u8;
+        red_lut[value as usize] = color(fb, value, 0, 0);
+        green_lut[value as usize] = color(fb, 0, value, 0);
+        blue_lut[value as usize] = color(fb, 0, 0, value);
+    }
+
+    // Bilinear interpolation keeps the wallpaper smooth. Keep the same fixed-point
+    // cover mapping, but advance the source coordinate instead of multiplying x
+    // by the scale for every framebuffer pixel.
     const FP_SHIFT: u32 = 16;
     const FP_ONE: u64 = 1 << FP_SHIFT;
     let width_u = width as u64;
@@ -1210,8 +1345,8 @@ fn draw_wallpaper(fb: &Framebuffer) {
         let source_y1 = (source_y0 + 1).min(WALLPAPER_HEIGHT - 1);
         let fy = (source_y_fp & (FP_ONE - 1)) as u32;
         let row = unsafe { fb.address.add(y * fb.pitch as usize) as *mut u32 };
+        let mut source_x_fp = start_x_fp;
         for x in 0..width {
-            let source_x_fp = start_x_fp.saturating_add(x as u64 * step_fp);
             let source_x0 = ((source_x_fp >> FP_SHIFT) as usize).min(WALLPAPER_WIDTH - 1);
             let source_x1 = (source_x0 + 1).min(WALLPAPER_WIDTH - 1);
             let fx = (source_x_fp & (FP_ONE - 1)) as u32;
@@ -1219,20 +1354,57 @@ fn draw_wallpaper(fb: &Framebuffer) {
             let top_right = (source_y0 * WALLPAPER_WIDTH + source_x1) * 3;
             let bottom_left = (source_y1 * WALLPAPER_WIDTH + source_x0) * 3;
             let bottom_right = (source_y1 * WALLPAPER_WIDTH + source_x1) * 3;
-            let interpolate = |channel: usize| -> u8 {
-                let a = WALLPAPER_RGB[top_left + channel] as u64;
-                let b = WALLPAPER_RGB[top_right + channel] as u64;
-                let c = WALLPAPER_RGB[bottom_left + channel] as u64;
-                let d = WALLPAPER_RGB[bottom_right + channel] as u64;
-                let top = a * (FP_ONE - fx as u64) + b * fx as u64;
-                let bottom = c * (FP_ONE - fx as u64) + d * fx as u64;
-                let mixed = top * (FP_ONE - fy as u64) + bottom * fy as u64;
-                ((mixed + (1u64 << 31)) >> 32).min(255) as u8
-            };
-            let pixel = color(fb, interpolate(0), interpolate(1), interpolate(2));
+            let red = interpolate_wallpaper_channel(
+                WALLPAPER_RGB[top_left], WALLPAPER_RGB[top_right],
+                WALLPAPER_RGB[bottom_left], WALLPAPER_RGB[bottom_right], fx, fy,
+            );
+            let green = interpolate_wallpaper_channel(
+                WALLPAPER_RGB[top_left + 1], WALLPAPER_RGB[top_right + 1],
+                WALLPAPER_RGB[bottom_left + 1], WALLPAPER_RGB[bottom_right + 1], fx, fy,
+            );
+            let blue = interpolate_wallpaper_channel(
+                WALLPAPER_RGB[top_left + 2], WALLPAPER_RGB[top_right + 2],
+                WALLPAPER_RGB[bottom_left + 2], WALLPAPER_RGB[bottom_right + 2], fx, fy,
+            );
+            let pixel = red_lut[red as usize] | green_lut[green as usize] | blue_lut[blue as usize];
             unsafe { core::ptr::write_volatile(row.add(x), pixel); }
+            source_x_fp = source_x_fp.saturating_add(step_fp);
         }
     }
+}
+
+fn refresh_clock_live_text(fb: &Framebuffer) {
+    let (x, y, win_w, _) = app_window_geometry(fb);
+    let content_x = x + 160;
+    let content_w = win_w.saturating_sub(180);
+    let panel = color(fb, 12, 23, 40);
+    // Clear only the two text rows inside the clock card. The labels, cards,
+    // buttons and surrounding window are static until a user action occurs.
+    crate::fill_rect(fb, content_x + 12, y + 137, content_w.saturating_sub(24), 19, panel);
+    crate::fill_rect(fb, content_x + 12, y + 175, content_w.saturating_sub(24), 11, panel);
+    if let Ok(now) = clock::now_local() {
+        let mut buffer = [0u8; 24];
+        let date = format_datetime(&mut buffer, now);
+        crate::draw_text(fb, content_x + 15, y + 141, date, 2, color(fb, 244, 248, 255));
+        let mut time_buffer = [0u8; 24];
+        let time = format_clock(&mut time_buffer);
+        crate::draw_text(fb, content_x + 15, y + 177, time, 1, color(fb, 170, 196, 224));
+    } else {
+        crate::draw_text(fb, content_x + 15, y + 148, "CLOCK UNAVAILABLE", 2, color(fb, 255, 171, 158));
+    }
+}
+
+fn draw_menu_clock(fb: &Framebuffer, mouse_ready: bool) {
+    let width = fb.width as usize;
+    let offset = if mouse_ready { 124 } else { 102 };
+    let right_edge = width.saturating_sub(offset);
+    let area_width = 98usize.min(right_edge);
+    let x = right_edge.saturating_sub(area_width);
+    crate::fill_rect(fb, x, 12, area_width, 12, color(fb, 15, 22, 43));
+    let mut buffer = [0u8; 24];
+    let time = format_clock(&mut buffer);
+    let text_x = right_edge.saturating_sub(time.len() * 6);
+    crate::draw_text(fb, text_x, 16, time, 1, color(fb, 228, 237, 250));
 }
 
 fn draw_menu_bar(fb: &Framebuffer, mouse_ready: bool) {
@@ -2774,6 +2946,11 @@ fn blend_cursor_pixel(
     alpha: u8,
 ) {
     if alpha == 0 { return; }
+    if alpha == 255 {
+        // Opaque cursor pixels need no framebuffer read or channel blending.
+        unsafe { core::ptr::write_volatile(row.add(x), crate::rgb(fb, red, green, blue)); }
+        return;
+    }
     let destination = unsafe { core::ptr::read_volatile(row.add(x)) };
     let dest_red = unpack_channel(destination, fb.red_mask_size, fb.red_mask_shift);
     let dest_green = unpack_channel(destination, fb.green_mask_size, fb.green_mask_shift);

@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.2.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.3.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_is_wired_and_version_is_release_022(self) -> None:
+    def test_desktop_is_wired_and_version_is_release_023(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,17 +185,20 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.2"', cargo)
-        self.assertIn('VERSION = "0.2.2"', release)
-        self.assertIn('Current version: `0.2.2`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.3"', cargo)
+        self.assertIn('VERSION = "0.2.3"', release)
+        self.assertIn('Current version: `0.2.3`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
-    def test_beta4_wallpaper_uses_bilinear_interpolation(self) -> None:
+    def test_beta4_wallpaper_uses_optimized_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
-        wallpaper = desktop[desktop.index("fn draw_wallpaper("):desktop.index("fn draw_menu_bar(")]
+        wallpaper = desktop[desktop.index("fn draw_wallpaper("):desktop.index("fn refresh_clock_live_text(")]
         self.assertIn("bilinear interpolation", wallpaper.lower())
-        self.assertIn("let top = a * (FP_ONE - fx as u64) + b * fx as u64;", wallpaper)
-        self.assertIn("let bottom = c * (FP_ONE - fx as u64) + d * fx as u64;", wallpaper)
-        self.assertIn("mixed + (1u64 << 31)", wallpaper)
+        self.assertIn("interpolate_wallpaper_channel", wallpaper)
+        self.assertIn("let mut red_lut = [0u32; 256]", wallpaper)
+        self.assertIn("let mut green_lut = [0u32; 256]", wallpaper)
+        self.assertIn("let mut blue_lut = [0u32; 256]", wallpaper)
+        self.assertIn("let mut source_x_fp = start_x_fp;", wallpaper)
+        self.assertIn("source_x_fp = source_x_fp.saturating_add(step_fp);", wallpaper)
 
     def test_terminal_uses_a_sub_framebuffer_and_window_close_controls(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -417,13 +420,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_release_022(self) -> None:
+    def test_version_metadata_is_consistent_for_release_023(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.2"', cargo)
-        self.assertIn('VERSION = "0.2.2"', package)
-        self.assertIn("Current version: `0.2.2`", readme)
+        self.assertIn('version = "0.2.3"', cargo)
+        self.assertIn('VERSION = "0.2.3"', package)
+        self.assertIn("Current version: `0.2.3`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -517,7 +520,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.2")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.3")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -559,7 +562,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.2', main)
+        self.assertIn('VERSION: 0.2.3', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -637,8 +640,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.2"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.2"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.3"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.3"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -691,9 +694,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.2`", readme)
-        self.assertIn('VERSION = "0.2.2"', release)
-        self.assertIn('version = "0.2.2"', cargo)
+        self.assertIn("Current version: `0.2.3`", readme)
+        self.assertIn('VERSION = "0.2.3"', release)
+        self.assertIn('version = "0.2.3"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
@@ -789,6 +792,57 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("let network_settings = config::current();", console)
         self.assertIn("if network_settings.use_dhcp", console)
         self.assertNotIn("net::acquire_dhcp()", console)
+
+    def test_desktop_window_updates_render_in_place_without_underlay_flash(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        start = desktop.index("fn render_window_only(")
+        end = desktop.index("fn save_window_backdrop(", start)
+        render_window = desktop[start:end]
+        self.assertIn("draw_app_window", render_window)
+        self.assertNotIn("restore_window_backdrop", render_window)
+        self.assertNotIn("save_window_backdrop", render_window)
+
+    def test_system_menu_redraw_is_scoped_to_its_cached_overlay(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        run_start = desktop.index("pub(super) fn run(")
+        run_end = desktop.index("fn open_login_manager_after_session_end(", run_start)
+        run = desktop[run_start:run_end]
+        self.assertIn("let menu_overlay_only =", run)
+        self.assertIn("restore_system_menu_backdrop(&active_framebuffer)", run)
+        self.assertIn("save_system_menu_backdrop(&active_framebuffer)", run)
+        self.assertIn("if system_menu_before_input && !state.system_menu_open", run)
+        self.assertIn("before saving the window underlay", run)
+
+    def test_periodic_desktop_refresh_is_minute_scoped_and_skips_network(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        run_start = desktop.index("pub(super) fn run(")
+        run_end = desktop.index("fn open_login_manager_after_session_end(", run_start)
+        run = desktop[run_start:run_end]
+        refresh_setup = run[run.index("let mut last_dynamic_minute"):run.index("if let Some(packet) = interrupts::poll_mouse_packet()") ]
+        self.assertIn("timer_ticks() / 6_000", refresh_setup)
+        self.assertIn("state.open_window == Some(APP_CLOCK)", refresh_setup)
+        self.assertNotIn("APP_NETWORK", refresh_setup)
+        self.assertIn("refresh_clock_live_text(&active_framebuffer)", run)
+        self.assertIn("draw_menu_clock(&active_framebuffer", run)
+
+    def test_terminal_appends_rows_and_detects_visible_scroll(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        start = main.index("    fn render_pending(&mut self)")
+        end = main.index("    fn render_completed_line(", start)
+        render_pending = main[start:end]
+        self.assertIn("rendered_first_line", render_pending)
+        self.assertIn("rendered_scroll_generation", render_pending)
+        self.assertIn("self.render_line_at(line_index, first_line)", render_pending)
+        self.assertIn("self.render();", render_pending)
+        self.assertIn("console.render_pending();", main)
+
+    def test_wallpaper_and_opaque_cursor_use_fast_pixel_paths(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        cursor_start = desktop.index("fn blend_cursor_pixel(")
+        cursor_end = desktop.index("fn unpack_channel(", cursor_start)
+        cursor = desktop[cursor_start:cursor_end]
+        self.assertIn("if alpha == 255", cursor)
+        self.assertIn("core::ptr::write_volatile(row.add(x), crate::rgb(fb, red, green, blue))", cursor)
 
     def test_update_check_is_not_claimed_without_https_tls(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

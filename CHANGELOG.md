@@ -1,6 +1,22 @@
 # Changelog
 
-All notable XavierOS changes are documented here. The release-kit file `XavierOS-0.2.2-Release-Notes.md` contains the expanded history and detailed release notes.
+All notable XavierOS changes are documented here. Each release-kit Release Notes file describes only that release. This changelog retains the cumulative development history.
+
+## 0.2.3 — Rendering and Responsiveness
+
+### Fixed
+- App updates now redraw the opaque application window in place instead of restoring the wallpaper before every refresh, reducing visible flashes.
+- System-menu open, close, and selection changes now save/restore only the menu overlay area. Opening Terminal from the system menu restores the underlying desktop before saving the Terminal window background.
+- Clock changes refresh only the clock text and top-bar time once per displayed minute; the Network panel is no longer repainted by the periodic clock tick.
+- Terminal command output is appended by drawing only changed text rows. A full Terminal redraw is retained when the visible viewport actually scrolls or the bounded line history rolls over.
+
+### Improved
+- Wallpaper scaling keeps fixed-point bilinear interpolation while reusing precomputed framebuffer channel lookup tables and incrementally advancing source coordinates.
+- Opaque custom cursor pixels skip destination reads and alpha-blending calculations.
+- Dock selection is updated locally when an app is selected, without repainting the wallpaper.
+
+### Verification
+- Host-side Python tests cover packaging helpers and source-level rendering invariants. They do not compile the Rust kernel or prove QEMU runtime behavior; Rust compilation and visual flicker checks still require a local QEMU run.
 
 ## 0.2.2 — Session and Power Actions Fix
 

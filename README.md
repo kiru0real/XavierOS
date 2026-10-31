@@ -8,9 +8,9 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-0.2.2%20Pre-release-orange)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/Status-0.2.3%20Pre-release-orange)](#status-and-limitations)
 
-**Current version: `0.2.2`**
+**Current version: `0.2.3`**
 
 [Русская версия README](README.ru.md)
 
@@ -20,15 +20,15 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 ## About
 
-XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.2 adds a graphical Login Manager, first-run administrator setup, password-protected account sign-in, a passwordless LIVE-USER guest choice, session lock/unlock, and switch-user/logout actions in the system menu.
+XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.3 focuses on smoother framebuffer rendering: app updates redraw the window in place, system-menu changes redraw only the menu overlay, clock updates touch only their text areas, and Terminal appends changed rows instead of repainting its full panel for every command.
 
 ## Features
 
 - **Kernel and boot:** `x86_64-unknown-none`, Limine boot protocol, IDT exception handlers, PMM bitmap allocator, HHDM, heap, PIC/PIT, PS/2 keyboard and polled PS/2 mouse.
 - **Login Manager:** first-run administrator creation with password confirmation, a startup account picker, password-protected sign-in, a passwordless `LIVE-USER` guest session, session lock/unlock, switch user, and log out. Keyboard input is enabled before the login UI starts. The custom mouse pointer remains visible and follows PS/2 mouse movement; selecting fields and activating controls still uses the keyboard.
-- **Desktop compositor:** fullscreen wallpaper with cover scaling and fixed-point bilinear interpolation, updated dock and icons, a 24×24 custom alpha-blended cursor, a top menu bar, window panels, and saved-window-background restoration to avoid the old full-screen “printer” redraw on close.
+- **Desktop compositor:** fullscreen wallpaper with cover scaling and fixed-point bilinear interpolation, updated dock and icons, a 24×24 custom alpha-blended cursor, a top menu bar, window panels, and saved-window-background restoration, in-place window updates, and region-only system-menu/clock refreshes to reduce visible flicker.
 - **Files:** opens in the current session home (`/DISK/HOME/<username>` or `/DISK/HOME/live`), then supports folder navigation, Back/Up/Home/Disk/System/Favorite, paging, bounded text preview, directory/empty-file creation, and deletion on writable `/DISK`. Back history and Favorite are session-only. The embedded root is read-only; preview is bounded and not a full text editor.
-- **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running.
+- **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running and updates only changed text rows until its visible history scrolls.
 - **Network:** E1000 for QEMU, DHCP/static fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, experimental TCP/HTTP, gateway/DNS diagnostics, and packet counters.
 - **Clock:** local time, fixed UTC offset, RTC and experimental NTP synchronization controls.
 - **Settings:** three display profiles—1024×768, 1280×720, 1366×768—with a guarded Bochs VBE live-mode request when supported. Limine profiles remain the boot-time fallback.

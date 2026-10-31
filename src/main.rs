@@ -115,7 +115,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
     });
-    serial_write("\r\nXavierOS v0.2.2\r\n");
+    serial_write("\r\nXavierOS v0.2.3\r\n");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -306,6 +306,10 @@ struct Console {
     line_height: usize,
     max_cols: usize,
     windowed: bool,
+    rendered_line_count: usize,
+    rendered_first_line: usize,
+    scroll_generation: usize,
+    rendered_scroll_generation: usize,
 }
 
 impl Console {
@@ -329,6 +333,10 @@ impl Console {
             line_height: 7 * scale + 4,
             max_cols,
             windowed,
+            rendered_line_count: 0,
+            rendered_first_line: 0,
+            scroll_generation: 0,
+            rendered_scroll_generation: 0,
         }
     }
 
@@ -343,6 +351,10 @@ impl Console {
     fn clear(&mut self) {
         self.lines = [ConsoleLine::empty(); CONSOLE_MAX_LINES];
         self.line_count = 1;
+        self.rendered_line_count = 0;
+        self.rendered_first_line = 0;
+        self.scroll_generation = 0;
+        self.rendered_scroll_generation = 0;
     }
 
     fn write(&mut self, text: &str) {
@@ -409,6 +421,7 @@ impl Console {
         } else {
             self.lines.copy_within(1..CONSOLE_MAX_LINES, 0);
             self.lines[CONSOLE_MAX_LINES - 1] = ConsoleLine::empty();
+            self.scroll_generation = self.scroll_generation.wrapping_add(1);
         }
         serial_write("\r\n");
     }
@@ -478,50 +491,88 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.2.2 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.3 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
     }
 
-    fn render(&self) {
+    fn render(&mut self) {
         self.draw_chrome();
         let visible_rows = self.visible_rows();
-        let (text_x, text_y) = self.text_origin();
         let first_line = self.line_count.saturating_sub(visible_rows);
-        for (screen_row, line_index) in (first_line..self.line_count).enumerate() {
-            let line = &self.lines[line_index];
-            let len = line.len.min(self.max_cols);
-            let text = core::str::from_utf8(&line.bytes[..len]).unwrap_or("");
-            let color = if line_index + 1 == self.line_count {
-                rgb(&self.framebuffer, 104, 235, 174)
-            } else {
-                rgb(&self.framebuffer, 225, 234, 249)
-            };
-            let y = text_y + screen_row * self.line_height;
-            if is_x_logo_line(text.as_bytes()) {
-                let logo_color = rgb(&self.framebuffer, 89, 218, 255);
-                let logo = core::str::from_utf8(&text.as_bytes()[..18]).unwrap_or("");
-                draw_text(&self.framebuffer, text_x, y, logo, self.scale, logo_color);
-                let rest = core::str::from_utf8(&text.as_bytes()[18..]).unwrap_or("");
-                draw_text(
-                    &self.framebuffer,
-                    text_x + 18 * 6 * self.scale,
-                    y,
-                    rest,
-                    self.scale,
-                    color,
-                );
-            } else {
-                draw_text(
-                    &self.framebuffer,
-                    text_x,
-                    y,
-                    text,
-                    self.scale,
-                    color,
-                );
-            }
+        for line_index in first_line..self.line_count {
+            self.render_line_at(line_index, first_line);
+        }
+        self.rendered_line_count = self.line_count;
+        self.rendered_first_line = first_line;
+        self.rendered_scroll_generation = self.scroll_generation;
+    }
+
+    // Append-only command output is drawn into the rows that changed. A full
+    // Terminal repaint is reserved for scrolling the bounded history buffer.
+    fn render_pending(&mut self) {
+        let first_line = self.line_count.saturating_sub(self.visible_rows());
+        if self.rendered_scroll_generation != self.scroll_generation
+            || self.rendered_first_line != first_line
+        {
+            // When the visible viewport advances, existing rows have to move.
+            // For ordinary append-only output, only the newly added rows are drawn.
+            self.render();
+            return;
+        }
+        let start = self.rendered_line_count.max(first_line);
+        for line_index in start..self.line_count {
+            self.render_line_at(line_index, first_line);
+        }
+        self.rendered_line_count = self.line_count;
+    }
+
+    fn render_completed_line(&self) {
+        if self.line_count > 1 {
+            let first_line = self.line_count.saturating_sub(self.visible_rows());
+            self.render_line_at(self.line_count - 2, first_line);
+        }
+    }
+
+    fn render_line_at(&self, line_index: usize, first_line: usize) {
+        if line_index < first_line || line_index >= self.line_count { return; }
+        let (text_x, text_y) = self.text_origin();
+        let screen_row = line_index - first_line;
+        let y = text_y + screen_row * self.line_height;
+        let left = if self.windowed { 8 } else { 32 };
+        let horizontal_padding = if self.windowed { 16 } else { 64 };
+        fill_rect(
+            &self.framebuffer,
+            left,
+            y,
+            (self.framebuffer.width as usize).saturating_sub(horizontal_padding),
+            self.line_height,
+            rgb(&self.framebuffer, 11, 18, 31),
+        );
+        let line = &self.lines[line_index];
+        let len = line.len.min(self.max_cols);
+        let text = core::str::from_utf8(&line.bytes[..len]).unwrap_or("");
+        let color = if line_index + 1 == self.line_count {
+            rgb(&self.framebuffer, 104, 235, 174)
+        } else {
+            rgb(&self.framebuffer, 225, 234, 249)
+        };
+        if is_x_logo_line(text.as_bytes()) {
+            let logo_color = rgb(&self.framebuffer, 89, 218, 255);
+            let logo = core::str::from_utf8(&text.as_bytes()[..18]).unwrap_or("");
+            draw_text(&self.framebuffer, text_x, y, logo, self.scale, logo_color);
+            let rest = core::str::from_utf8(&text.as_bytes()[18..]).unwrap_or("");
+            draw_text(
+                &self.framebuffer,
+                text_x + 18 * 6 * self.scale,
+                y,
+                rest,
+                self.scale,
+                color,
+            );
+        } else {
+            draw_text(&self.framebuffer, text_x, y, text, self.scale, color);
         }
     }
 
@@ -570,34 +621,8 @@ impl Console {
     }
 
     fn render_current_line(&self) {
-        let visible_rows = self.visible_rows();
-        let first_line = self.line_count.saturating_sub(visible_rows);
-        let index = self.line_count - 1;
-        let screen_row = index.saturating_sub(first_line);
-        let fb = &self.framebuffer;
-        let (text_x, text_y) = self.text_origin();
-        let y = text_y + screen_row * self.line_height;
-        let left = if self.windowed { 8 } else { 32 };
-        let horizontal_padding = if self.windowed { 16 } else { 64 };
-        fill_rect(
-            fb,
-            left,
-            y,
-            (fb.width as usize).saturating_sub(horizontal_padding),
-            self.line_height,
-            rgb(fb, 11, 18, 31),
-        );
-        let line = &self.lines[index];
-        let len = line.len.min(self.max_cols);
-        let text = core::str::from_utf8(&line.bytes[..len]).unwrap_or("");
-        draw_text(
-            fb,
-            text_x,
-            y,
-            text,
-            self.scale,
-            rgb(fb, 104, 235, 174),
-        );
+        let first_line = self.line_count.saturating_sub(self.visible_rows());
+        self.render_line_at(self.line_count - 1, first_line);
     }
 }
 
@@ -704,7 +729,7 @@ fn run_console_window(
 
     let mut console = Console::new(*framebuffer, true);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.2");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.3");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -851,8 +876,9 @@ fn run_console_window(
                     console.replace_current_input(prompt_start, &[]);
                     console.write("^C");
                     console.newline();
+                    console.render_completed_line();
                     write_shell_prompt(&mut console);
-                    console.render();
+                    console.render_pending();
                     if mouse_ready {
                         crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
                     }
@@ -916,6 +942,7 @@ fn run_console_window(
                 }
                 Some(KeyboardKey::Enter) => {
                     console.newline();
+                    console.render_completed_line();
                     history.push(&input[..input_len]);
                     let command_line = core::str::from_utf8(&input[..input_len]).unwrap_or("");
                     if command_line.trim().eq_ignore_ascii_case("DESKTOP") {
@@ -924,7 +951,7 @@ fn run_console_window(
                     }
                     process_command(&mut console, command_line, memory_summary);
                     write_shell_prompt(&mut console);
-                    console.render();
+                    console.render_pending();
                     if mouse_ready {
                         crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
                     }
@@ -1483,7 +1510,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.2.2");
+            console.write_line("PROJECT VERSION: 0.2.3");
             console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
@@ -1492,7 +1519,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.2.2");
+            console.write_line("VERSION: 0.2.3");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1961,7 +1988,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.2.2"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.3"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2210,7 +2237,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.2.2");
+    let _ = writeln!(&mut out, "Version: 0.2.3");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2457,7 +2484,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.2.2 | DESKTOP PREVIEW AVAILABLE.");
+    console.write_line("VERSION 0.2.3 | DESKTOP PREVIEW AVAILABLE.");
     console.write_line("");
 }
 
@@ -2798,9 +2825,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.2");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.3");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.2");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.3");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2856,7 +2883,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.2.2"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.3"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
