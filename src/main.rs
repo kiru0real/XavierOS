@@ -2,6 +2,9 @@
 #![no_main]
 
 mod memory;
+mod sync;
+mod vm;
+mod klog;
 mod interrupts;
 mod heap;
 mod fs;
@@ -115,7 +118,8 @@ pub extern "C" fn _start() -> ! {
     } else {
         "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
     });
-    serial_write("\r\nXavierOS v0.2.3\r\n");
+    serial_write("\r\nXavierOS v0.2.4\r\n");
+    klog::log(klog::Level::Info, "kernel entry reached");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
 
@@ -178,6 +182,23 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
+    let vm_ready = if memory::is_initialized() {
+        match vm::initialize() {
+            Ok(()) => {
+                serial_write("Virtual memory manager initialized from active Limine page tables.\r\n");
+                klog::log(klog::Level::Info, "virtual memory manager ready");
+                true
+            }
+            Err(error) => {
+                serial_write("WARNING: Virtual memory manager unavailable: ");
+                serial_write(error);
+                serial_write("\r\n");
+                klog::log(klog::Level::Warn, "virtual memory manager initialization failed");
+                false
+            }
+        }
+    } else { false };
+
     match memory_summary {
         Some((_, true)) => match heap::initialize() {
             Ok(stats) => {
@@ -186,6 +207,7 @@ pub extern "C" fn _start() -> ! {
                 serial_write(" bytes; free: ");
                 serial_write_u64(stats.free_bytes as u64);
                 serial_write(" bytes.\r\n");
+                klog::log(klog::Level::Info, "kernel heap ready");
             }
             Err(error) => {
                 serial_write("WARNING: Kernel heap initialization failed: ");
@@ -199,6 +221,7 @@ pub extern "C" fn _start() -> ! {
 
     match diskfs::initialize() {
         Ok(info) => {
+            klog::log(klog::Level::Info, "writable disk filesystem mounted");
             serial_write("Writable XVDISKFS mounted. ATA sectors: ");
             serial_write_u64(info.total_sectors as u64);
             serial_write("; files: ");
@@ -236,6 +259,7 @@ pub extern "C" fn _start() -> ! {
 
     match net::initialize() {
         Ok(()) => {
+            klog::log(klog::Level::Info, "E1000 network driver ready");
             serial_write("E1000 network driver initialized.\r\n");
             let settings = config::current();
             if settings.use_dhcp {
@@ -266,6 +290,7 @@ pub extern "C" fn _start() -> ! {
     }
 
     serial_write("Framebuffer ready. Starting interactive console...\r\n");
+    if vm_ready { klog::log(klog::Level::Info, "kernel diagnostics initialized"); }
     desktop::run(&framebuffer, memory_summary, mouse_ready)
 }
 
@@ -310,6 +335,7 @@ struct Console {
     rendered_first_line: usize,
     scroll_generation: usize,
     rendered_scroll_generation: usize,
+    full_repaint_pending: bool,
 }
 
 impl Console {
@@ -337,6 +363,7 @@ impl Console {
             rendered_first_line: 0,
             scroll_generation: 0,
             rendered_scroll_generation: 0,
+            full_repaint_pending: false,
         }
     }
 
@@ -355,6 +382,10 @@ impl Console {
         self.rendered_first_line = 0;
         self.scroll_generation = 0;
         self.rendered_scroll_generation = 0;
+        // CLEAR invalidates every pixel in the Terminal content area, not just
+        // the rows represented by the new one-line console model. Force the
+        // next render_pending() to repaint the full window chrome and panel.
+        self.full_repaint_pending = true;
     }
 
     fn write(&mut self, text: &str) {
@@ -491,7 +522,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.2.3 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.4 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -507,11 +538,18 @@ impl Console {
         self.rendered_line_count = self.line_count;
         self.rendered_first_line = first_line;
         self.rendered_scroll_generation = self.scroll_generation;
+        self.full_repaint_pending = false;
     }
 
     // Append-only command output is drawn into the rows that changed. A full
     // Terminal repaint is reserved for scrolling the bounded history buffer.
     fn render_pending(&mut self) {
+        // A command such as CLEAR discards old buffered lines. Incremental
+        // rendering cannot erase rows that are no longer present in the model.
+        if self.full_repaint_pending {
+            self.render();
+            return;
+        }
         let first_line = self.line_count.saturating_sub(self.visible_rows());
         if self.rendered_scroll_generation != self.scroll_generation
             || self.rendered_first_line != first_line
@@ -729,7 +767,7 @@ fn run_console_window(
 
     let mut console = Console::new(*framebuffer, true);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.3");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.4");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -1106,8 +1144,8 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
 const COMMAND_COMPLETIONS: &[&str] = &[
     "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CONFIG", "CPU", "DIAG", "DIR", "DISK", "ECHO", "FETCH",
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "HTTPGET", "IDT",
-    "INFO", "IRQ", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
-    "REBOOT", "RM", "SELFTEST", "STAT", "SYSINFO", "TASKS", "TASKTEST", "TIME", "TOUCH", "DF", "UPTIME",
+    "INFO", "IRQ", "KERNEL", "KLOG", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
+    "REBOOT", "RM", "SELFTEST", "STAT", "SCHEDSTAT", "SYSINFO", "TASKS", "TASKRUN", "TASKTEST", "TIME", "VMSTAT", "VMTEST", "TOUCH", "DF", "UPTIME",
     "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING", "REPORT", "SETTINGS", "DESKTOP",
     "DATE", "DATETIME", "DHCP", "NTP", "TIMEZONE", "NETSTAT", "NETCHECK",
 ];
@@ -1487,8 +1525,14 @@ fn process_command(
             console.write_line("HEALTH      - SHOW QUICK KERNEL SUBSYSTEM STATUS");
             console.write_line("UPTIME      - SHOW TIME SINCE KERNEL START");
             console.write_line("FORMAT DISK - ERASE AND FORMAT THE DATA DISK");
-            console.write_line("TASKS       - LIST COOPERATIVE KERNEL TASKS");
-            console.write_line("TASKTEST    - TEST CONTEXT SWITCHING");
+            console.write_line("TASKS       - LIST KERNEL THREADS AND STATES");
+            console.write_line("TASKRUN     - RUN READY COOPERATIVE KERNEL THREADS");
+            console.write_line("TASKTEST    - TEST SPAWN, YIELD, SLEEP AND STACK RECLAIM");
+            console.write_line("SCHEDSTAT   - SHOW SCHEDULER AND LOCK STATISTICS");
+            console.write_line("VMSTAT      - SHOW ACTIVE VIRTUAL MEMORY STATUS");
+            console.write_line("VMTEST      - TEST ACTIVE PAGE TABLE WALKING");
+            console.write_line("KLOG        - SHOW THE RECENT KERNEL EVENT LOG");
+            console.write_line("KERNEL      - SHOW KERNEL SUBSYSTEM READINESS");
             console.write_line("PWD         - SHOW CURRENT DIRECTORY");
             console.write_line("FSINFO      - SHOW INITRAMFS STATISTICS");
             console.write_line("FSTEST      - TEST THE EMBEDDED INITRAMFS");
@@ -1510,7 +1554,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.2.3");
+            console.write_line("PROJECT VERSION: 0.2.4");
             console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
@@ -1519,7 +1563,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.2.3");
+            console.write_line("VERSION: 0.2.4");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1920,20 +1964,34 @@ fn process_command(
                 }
             }
         }
+        "VMSTAT" => show_vmstat(console),
+        "VMTEST" => match vm::self_test() {
+            Ok(()) => console.write_line("VMM ACTIVE PAGE-TABLE WALK SELF-TEST: PASS"),
+            Err(error) => { console.write("VMTEST FAIL: "); console.write_line(error); }
+        },
+        "SCHEDSTAT" => show_scheduler_stats(console),
+        "KLOG" => show_kernel_log(console),
+        "KERNEL" => show_kernel_status(console),
+        "TASKRUN" => match task::run_until_idle() {
+            Ok(()) => console.write_line("SCHEDULER RETURNED TO SHELL; NO READY OR SLEEPING THREADS REMAIN."),
+            Err(error) => { console.write("TASKRUN ERROR: "); console.write_line(error); }
+        },
         "TASKS" => {
             let (total, runnable, switches) = task::stats();
             console.write("TASKS: "); console.write_decimal(total as u64);
             console.write(" | RUNNABLE: "); console.write_decimal(runnable as u64);
             console.write(" | CONTEXT SWITCHES: "); console.write_decimal(switches);
             console.write_line("");
-            task::list(|id, name, state, count| {
+            task::list(|id, name, state, priority, effective, count| {
                 console.write("#"); console.write_decimal(id as u64); console.write(" ");
                 console.write(name); console.write(" "); console.write(state);
+                console.write(" PRIORITY="); console.write_decimal(priority as u64);
+                console.write(" EFFECTIVE="); console.write_decimal(effective as u64);
                 console.write(" SWITCHES="); console.write_decimal(count); console.write_line("");
             });
         }
         "TASKTEST" => match task::self_test() {
-            Ok(()) => console.write_line("COOPERATIVE SCHEDULER SELF-TEST: PASS"),
+            Ok(()) => console.write_line("COOPERATIVE KERNEL THREAD SELF-TEST: PASS"),
             Err(error) => { console.write("TASKTEST FAIL: "); console.write_line(error); }
         },
         "PWD" => {
@@ -1988,7 +2046,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.2.3"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.4"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2046,11 +2104,24 @@ fn process_command(
                     console.write_line(error);
                 }
             }
+            match sync::self_test() {
+                Ok(()) => console.write_line("IRQ-SAFE SPINLOCK SELF-TEST: PASS"),
+                Err(error) => { failed = true; console.write("SPINLOCK SELF-TEST: FAIL: "); console.write_line(error); }
+            }
+            if vm::is_initialized() {
+                match vm::self_test() {
+                    Ok(()) => console.write_line("VMM ACTIVE PAGE-TABLE WALK SELF-TEST: PASS"),
+                    Err(error) => { failed = true; console.write("VMM SELF-TEST: FAIL: "); console.write_line(error); }
+                }
+            } else {
+                failed = true;
+                console.write_line("VMM SELF-TEST: SKIPPED (VMM UNAVAILABLE)");
+            }
             match task::self_test() {
-                Ok(()) => console.write_line("COOPERATIVE SCHEDULER SELF-TEST: PASS"),
+                Ok(()) => console.write_line("COOPERATIVE KERNEL THREAD SELF-TEST: PASS"),
                 Err(error) => {
                     failed = true;
-                    console.write("COOPERATIVE SCHEDULER SELF-TEST: FAIL: ");
+                    console.write("KERNEL THREAD SELF-TEST: FAIL: ");
                     console.write_line(error);
                 }
             }
@@ -2237,7 +2308,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.2.3");
+    let _ = writeln!(&mut out, "Version: 0.2.4");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2484,7 +2555,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.2.3 | DESKTOP PREVIEW AVAILABLE.");
+    console.write_line("VERSION 0.2.4 | DESKTOP PREVIEW AVAILABLE.");
     console.write_line("");
 }
 
@@ -2704,6 +2775,71 @@ fn show_time(console: &mut Console) {
     console.write_line(" SECONDS (APPROXIMATE)");
 }
 
+fn show_vmstat(console: &mut Console) {
+    if !vm::is_initialized() {
+        console.write_line("VIRTUAL MEMORY MANAGER: UNAVAILABLE");
+        return;
+    }
+    let stats = vm::stats();
+    console.write_line("XAVIEROS VIRTUAL MEMORY MANAGER");
+    console.write("ACTIVE PML4 PHYSICAL: "); console.write_hex(stats.root_physical); console.write_line("");
+    console.write_line("PAGE WALK: 4-LEVEL X86_64 (4 KIB / 2 MIB / 1 GIB LEAVES)");
+    console.write_line("MANAGED PHYSICAL RANGE: BELOW 4 GIB | SUPERVISOR MAPPINGS ONLY");
+    console.write_line(if stats.nx_enabled { "NX PAGE PROTECTION: ENABLED" } else { "NX PAGE PROTECTION: UNAVAILABLE" });
+    console.write("MAPPED 4 KIB PAGES: "); console.write_decimal(stats.mapped_pages); console.write_line("");
+    console.write("UNMAPPED 4 KIB PAGES: "); console.write_decimal(stats.unmapped_pages); console.write_line("");
+    console.write("PAGE-TABLE PAGES ALLOCATED: "); console.write_decimal(stats.page_tables_allocated); console.write_line("");
+    console.write("PAGE TABLE WALKS: "); console.write_decimal(stats.page_walks); console.write_line("");
+    console.write_line("SCOPE: ACTIVE KERNEL ADDRESS SPACE; NO USER ADDRESS SPACES YET.");
+}
+
+fn show_scheduler_stats(console: &mut Console) {
+    let stats = task::detailed_stats();
+    let sync = sync::stats();
+    console.write_line("XAVIEROS KERNEL THREAD SCHEDULER");
+    console.write_line("POLICY: PRIORITY-AWARE ROUND ROBIN / COOPERATIVE");
+    console.write_line("PRIORITY AGING: +1 EVERY 25 READY TICKS, CAPPED AT 7");
+    console.write_line("TCB CAPACITY: 16 | PER-TASK STACK: 16 KIB FROM PMM");
+    console.write("CURRENT TID: "); console.write_decimal(stats.current_id as u64); console.write_line("");
+    console.write("TOTAL / CREATED: "); console.write_decimal(stats.total as u64); console.write(" / "); console.write_decimal(stats.created); console.write_line("");
+    console.write("READY: "); console.write_decimal(stats.ready as u64); console.write(" | RUNNING: "); console.write_decimal(stats.running as u64);
+    console.write(" | SLEEPING: "); console.write_decimal(stats.sleeping as u64); console.write_line("");
+    console.write("BLOCKED: "); console.write_decimal(stats.blocked as u64); console.write(" | ZOMBIE: "); console.write_decimal(stats.zombie as u64);
+    console.write(" | FINISHED: "); console.write_decimal(stats.finished as u64); console.write_line("");
+    console.write("CONTEXT SWITCHES: "); console.write_decimal(stats.switches); console.write_line("");
+    console.write("LOCK ACQUISITIONS: "); console.write_decimal(sync.acquisitions); console.write(" | CONTENDED: ");
+    console.write_decimal(sync.contended_acquisitions); console.write(" | SPINS: "); console.write_decimal(sync.spin_iterations); console.write_line("");
+    console.write_line("PIT WAKES SLEEPERS; IT DOES NOT PREEMPT A RUNNING THREAD.");
+}
+
+fn show_kernel_log(console: &mut Console) {
+    let mut entries = [klog::LogEntry { tick: 0, level: klog::Level::Info, message: "" }; klog::CAPACITY];
+    let count = klog::snapshot(&mut entries);
+    console.write_line("XAVIEROS KERNEL EVENT LOG (OLDEST FIRST)");
+    for entry in &entries[..count] {
+        console.write("T+"); console.write_decimal(entry.tick / 100);
+        console.write("S ["); console.write(entry.level.as_str()); console.write("] ");
+        console.write_line(entry.message);
+    }
+    console.write("ENTRIES: "); console.write_decimal(count as u64);
+    console.write(" | OVERWRITTEN: "); console.write_decimal(klog::dropped_count()); console.write_line("");
+}
+
+fn show_kernel_status(console: &mut Console) {
+    console.write_line("XAVIEROS KERNEL STATUS");
+    console.write_line("ARCHITECTURE: X86_64 | RUST NO_STD | LIMINE");
+    console.write_line(if interrupts::is_initialized() { "IDT: READY" } else { "IDT: UNAVAILABLE" });
+    console.write_line(if memory::is_initialized() { "PMM / HHDM: READY (BELOW 4 GIB MANAGED)" } else { "PMM / HHDM: UNAVAILABLE" });
+    console.write_line(if vm::is_initialized() { "VMM: ACTIVE PAGE-TABLE WALK / SUPERVISOR MAPPING" } else { "VMM: UNAVAILABLE" });
+    console.write_line(if heap::is_initialized() { "KERNEL HEAP: READY (IRQ-SAFE LOCK)" } else { "KERNEL HEAP: UNAVAILABLE" });
+    console.write_line("SCHEDULER: COOPERATIVE KERNEL THREADS; PRIORITIES AND SLEEP/WAKE");
+    console.write_line("SYNCHRONIZATION: IRQ-SAFE SPINLOCK; SINGLE-CORE ASSUMPTION");
+    console.write_line(if diskfs::mount_status() { "DISK VFS: READY" } else { "DISK VFS: UNAVAILABLE" });
+    console.write_line(if net::is_ready() { "E1000 NETWORK: READY" } else { "E1000 NETWORK: UNAVAILABLE" });
+    console.write_line("PROCESS ISOLATION / RING 3: NOT IMPLEMENTED");
+    console.write_line("SMP / APIC PREEMPTION / TLB SHOOTDOWN: NOT IMPLEMENTED");
+}
+
 fn show_irq(console: &mut Console) {
     console.write_line("XAVIEROS HARDWARE INTERRUPTS");
     console.write_line(if interrupts::hardware_is_initialized() { "PIC: READY (MASTER 0X20 / SLAVE 0X28)" } else { "PIC: NOT INITIALIZED" });
@@ -2737,6 +2873,8 @@ fn run_diagnostics(console: &mut Console, memory_summary: Option<(MemoryStats, b
     console.write(" | SWITCHES: "); console.write_decimal(context_switches); console.write_line("");
     console.write_line(if interrupts::hardware_is_initialized() { "PIC / PIT: READY" } else { "PIC / PIT: UNAVAILABLE" });
     console.write_line("TIMER: 100 HZ PIT");
+    console.write_line(if vm::is_initialized() { "VMM: READY" } else { "VMM: UNAVAILABLE" });
+    console.write_line("SCHEDULER: COOPERATIVE PRIORITY ROUND-ROBIN");
     console.write_line("BOOTLOADER: LIMINE");
     console.write_line(if interrupts::is_initialized() { "IDT: READY (CPU EXCEPTIONS INSTALLED)" } else { "IDT: UNAVAILABLE" });
     console.write_line(if heap::is_initialized() { "KERNEL HEAP: READY" } else { "KERNEL HEAP: UNAVAILABLE" });
@@ -2825,9 +2963,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.3");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.4");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.3");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.4");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -2876,14 +3014,14 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
                 console.write_line("UNAVAILABLE");
             }
         }
-        sysinfo_row(console, "                  ", "SCHEDULER: COOPERATIVE");
+        sysinfo_row(console, "                  ", "SCHEDULER: PRIORITY COOPERATIVE");
         sysinfo_row(console, "                  ", "SHELL: XAVIER CONSOLE");
     } else {
         console.write_line("      XX  XX"); console.write_line("     XX    XX");
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.2.3"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.4"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
@@ -2905,7 +3043,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
             console.write("HEAP FREE: "); console.write_decimal(heap_stats.free_bytes as u64 / 1024); console.write_line(" KIB");
         }
         console.write_line(if diskfs::mount_status() { "DISK: XVDISKFS READY" } else { "DISK: UNAVAILABLE" });
-        console.write_line("SCHEDULER: COOPERATIVE");
+        console.write_line("SCHEDULER: PRIORITY COOPERATIVE");
     }
     console.write_line("");
 }
@@ -2953,11 +3091,13 @@ fn show_health(console: &mut Console, memory_summary: Option<(MemoryStats, bool)
         Some((stats, pmm_ok)) => (pmm_ok, stats.hhdm_offset != 0),
         None => (false, false),
     };
-    let rows: [(&str, bool); 9] = [
+    let rows: [(&str, bool); 11] = [
         ("IDT / EXCEPTIONS", interrupts::is_initialized()),
         ("PIC / PIT", interrupts::hardware_is_initialized()),
         ("PS/2 KEYBOARD IRQ", interrupts::keyboard_is_initialized()),
         ("PMM / HHDM", ram_ok && hhdm_ok),
+        ("IRQ-SAFE SYNCHRONIZATION", sync::self_test().is_ok()),
+        ("VIRTUAL MEMORY MANAGER", vm::is_initialized()),
         ("KERNEL HEAP", heap::is_initialized()),
         ("INITRAMFS", fs::info().is_ok()),
         ("WRITABLE XVDISKFS", diskfs::mount_status()),

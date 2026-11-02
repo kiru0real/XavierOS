@@ -8,9 +8,9 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-0.2.3%20Pre-release-orange)](#status-and-limitations)
+[![Status](https://img.shields.io/badge/Status-0.2.4%20Pre-release-orange)](#status-and-limitations)
 
-**Current version: `0.2.3`**
+**Current version: `0.2.4`**
 
 [Русская версия README](README.ru.md)
 
@@ -20,15 +20,18 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 ## About
 
-XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.3 focuses on smoother framebuffer rendering: app updates redraw the window in place, system-menu changes redraw only the menu overlay, clock updates touch only their text areas, and Terminal appends changed rows instead of repainting its full panel for every command.
+XavierOS is a learning-oriented hobby operating system written in Rust without the standard library. It boots through Limine, renders directly to a framebuffer, handles legacy PS/2 input, manages physical memory and a kernel heap, and includes experimental virtual-disk and networking subsystems. Release 0.2.4 strengthens the kernel foundations: IRQ-safe spinlocks protect heap and PMM metadata; a cooperative kernel-thread scheduler uses up to 16 TCB slots, dynamically PMM-backed stacks, priority aging, round-robin selection, sleep/wake and runtime creation; and a four-level x86_64 VMM can inspect and modify supervisor mappings in the active address space.
 
 ## Features
 
-- **Kernel and boot:** `x86_64-unknown-none`, Limine boot protocol, IDT exception handlers, PMM bitmap allocator, HHDM, heap, PIC/PIT, PS/2 keyboard and polled PS/2 mouse.
+- **Kernel and boot:** `x86_64-unknown-none`, Limine boot protocol, IDT exception handlers, PMM bitmap allocator, HHDM, IRQ-safe heap/PMM synchronization, PIC/PIT, PS/2 keyboard and polled PS/2 mouse.
+- **Kernel threads:** bounded 16-slot TCB table, dynamically allocated 16 KiB PMM-backed stacks, priorities 0–7 with round-robin scheduling among equal effective priorities and aging (+1 every 25 READY ticks, capped at 7) for long-waiting tasks, runtime spawn, cooperative yield, sleep/wake, blocked/zombie/finished states, and stack reclamation. Timer interrupts wake sleepers but do not preempt a running thread.
+- **Virtual memory:** four-level active page-table walker for 4 KiB, 2 MiB, and 1 GiB mappings; supervisor 4 KiB map/unmap APIs; local `invlpg`; NX enablement when supported. Separate user address spaces, user mappings, page-table reclamation, and SMP TLB shootdowns are not implemented.
+- **Kernel diagnostics:** fixed-capacity allocation-free event log (`KLOG`), scheduler/lock statistics (`SCHEDSTAT`), active page-table status (`VMSTAT`), and kernel subsystem summary (`KERNEL`).
 - **Login Manager:** first-run administrator creation with password confirmation, a startup account picker, password-protected sign-in, a passwordless `LIVE-USER` guest session, session lock/unlock, switch user, and log out. Keyboard input is enabled before the login UI starts. The custom mouse pointer remains visible and follows PS/2 mouse movement; selecting fields and activating controls still uses the keyboard.
 - **Desktop compositor:** fullscreen wallpaper with cover scaling and fixed-point bilinear interpolation, updated dock and icons, a 24×24 custom alpha-blended cursor, a top menu bar, window panels, and saved-window-background restoration, in-place window updates, and region-only system-menu/clock refreshes to reduce visible flicker.
 - **Files:** opens in the current session home (`/DISK/HOME/<username>` or `/DISK/HOME/live`), then supports folder navigation, Back/Up/Home/Disk/System/Favorite, paging, bounded text preview, directory/empty-file creation, and deletion on writable `/DISK`. Back history and Favorite are session-only. The embedded root is read-only; preview is bounded and not a full text editor.
-- **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running and updates only changed text rows until its visible history scrolls.
+- **Terminal:** existing kernel shell rendered inside a window, with line editing, command history, path/command Tab completion, account commands, filesystem commands, network diagnostics, and system reports. The Terminal takes keyboard focus while running and updates only changed text rows until its visible history scrolls; `CLEAR` forces a full repaint so previous output is erased.
 - **Network:** E1000 for QEMU, DHCP/static fallback, ARP/IPv4, ICMP `PING`, DNS/NTP, experimental TCP/HTTP, gateway/DNS diagnostics, and packet counters.
 - **Clock:** local time, fixed UTC offset, RTC and experimental NTP synchronization controls.
 - **Settings:** three display profiles—1024×768, 1280×720, 1366×768—with a guarded Bochs VBE live-mode request when supported. Limine profiles remain the boot-time fallback.
@@ -60,7 +63,7 @@ The ISO is written under `build/`. `run.py` attaches `data/xavieros-disk.img`, a
 
 ## Shell commands
 
-Run `HELP` for the current full list. Key groups include `SYSINFO`; `NET`, `NETSTAT`, `NETCHECK`, `PING`; experimental `HTTPGET` and `FETCH`; `DATE`, `TIME`, `DATETIME`, `TIMEZONE`, `NTP`; `CONFIG`, `SETTINGS`, `REPORT`; `LS`, `CAT`, `STAT`, `WRITE`, `MKDIR`, `RM`, `DF`, `FSCK`; `USERADD`, `LOGIN`, `LOGOUT`, `WHOAMI`, `PASSWD`; and diagnostic commands such as `HEALTH`, `SELFTEST`, `TASKS`, `HEAP`, and `MEM`.
+Run `HELP` for the current full list. Key groups include `SYSINFO`; `NET`, `NETSTAT`, `NETCHECK`, `PING`; experimental `HTTPGET` and `FETCH`; `DATE`, `TIME`, `DATETIME`, `TIMEZONE`, `NTP`; `CONFIG`, `SETTINGS`, `REPORT`; `LS`, `CAT`, `STAT`, `WRITE`, `MKDIR`, `RM`, `DF`, `FSCK`; `USERADD`, `LOGIN`, `LOGOUT`, `WHOAMI`, `PASSWD`; and diagnostic commands such as `HEALTH`, `SELFTEST`, `TASKS`, `TASKRUN`, `SCHEDSTAT`, `VMSTAT`, `VMTEST`, `KLOG`, `KERNEL`, `HEAP`, and `MEM`.
 
 ## Documentation
 
@@ -71,7 +74,7 @@ The root documentation is intentionally kept to `README.md`, `README.ru.md`, and
 
 ## Status and limitations
 
-XavierOS is experimental and is not a general-purpose or secure operating system. The desktop and its applications run inside the kernel rather than isolated user processes. Account UI, password checks, and shell path restrictions are a prototype and are not a security boundary against arbitrary kernel code. Files supports directory navigation, bounded text preview, and selected operations on `/DISK`, but is not a complete file manager/editor. Network features target the QEMU E1000 and user-mode NAT; HTTPS/TLS, IPv6, and general-purpose networking are not implemented. XVDISKFS is not journaled or crash-safe. Live resolution switching depends on VGA/Bochs VBE support. Restart and shutdown are emulator-oriented; QEMU shutdown depends on ACPI support, and physical hardware is not validated.
+XavierOS is experimental and is not a general-purpose or secure operating system. The scheduler TCB table is capped at 16 slots; each task receives a 16 KiB physically contiguous stack without a guard page or stack-overflow detector. Kernel threads are cooperative, so a CPU-bound thread that never yields can stall other threads. The context switch does not save a separate FPU/SIMD context. IRQ-safe spinlocks protect selected shared structures on the current single-core execution model, but the whole system is not SMP-safe. The PMM manages physical pages below 4 GiB only. The VMM operates on the active four-level Limine address space and supervisor mappings only; it refuses five-level paging and does not create isolated user address spaces. Page-table reclamation after unmap and SMP TLB shootdowns are not implemented. The desktop and its applications run inside the kernel rather than isolated user processes. Account UI, password checks, and shell path restrictions are a prototype and are not a security boundary against arbitrary kernel code. Files supports directory navigation, bounded text preview, and selected operations on `/DISK`, but is not a complete file manager/editor. Network features target the QEMU E1000 and user-mode NAT; HTTPS/TLS, IPv6, and general-purpose networking are not implemented. XVDISKFS is not journaled or crash-safe. Live resolution switching depends on VGA/Bochs VBE support. Restart and shutdown are emulator-oriented; QEMU shutdown depends on ACPI support, and physical hardware is not validated.
 
 **Run XavierOS in QEMU or another disposable virtual machine. Do not rely on it to protect important data.**
 

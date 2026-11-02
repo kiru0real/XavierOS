@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.4 — Kernel Foundations
+
+### Added
+- Added an IRQ-safe generic `SpinLock` that saves/restores the local interrupt-enable state and records lock contention statistics.
+- Protected kernel heap free-list metadata and PMM bitmap allocation/free operations with the shared synchronization primitive.
+- Reworked the cooperative scheduler around 16 TCB slots, dynamically PMM-allocated 16 KiB kernel-thread stacks, priorities 0–7 with round-robin selection and aging for long-waiting tasks, runtime task creation, sleep/wake, block, zombie/finished states, and safe stack reclamation from the host context.
+- Added a four-level x86_64 VMM for the active kernel address space: page-table walking across 4 KiB / 2 MiB / 1 GiB leaves, supervisor 4 KiB map/unmap operations, local TLB invalidation, NX enablement when supported by the CPU, and explicit rejection of unsupported five-level paging or permission widening.
+- Added an allocation-free 64-entry kernel event log and `KLOG`, `SCHEDSTAT`, `VMSTAT`, `VMTEST`, `KERNEL`, and `TASKRUN` diagnostics.
+
+### Fixed and improved
+- PMM allocation, contiguous-run allocation, page release, and free-page accounting are now serialized and IRQ-safe on the current single-core execution model.
+- Kernel heap metadata now uses the same IRQ-safe lock abstraction instead of a spin loop that could deadlock if an IRQ interrupted a lock holder. The lock self-test verifies local interrupt masking, failed nested `try_lock`, and restoration of the previous interrupt state.
+- Scheduler task stacks are returned to PMM only after control has switched back to the host stack.
+- Terminal `CLEAR` now marks the display for a full repaint after resetting the line buffer, so stale framebuffer rows are erased while ordinary output keeps incremental rendering.
+
+### Limitations
+- Scheduling remains cooperative. PIT ticks wake sleeping tasks but do not preempt CPU-bound kernel threads; the context switch does not save a separate FPU/SIMD context.
+- The VMM operates on the active Limine address space and supports supervisor mappings only; it does not yet create isolated Ring 3 address spaces. Mapping APIs reject requests that would widen permissions inherited from existing parent entries.
+- The PMM still manages physical memory below 4 GiB. Page-table pages created by VMM are retained after unmap; reclamation and SMP TLB shootdowns are not implemented.
+- The TCB table is currently limited to 16 slots. Each task stack is 16 KiB of physically contiguous memory without a guard page or stack-overflow detector. Aging raises the effective priority of READY tasks, but cooperative CPU-bound tasks can still stall the system if they never yield.
+- The kernel remains single-core in practice; IRQ-safe spinlocks are a foundation, not a claim that every subsystem is SMP-safe.
+
 All notable XavierOS changes are documented here. Each release-kit Release Notes file describes only that release. This changelog retains the cumulative development history.
 
 ## 0.2.3 — Rendering and Responsiveness

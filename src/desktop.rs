@@ -1,4 +1,4 @@
-//! XavierOS in-kernel desktop and login manager for v0.2.3.
+//! XavierOS in-kernel desktop and login manager for v0.2.4.
 //!
 //! This module provides the framebuffer compositor, desktop windows, file manager,
 //! system actions, and application panels. Applications still run in kernel space;
@@ -23,7 +23,7 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.3";
+const BUILD_LABEL: &str = "XAVIEROS 0.2.4";
 const WALLPAPER_WIDTH: usize = 1470;
 const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as

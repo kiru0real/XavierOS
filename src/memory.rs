@@ -1,10 +1,12 @@
 //! Limine memory-map parsing and a small physical page allocator.
 //!
-//! The first implementation intentionally manages only physical addresses below 4 GiB.
-//! Limine's HHDM is used to access and zero allocated physical pages.
-//! The allocator is single-core and is not SMP-safe yet.
+//! The allocator manages physical addresses below 4 GiB and uses Limine's HHDM to access
+//! allocated pages. PMM bitmap operations are serialized by an IRQ-safe spinlock. The wider
+//! memory subsystem still assumes one active CPU; SMP bring-up and TLB coordination are not
+//! implemented.
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use crate::sync::SpinLock;
 
 const LIMINE_COMMON_MAGIC: [u64; 2] = [
     0xC7B1_DD30_DF4C_8B88,
@@ -88,6 +90,7 @@ static mut USABLE_BITMAP: [u64; BITMAP_WORDS] = [0; BITMAP_WORDS];
 static mut FREE_PAGE_COUNT: usize = 0;
 static mut HHDM_OFFSET: u64 = 0;
 static mut INITIALIZED: bool = false;
+static PMM_LOCK: SpinLock<()> = SpinLock::new(());
 
 #[derive(Clone, Copy)]
 pub struct MemoryStats {
@@ -361,7 +364,12 @@ unsafe fn asm_invlpg(virtual_address: u64) {
 
 /// Allocate one physical 4 KiB page. The returned value is a physical address.
 pub fn allocate_page() -> Option<u64> {
-    if !unsafe { read_volatile(addr_of!(INITIALIZED)) } || free_page_count() == 0 {
+    let _guard = PMM_LOCK.lock();
+    allocate_page_locked()
+}
+
+fn allocate_page_locked() -> Option<u64> {
+    if !unsafe { read_volatile(addr_of!(INITIALIZED)) } || free_page_count_unlocked() == 0 {
         return None;
     }
 
@@ -380,7 +388,6 @@ pub fn allocate_page() -> Option<u64> {
             let usable_word = unsafe { read_volatile(usable_ptr.add(word_index)) };
 
             if usable_word & mask == 0 {
-                // Defensive repair: never return a page not marked as usable.
                 used_word |= mask;
                 unsafe { write_volatile(used_word_ptr, used_word) };
                 candidates &= !mask;
@@ -389,7 +396,7 @@ pub fn allocate_page() -> Option<u64> {
 
             used_word |= mask;
             unsafe { write_volatile(used_word_ptr, used_word) };
-            let free = free_page_count();
+            let free = free_page_count_unlocked();
             if free == 0 {
                 return None;
             }
@@ -397,7 +404,6 @@ pub fn allocate_page() -> Option<u64> {
             return Some((page_index as u64) * PAGE_SIZE);
         }
     }
-
     None
 }
 
@@ -405,29 +411,24 @@ pub fn allocate_page() -> Option<u64> {
 /// This is needed for subsystems (such as the first kernel heap) that require one
 /// contiguous virtual interval through the linear HHDM mapping.
 pub fn allocate_contiguous_pages(count: usize) -> Option<u64> {
-    if count == 0
-        || count > MAX_MANAGED_PAGES
-        || !unsafe { read_volatile(addr_of!(INITIALIZED)) }
-        || free_page_count() < count
-    {
+    if count == 0 || count > MAX_MANAGED_PAGES || !unsafe { read_volatile(addr_of!(INITIALIZED)) } {
         return None;
     }
+    let _guard = PMM_LOCK.lock();
+    if free_page_count_unlocked() < count { return None; }
 
     let used_ptr = unsafe { addr_of_mut!(USED_BITMAP).cast::<u64>() };
     let usable_ptr = unsafe { addr_of_mut!(USABLE_BITMAP).cast::<u64>() };
     let mut run_start = 0usize;
     let mut run_length = 0usize;
 
-    // Page zero is deliberately reserved. A run resets at every reserved or busy page.
     for page in 1..MAX_MANAGED_PAGES {
         let word_index = page / 64;
         let mask = 1u64 << (page % 64);
         let is_usable = unsafe { read_volatile(usable_ptr.add(word_index)) } & mask != 0;
         let is_used = unsafe { read_volatile(used_ptr.add(word_index)) } & mask != 0;
         if is_usable && !is_used {
-            if run_length == 0 {
-                run_start = page;
-            }
+            if run_length == 0 { run_start = page; }
             run_length += 1;
             if run_length == count {
                 for allocated_page in run_start..run_start + count {
@@ -436,7 +437,7 @@ pub fn allocate_contiguous_pages(count: usize) -> Option<u64> {
                     let used_value = unsafe { read_volatile(used_ptr.add(allocated_word)) };
                     unsafe { write_volatile(used_ptr.add(allocated_word), used_value | allocated_mask) };
                 }
-                let free = free_page_count();
+                let free = free_page_count_unlocked();
                 unsafe { write_volatile(addr_of_mut!(FREE_PAGE_COUNT), free.saturating_sub(count)) };
                 return Some((run_start as u64) * PAGE_SIZE);
             }
@@ -476,6 +477,7 @@ pub fn free_page(physical_address: u64) -> bool {
         return false;
     }
 
+    let _guard = PMM_LOCK.lock();
     let page_index = (physical_address / PAGE_SIZE) as usize;
     let word_index = page_index / 64;
     let mask = 1u64 << (page_index % 64);
@@ -485,19 +487,57 @@ pub fn free_page(physical_address: u64) -> bool {
     let usable_word = unsafe { read_volatile(usable_ptr.add(word_index)) };
     let used_word = unsafe { read_volatile(used_word_ptr) };
 
-    if usable_word & mask == 0 || used_word & mask == 0 {
-        return false;
-    }
+    if usable_word & mask == 0 || used_word & mask == 0 { return false; }
 
     unsafe {
         write_volatile(used_word_ptr, used_word & !mask);
-        let free = read_volatile(addr_of!(FREE_PAGE_COUNT));
+        let free = free_page_count_unlocked();
         write_volatile(addr_of_mut!(FREE_PAGE_COUNT), free.saturating_add(1));
     }
     true
 }
 
+/// Release a contiguous run allocated by allocate_contiguous_pages(). All pages are
+/// validated before any bitmap bit is changed, so a partial free cannot occur.
+pub fn free_contiguous_pages(physical_start: u64, count: usize) -> bool {
+    if count == 0 || physical_start == 0 || physical_start % PAGE_SIZE != 0 { return false; }
+    let byte_count = match (count as u64).checked_mul(PAGE_SIZE) { Some(value) => value, None => return false };
+    let end = match physical_start.checked_add(byte_count) { Some(value) if value <= MAX_MANAGED_BYTES => value, _ => return false };
+    if !unsafe { read_volatile(addr_of!(INITIALIZED)) } { return false; }
+
+    let _guard = PMM_LOCK.lock();
+    let used_ptr = unsafe { addr_of_mut!(USED_BITMAP).cast::<u64>() };
+    let usable_ptr = unsafe { addr_of_mut!(USABLE_BITMAP).cast::<u64>() };
+    let first_page = (physical_start / PAGE_SIZE) as usize;
+    let end_page = (end / PAGE_SIZE) as usize;
+    for page in first_page..end_page {
+        let word_index = page / 64;
+        let mask = 1u64 << (page % 64);
+        let usable = unsafe { read_volatile(usable_ptr.add(word_index)) };
+        let used = unsafe { read_volatile(used_ptr.add(word_index)) };
+        if usable & mask == 0 || used & mask == 0 { return false; }
+    }
+    for page in first_page..end_page {
+        let word_index = page / 64;
+        let mask = 1u64 << (page % 64);
+        let used = unsafe { read_volatile(used_ptr.add(word_index)) };
+        unsafe { write_volatile(used_ptr.add(word_index), used & !mask); }
+    }
+    let free = free_page_count_unlocked();
+    unsafe { write_volatile(addr_of_mut!(FREE_PAGE_COUNT), free.saturating_add(count)); }
+    true
+}
+
+pub fn is_initialized() -> bool {
+    unsafe { read_volatile(addr_of!(INITIALIZED)) }
+}
+
 pub fn free_page_count() -> usize {
+    let _guard = PMM_LOCK.lock();
+    free_page_count_unlocked()
+}
+
+fn free_page_count_unlocked() -> usize {
     unsafe { read_volatile(addr_of!(FREE_PAGE_COUNT)) }
 }
 

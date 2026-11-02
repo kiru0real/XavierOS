@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.3.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.4.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_is_wired_and_version_is_release_023(self) -> None:
+    def test_desktop_is_wired_for_release_024(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,9 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.3"', cargo)
-        self.assertIn('VERSION = "0.2.3"', release)
-        self.assertIn('Current version: `0.2.3`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.4"', cargo)
+        self.assertIn('VERSION = "0.2.4"', release)
+        self.assertIn('Current version: `0.2.4`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_beta4_wallpaper_uses_optimized_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -420,13 +420,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_release_023(self) -> None:
+    def test_version_metadata_is_consistent_for_release_024(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.3"', cargo)
-        self.assertIn('VERSION = "0.2.3"', package)
-        self.assertIn("Current version: `0.2.3`", readme)
+        self.assertIn('version = "0.2.4"', cargo)
+        self.assertIn('VERSION = "0.2.4"', package)
+        self.assertIn("Current version: `0.2.4`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -520,7 +520,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.3")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.4")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -528,7 +528,7 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('sysinfo_prefix(console, "    XX      XX    "); console.write("DISPLAY: ");', show)
         self.assertIn('sysinfo_prefix(console, "                  "); console.write("HEAP: ");', show)
         self.assertIn('sysinfo_prefix(console, "                  "); console.write("DISK: ");', show)
-        self.assertIn('sysinfo_row(console, "                  ", "SCHEDULER: COOPERATIVE")', show)
+        self.assertIn('sysinfo_row(console, "                  ", "SCHEDULER: PRIORITY COOPERATIVE")', show)
         self.assertIn('sysinfo_row(console, "                  ", "SHELL: XAVIER CONSOLE")', show)
         for fact in ("CPU VENDOR:", "DISPLAY:", "USER:", "UPTIME:", "PMM:", "HEAP:", "DISK:"):
             self.assertIn(fact, main)
@@ -562,7 +562,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.3', main)
+        self.assertIn('VERSION: 0.2.4', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -640,8 +640,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.3"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.3"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.4"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.4"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -694,9 +694,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.3`", readme)
-        self.assertIn('VERSION = "0.2.3"', release)
-        self.assertIn('version = "0.2.3"', cargo)
+        self.assertIn("Current version: `0.2.4`", readme)
+        self.assertIn('VERSION = "0.2.4"', release)
+        self.assertIn('version = "0.2.4"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
@@ -836,6 +836,28 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("self.render();", render_pending)
         self.assertIn("console.render_pending();", main)
 
+    def test_terminal_clear_forces_a_full_repaint_before_incremental_render(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        console_start = main.index("struct Console {")
+        console_end = main.index("fn is_x_logo_line(", console_start)
+        console = main[console_start:console_end]
+        self.assertIn("full_repaint_pending: bool", console)
+        clear_start = console.index("    fn clear(&mut self)")
+        clear_end = console.index("    fn write(&mut self", clear_start)
+        clear = console[clear_start:clear_end]
+        self.assertIn("self.full_repaint_pending = true;", clear)
+        render_start = console.index("    fn render(&mut self)")
+        render_end = console.index("    // Append-only command output", render_start)
+        render = console[render_start:render_end]
+        self.assertIn("self.full_repaint_pending = false;", render)
+        pending_start = console.index("    fn render_pending(&mut self)")
+        pending_end = console.index("    fn render_completed_line(", pending_start)
+        pending = console[pending_start:pending_end]
+        self.assertIn("if self.full_repaint_pending", pending)
+        self.assertLess(pending.index("if self.full_repaint_pending"), pending.index("let first_line"))
+        self.assertIn('"CLEAR" => console.clear()', main)
+        self.assertIn("console.render_pending();", main)
+
     def test_wallpaper_and_opaque_cursor_use_fast_pixel_paths(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         cursor_start = desktop.index("fn blend_cursor_pixel(")
@@ -848,6 +870,121 @@ class RepositoryShapeTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("Automatic GitHub release checking is not implemented yet", readme)
         self.assertIn("HTTPS/TLS support is required", readme)
+
+
+
+    def test_v024_kernel_modules_are_wired_into_boot(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("mod sync;", main)
+        self.assertIn("mod vm;", main)
+        self.assertIn("mod klog;", main)
+        self.assertIn("match vm::initialize()", main)
+        self.assertIn('"VMSTAT" => show_vmstat(console)', main)
+        self.assertIn('"SCHEDSTAT" => show_scheduler_stats(console)', main)
+        self.assertIn('"KLOG" => show_kernel_log(console)', main)
+        self.assertIn('"KERNEL" => show_kernel_status(console)', main)
+
+    def test_irq_safe_spinlock_is_used_by_heap_and_pmm(self) -> None:
+        sync = (ROOT / "src" / "sync.rs").read_text(encoding="utf-8")
+        heap = (ROOT / "src" / "heap.rs").read_text(encoding="utf-8")
+        memory = (ROOT / "src" / "memory.rs").read_text(encoding="utf-8")
+        self.assertIn("pub struct SpinLock<T>", sync)
+        self.assertIn("disable_local_interrupts()", sync)
+        self.assertIn('core::arch::asm!("sti"', sync)
+        self.assertIn("lock: SpinLock<()>", heap)
+        self.assertIn("self.lock.lock()", heap)
+        self.assertIn("static PMM_LOCK: SpinLock<()> = SpinLock::new(())", memory)
+        self.assertIn("pub fn free_contiguous_pages(", memory)
+
+    def test_scheduler_supports_dynamic_kernel_thread_stacks_and_sleep(self) -> None:
+        task = (ROOT / "src" / "task.rs").read_text(encoding="utf-8")
+        self.assertIn("const MAX_TASKS: usize = 16", task)
+        self.assertIn("const STACK_PAGES: usize = 4", task)
+        self.assertIn("pub fn create_with_priority(", task)
+        self.assertIn("pub fn sleep_ticks(", task)
+        self.assertIn("pub fn block_current(", task)
+        self.assertIn("pub fn wake(task_id: u32)", task)
+        self.assertIn("fn reap_zombies()", task)
+        self.assertIn("free_contiguous_pages(physical, STACK_PAGES)", task)
+        self.assertIn("pub fn detailed_stats()", task)
+        self.assertIn("pub fn self_test()", task)
+        self.assertIn("PIT ticks wake sleepers but do not", task)
+
+    def test_irq_spinlock_guard_is_cpu_local(self) -> None:
+        sync = (ROOT / "src" / "sync.rs").read_text(encoding="utf-8")
+        self.assertIn("use core::marker::PhantomData;", sync)
+        self.assertIn("_cpu_local: PhantomData<*mut ()>", sync)
+        self.assertIn("restore_local_interrupts(self.restore_interrupts)", sync)
+        self.assertIn("SPINLOCK DID NOT DISABLE LOCAL INTERRUPTS", sync)
+        self.assertIn("SPINLOCK DID NOT RESTORE THE PREVIOUS INTERRUPT STATE", sync)
+
+    def test_scheduler_ages_long_waiting_ready_tasks(self) -> None:
+        task = (ROOT / "src" / "task.rs").read_text(encoding="utf-8")
+        self.assertIn("PRIORITY_AGING_INTERVAL_TICKS: u64 = 25", task)
+        self.assertIn("fn effective_priority(task: &Task, now: u64) -> u8", task)
+        self.assertIn("effective_priority(&task, now)", task)
+        self.assertIn("task.ready_since = now", task)
+        self.assertIn("PRIORITY AGING DID NOT PROMOTE A LONG-WAITING TASK", task)
+
+    def test_task_list_reports_priority_and_all_terminal_states_are_checked(self) -> None:
+        task = (ROOT / "src" / "task.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("FnMut(u32, &'static str, &'static str, u8, u8, u64)", task)
+        self.assertIn("visit(task.id, task.name, state, task.priority, effective_priority(task, now), task.switches)", task)
+        self.assertIn('console.write(" PRIORITY=")', main)
+        self.assertIn('console.write(" EFFECTIVE=")', main)
+        self.assertIn("stats.ready + stats.running + stats.blocked + stats.sleeping + stats.zombie", task)
+        self.assertIn("SCHEDULER SELF-TEST REQUIRES NO ACTIVE TASKS", task)
+
+    def test_vmm_mapping_does_not_widen_parent_permissions(self) -> None:
+        vm = (ROOT / "src" / "vm.rs").read_text(encoding="utf-8")
+        self.assertIn("PHYSICAL ADDRESS ZERO IS RESERVED BY THIS KERNEL", vm)
+        self.assertIn("PARENT PAGE-TABLE ENTRY IS READ-ONLY", vm)
+        self.assertIn("PARENT PAGE-TABLE ENTRY DISABLES EXECUTION", vm)
+        self.assertIn("FIVE-LEVEL PAGING IS ENABLED", vm)
+        self.assertIn("CR4.PGE IS NOT ENABLED", vm)
+        self.assertIn("Never widen an existing parent entry", vm)
+        self.assertIn("free_page(child_physical)", vm)
+
+    def test_pmm_docs_describe_irq_safe_metadata_and_single_cpu_scope(self) -> None:
+        memory = (ROOT / "src" / "memory.rs").read_text(encoding="utf-8")
+        self.assertIn("PMM bitmap operations are serialized by an IRQ-safe spinlock", memory)
+        self.assertIn("SMP bring-up and TLB coordination are not", memory)
+
+    def test_vmm_walks_active_tables_and_maps_supervisor_pages(self) -> None:
+        vm = (ROOT / "src" / "vm.rs").read_text(encoding="utf-8")
+        self.assertIn("pub fn translate(virtual_address: u64)", vm)
+        self.assertIn("pub fn map_page(", vm)
+        self.assertIn("pub fn unmap_page(", vm)
+        self.assertIn("PDPT_LARGE_MASK", vm)
+        self.assertIn("PD_LARGE_MASK", vm)
+        self.assertIn("invalidate_page(virtual_address)", vm)
+        self.assertIn("pub fn self_test()", vm)
+        self.assertIn("Separate process address spaces", vm)
+
+    def test_kernel_event_log_is_fixed_capacity_and_non_allocating(self) -> None:
+        klog = (ROOT / "src" / "klog.rs").read_text(encoding="utf-8")
+        self.assertIn("pub const CAPACITY: usize = 64", klog)
+        self.assertIn("message: &'static str", klog)
+        self.assertIn("pub fn snapshot(", klog)
+        self.assertNotIn("alloc::", klog)
+        self.assertNotIn("Vec<", klog)
+
+    def test_kernel_event_log_writer_uses_a_local_index_for_mutable_entry_access(self) -> None:
+        klog = (ROOT / "src" / "klog.rs").read_text(encoding="utf-8")
+        self.assertIn("let next = buffer.next;", klog)
+        self.assertIn("buffer.entries[next] = LogEntry", klog)
+        self.assertIn("buffer.next = (next + 1) % CAPACITY;", klog)
+        self.assertNotIn("buffer.entries[buffer.next] =", klog)
+
+    def test_v024_documentation_states_kernel_limitations(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("Current version: `0.2.4`", readme)
+        self.assertIn("Kernel threads", readme)
+        self.assertIn("do not preempt", readme)
+        self.assertIn("## 0.2.4 — Kernel Foundations", changelog)
+        self.assertIn("SMP TLB shootdowns are not implemented", changelog)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,9 +1,10 @@
 //! A small first-fit kernel heap backed by a contiguous PMM allocation.
-//! The current kernel runs on one CPU with interrupts disabled. The list uses a spin lock,
-//! but PMM is not SMP-safe and IRQ handlers must not allocate until locking is IRQ-safe.
+//! Allocator metadata is protected by the shared IRQ-safe SpinLock primitive. IRQ handlers
+//! should still avoid allocation because allocation can be lengthy and is not reentrant.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use crate::sync::SpinLock;
 use core::mem::{align_of, size_of};
 use core::ptr::{null_mut, write_bytes};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -25,7 +26,7 @@ struct AllocationHeader {
 }
 
 struct KernelHeap {
-    lock: AtomicBool,
+    lock: SpinLock<()>,
     initialized: AtomicBool,
     base: AtomicUsize,
     end: AtomicUsize,
@@ -34,29 +35,15 @@ struct KernelHeap {
 
 unsafe impl Sync for KernelHeap {}
 
-struct LockGuard<'a>(&'a AtomicBool);
-impl Drop for LockGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 impl KernelHeap {
     const fn new() -> Self {
         Self {
-            lock: AtomicBool::new(false),
+            lock: SpinLock::new(()),
             initialized: AtomicBool::new(false),
             base: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
             head: UnsafeCell::new(null_mut()),
         }
-    }
-
-    fn lock(&self) -> LockGuard<'_> {
-        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
-        LockGuard(&self.lock)
     }
 
     unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
@@ -66,7 +53,7 @@ impl KernelHeap {
         if layout.size() == 0 {
             return layout.align() as *mut u8;
         }
-        let _guard = self.lock();
+        let _guard = self.lock.lock();
         unsafe { self.allocate_locked(layout) }
     }
 
@@ -143,7 +130,7 @@ impl KernelHeap {
             return;
         }
 
-        let _guard = self.lock();
+        let _guard = self.lock.lock();
         let header_ptr = (user - header_size) as *const AllocationHeader;
         let header = unsafe { header_ptr.read() };
         let Some(allocation_end) = header.start.checked_add(header.size) else { return; };
@@ -217,7 +204,7 @@ impl KernelHeap {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
         }
-        let _guard = self.lock();
+        let _guard = self.lock.lock();
         let mut free_bytes = 0usize;
         let base = self.base.load(Ordering::Acquire);
         let end = self.end.load(Ordering::Acquire);
