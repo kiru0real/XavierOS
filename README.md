@@ -8,7 +8,6 @@ A `no_std` kernel booting with Limine, with a framebuffer desktop, a shell, stor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-x86__64%20%2B%20QEMU-informational)](#build-and-run)
-[![Status](https://img.shields.io/badge/Status-0.2.4%20Pre-release-orange)](#status-and-limitations)
 
 **Current version: `0.2.4`**
 
