@@ -18,6 +18,9 @@ mod net;
 mod clock;
 mod config;
 mod desktop;
+mod pci;
+mod virtio_blk;
+mod graphics;
 
 use memory::MemoryStats;
 use core::arch::asm;
@@ -62,24 +65,24 @@ struct FramebufferResponse {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Framebuffer {
-    address: *mut u8,
-    width: u64,
-    height: u64,
-    pitch: u64,
-    bpp: u16,
-    memory_model: u8,
-    red_mask_size: u8,
-    red_mask_shift: u8,
-    green_mask_size: u8,
-    green_mask_shift: u8,
-    blue_mask_size: u8,
-    blue_mask_shift: u8,
-    unused: [u8; 7],
-    edid_size: u64,
-    edid: *mut u8,
-    mode_count: u64,
-    modes: *mut *mut u8,
+pub(crate) struct Framebuffer {
+    pub(crate) address: *mut u8,
+    pub(crate) width: u64,
+    pub(crate) height: u64,
+    pub(crate) pitch: u64,
+    pub(crate) bpp: u16,
+    pub(crate) memory_model: u8,
+    pub(crate) red_mask_size: u8,
+    pub(crate) red_mask_shift: u8,
+    pub(crate) green_mask_size: u8,
+    pub(crate) green_mask_shift: u8,
+    pub(crate) blue_mask_size: u8,
+    pub(crate) blue_mask_shift: u8,
+    pub(crate) unused: [u8; 7],
+    pub(crate) edid_size: u64,
+    pub(crate) edid: *mut u8,
+    pub(crate) mode_count: u64,
+    pub(crate) modes: *mut *mut u8,
 }
 
 #[repr(C)]
@@ -118,7 +121,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         "PS/2 mouse unavailable; desktop keyboard navigation remains enabled.\r\n"
     });
-    serial_write("\r\nXavierOS v0.2.4\r\n");
+    serial_write("\r\nXavierOS v0.2.5\r\n");
     klog::log(klog::Level::Info, "kernel entry reached");
     serial_write("Rust x86_64 kernel entered.\r\n");
     serial_write("Requesting Limine framebuffer...\r\n");
@@ -219,10 +222,39 @@ pub extern "C" fn _start() -> ! {
         None => serial_write("WARNING: Heap initialization skipped because memory manager is unavailable.\r\n"),
     }
 
+    match pci::initialize() {
+        Ok(stats) => {
+            serial_write("PCI bus enumeration complete. Devices found: ");
+            serial_write_u64(stats.devices as u64);
+            if stats.table_overflow { serial_write(" (DEVICE TABLE FULL)"); }
+            serial_write(".\r\n");
+            klog::log(klog::Level::Info, "PCI bus manager initialized");
+        }
+        Err(error) => {
+            serial_write("WARNING: PCI enumeration failed: ");
+            serial_write(error);
+            serial_write("\r\n");
+            klog::log(klog::Level::Warn, "PCI bus manager initialization failed");
+        }
+    }
+    match virtio_blk::initialize() {
+        Ok(sectors) => {
+            serial_write("VirtIO Block ready. Sectors: ");
+            serial_write_u64(sectors);
+            serial_write(".\r\n");
+            klog::log(klog::Level::Info, "VirtIO block driver initialized");
+        }
+        Err(error) => {
+            serial_write("VirtIO Block unavailable; ATA PIO fallback will be used if present: ");
+            serial_write(error);
+            serial_write("\r\n");
+        }
+    }
+
     match diskfs::initialize() {
         Ok(info) => {
             klog::log(klog::Level::Info, "writable disk filesystem mounted");
-            serial_write("Writable XVDISKFS mounted. ATA sectors: ");
+            serial_write("Writable XVDISKFS mounted. Block sectors: ");
             serial_write_u64(info.total_sectors as u64);
             serial_write("; files: ");
             serial_write_u64(info.files as u64);
@@ -522,7 +554,7 @@ impl Console {
             fb,
             32,
             height.saturating_sub(27),
-            "XAVIEROS // BUILD 0.2.4 // INTERACTIVE CONSOLE",
+            "XAVIEROS // BUILD 0.2.5 // INTERACTIVE CONSOLE",
             if width >= 640 { 2 } else { 1 },
             rgb(fb, 151, 169, 196),
         );
@@ -539,6 +571,7 @@ impl Console {
         self.rendered_first_line = first_line;
         self.rendered_scroll_generation = self.scroll_generation;
         self.full_repaint_pending = false;
+        crate::graphics::present();
     }
 
     // Append-only command output is drawn into the rows that changed. A full
@@ -564,6 +597,7 @@ impl Console {
             self.render_line_at(line_index, first_line);
         }
         self.rendered_line_count = self.line_count;
+        crate::graphics::present();
     }
 
     fn render_completed_line(&self) {
@@ -767,7 +801,7 @@ fn run_console_window(
 
     let mut console = Console::new(*framebuffer, true);
     console.clear();
-    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.4");
+    console.write_line("XAVIEROS INTERACTIVE SHELL V0.2.5");
     console.write_line("RUST NO_STD KERNEL | LIMINE | X86_64");
     console.write_line("INITRAMFS: XVRFS V1 | WRITABLE DISK: /DISK");
     console.write_line("TYPE HELP TO SEE AVAILABLE COMMANDS.");
@@ -808,6 +842,7 @@ fn run_console_window(
     if mouse_ready {
         crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
     }
+    crate::graphics::present();
 
     serial_write("Windowed Terminal ready. Press ESC to return to desktop; type HELP for commands.\r\n");
 
@@ -825,6 +860,7 @@ fn run_console_window(
         if mouse_ready {
             crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
         }
+        crate::graphics::present();
         let mut history_offset: Option<usize> = None;
         let mut saved_input = [0u8; CONSOLE_INPUT_CAPACITY];
         let mut saved_input_len = 0usize;
@@ -1000,6 +1036,7 @@ fn run_console_window(
             if mouse_ready && (mouse_event || keyboard_event) {
                 crate::desktop::draw_mouse_cursor_saved(desktop_framebuffer, *mouse_x, *mouse_y, cursor_background);
             }
+            if mouse_event || keyboard_event { crate::graphics::present(); }
         }
     }
 }
@@ -1144,7 +1181,7 @@ fn keyboard_poll_key() -> Option<KeyboardKey> {
 const COMMAND_COMPLETIONS: &[&str] = &[
     "ABOUT", "BANNER", "CALC", "CAT", "CLEAR", "CONFIG", "CPU", "DIAG", "DIR", "DISK", "ECHO", "FETCH",
     "FORMAT", "FSCK", "FSINFO", "FSTEST", "HALT", "HEALTH", "HEAP", "HELP", "HHDM", "HOME", "HTTPGET", "IDT",
-    "INFO", "IRQ", "KERNEL", "KLOG", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
+    "INFO", "IRQ", "KERNEL", "KLOG", "PCI", "DEVICES", "DRIVERS", "GFXINFO", "GFXTEST", "LOGIN", "LOGOUT", "LS", "MEM", "MKDIR", "PASSWD", "PMM", "PWD",
     "REBOOT", "RM", "SELFTEST", "STAT", "SCHEDSTAT", "SYSINFO", "TASKS", "TASKRUN", "TASKTEST", "TIME", "VMSTAT", "VMTEST", "TOUCH", "DF", "UPTIME",
     "TRAP", "USERADD", "USERS", "VERSION", "WHOAMI", "WRITE", "NET", "PING", "REPORT", "SETTINGS", "DESKTOP",
     "DATE", "DATETIME", "DHCP", "NTP", "TIMEZONE", "NETSTAT", "NETCHECK",
@@ -1533,6 +1570,10 @@ fn process_command(
             console.write_line("VMTEST      - TEST ACTIVE PAGE TABLE WALKING");
             console.write_line("KLOG        - SHOW THE RECENT KERNEL EVENT LOG");
             console.write_line("KERNEL      - SHOW KERNEL SUBSYSTEM READINESS");
+            console.write_line("PCI / DEVICES - LIST ENUMERATED PCI DEVICES");
+            console.write_line("DRIVERS     - SHOW DEVICE DRIVER BINDINGS");
+            console.write_line("GFXINFO     - SHOW BACKBUFFER / DIRTY-TILE RENDERER STATUS");
+            console.write_line("GFXTEST     - VERIFY THE ACTIVE RENDERER STATE");
             console.write_line("PWD         - SHOW CURRENT DIRECTORY");
             console.write_line("FSINFO      - SHOW INITRAMFS STATISTICS");
             console.write_line("FSTEST      - TEST THE EMBEDDED INITRAMFS");
@@ -1542,7 +1583,7 @@ fn process_command(
             console.write_line("INFO        - SHOW KERNEL INFORMATION");
             console.write_line("MEM         - SHOW MEMORY USAGE");
             console.write_line("PMM         - SHOW PHYSICAL PAGE ALLOCATOR");
-            console.write_line("SELFTEST    - TEST MEMORY, IRQ, HEAP, VFS, DISK AND TASKS");
+            console.write_line("SELFTEST    - TEST MEMORY, IRQ, HEAP, VFS, DISK, GFX, PCI AND TASKS");
             console.write_line("SYSINFO     - SHOW THE XAVIEROS SYSTEM SUMMARY");
             console.write_line("TRAP        - TRIGGER A TEST INVALID-OPCODE FAULT (HALTS)");
             console.write_line("VERSION     - SHOW THE OS VERSION");
@@ -1554,7 +1595,7 @@ fn process_command(
             console.write_line("XAVIEROS IS AN EXPERIMENTAL X86_64 OS.");
             console.write_line("KERNEL: RUST NO_STD, BUILT FROM SCRATCH.");
             console.write_line("BOOT: LIMINE | TEST MACHINE: QEMU");
-            console.write_line("PROJECT VERSION: 0.2.4");
+            console.write_line("PROJECT VERSION: 0.2.5");
             console.write_line("DESKTOP PREVIEW: DOCK, APP WINDOWS, AND TERMINAL.");
         }
         "BANNER" => show_banner(console),
@@ -1563,7 +1604,7 @@ fn process_command(
         "DIAG" => run_diagnostics(console, memory_summary),
         "INFO" => {
             console.write_line("KERNEL: XAVIEROS");
-            console.write_line("VERSION: 0.2.4");
+            console.write_line("VERSION: 0.2.5");
             console.write_line("ARCHITECTURE: X86_64");
             console.write_line("BOOTLOADER: LIMINE");
             console.write_line("LANGUAGE: RUST NO_STD");
@@ -1972,6 +2013,13 @@ fn process_command(
         "SCHEDSTAT" => show_scheduler_stats(console),
         "KLOG" => show_kernel_log(console),
         "KERNEL" => show_kernel_status(console),
+        "PCI" | "DEVICES" => show_pci_devices(console),
+        "DRIVERS" => show_driver_status(console),
+        "GFXINFO" => show_graphics_info(console),
+        "GFXTEST" => match graphics::self_test() {
+            Ok(()) => console.write_line("RENDERER V2 SELF-TEST: PASS"),
+            Err(error) => { console.write("RENDERER V2 SELF-TEST: FAIL: "); console.write_line(error); }
+        },
         "TASKRUN" => match task::run_until_idle() {
             Ok(()) => console.write_line("SCHEDULER RETURNED TO SHELL; NO READY OR SLEEPING THREADS REMAIN."),
             Err(error) => { console.write("TASKRUN ERROR: "); console.write_line(error); }
@@ -2046,7 +2094,7 @@ fn process_command(
             unsafe { asm!("ud2", options(nomem, nostack)); }
             halt_forever();
         }
-        "VERSION" => console.write_line("XAVIEROS V0.2.4"),
+        "VERSION" => console.write_line("XAVIEROS V0.2.5"),
         "ECHO" => console.write_line(arguments),
         "SELFTEST" => {
             let mut failed = false;
@@ -2107,6 +2155,24 @@ fn process_command(
             match sync::self_test() {
                 Ok(()) => console.write_line("IRQ-SAFE SPINLOCK SELF-TEST: PASS"),
                 Err(error) => { failed = true; console.write("SPINLOCK SELF-TEST: FAIL: "); console.write_line(error); }
+            }
+            match pci::self_test() {
+                Ok(()) => console.write_line("PCI BUS ENUMERATION SELF-TEST: PASS"),
+                Err(error) => { failed = true; console.write("PCI SELF-TEST: FAIL: "); console.write_line(error); }
+            }
+            if virtio_blk::is_ready() {
+                match virtio_blk::self_test() {
+                    Ok(()) => console.write_line("VIRTIO BLOCK DRIVER SELF-TEST: PASS"),
+                    Err(error) => { failed = true; console.write("VIRTIO-BLK SELF-TEST: FAIL: "); console.write_line(error); }
+                }
+            } else if ata::is_ready() {
+                console.write_line("VIRTIO BLOCK: SKIPPED (LEGACY ATA PIO FALLBACK IS ACTIVE)");
+            } else {
+                console.write_line("STORAGE DRIVER: SKIPPED (NO BLOCK DEVICE READY)");
+            }
+            match graphics::self_test() {
+                Ok(()) => console.write_line("RENDERER V2 BACKBUFFER SELF-TEST: PASS"),
+                Err(error) => { failed = true; console.write("RENDERER SELF-TEST: FAIL: "); console.write_line(error); }
             }
             if vm::is_initialized() {
                 match vm::self_test() {
@@ -2308,7 +2374,7 @@ fn build_diagnostic_report<'a>(storage: &'a mut [u8]) -> Result<&'a str, &'stati
     let username = users::current_name(&mut name_buffer);
     let (total_tasks, runnable_tasks, switches) = task::stats();
     let _ = writeln!(&mut out, "XavierOS Diagnostic Report");
-    let _ = writeln!(&mut out, "Version: 0.2.4");
+    let _ = writeln!(&mut out, "Version: 0.2.5");
     let _ = writeln!(&mut out, "Session: {} ({})", username, if users::is_admin() { "administrator" } else if users::is_live() { "live" } else { "user" });
     let _ = writeln!(&mut out, "Uptime: {} seconds", interrupts::timer_ticks() / 100);
     let _ = writeln!(&mut out, "IDT: {} | PIC/PIT: {} | Keyboard IRQ: {}", if interrupts::is_initialized() { "ready" } else { "unavailable" }, if interrupts::hardware_is_initialized() { "ready" } else { "unavailable" }, if interrupts::keyboard_is_initialized() { "ready" } else { "unavailable" });
@@ -2555,7 +2621,7 @@ fn show_banner(console: &mut Console) {
     console.write_line("");
     console.write_line("XAVIEROS");
     console.write_line("A SMALL OS. BUILT FROM SCRATCH IN RUST.");
-    console.write_line("VERSION 0.2.4 | DESKTOP PREVIEW AVAILABLE.");
+    console.write_line("VERSION 0.2.5 | GRAPHICS & DEVICE UPDATE.");
     console.write_line("");
 }
 
@@ -2836,8 +2902,65 @@ fn show_kernel_status(console: &mut Console) {
     console.write_line("SYNCHRONIZATION: IRQ-SAFE SPINLOCK; SINGLE-CORE ASSUMPTION");
     console.write_line(if diskfs::mount_status() { "DISK VFS: READY" } else { "DISK VFS: UNAVAILABLE" });
     console.write_line(if net::is_ready() { "E1000 NETWORK: READY" } else { "E1000 NETWORK: UNAVAILABLE" });
+    console.write_line(if pci::is_initialized() { "PCI BUS MANAGER: READY" } else { "PCI BUS MANAGER: UNAVAILABLE" });
+    console.write_line(if virtio_blk::is_ready() { "VIRTIO BLOCK: READY" } else if ata::is_ready() { "STORAGE: ATA PIO FALLBACK" } else { "STORAGE DRIVER: UNAVAILABLE" });
+    console.write_line(if graphics::is_active() { "RENDERER V2: RAM BACKBUFFER + DIRTY TILES" } else { "RENDERER V2: DIRECT FRAMEBUFFER FALLBACK" });
     console.write_line("PROCESS ISOLATION / RING 3: NOT IMPLEMENTED");
     console.write_line("SMP / APIC PREEMPTION / TLB SHOOTDOWN: NOT IMPLEMENTED");
+}
+
+fn show_pci_devices(console: &mut Console) {
+    if !pci::is_initialized() {
+        console.write_line("PCI BUS MANAGER IS NOT INITIALIZED.");
+        return;
+    }
+    let stats = pci::stats();
+    console.write_line("XAVIEROS PCI DEVICE MANAGER");
+    console.write("DEVICES: "); console.write_decimal(stats.devices as u64);
+    if stats.table_overflow { console.write(" | WARNING: TABLE CAPACITY REACHED"); }
+    console.write_line("");
+    pci::for_each(|device| {
+        console.write("["); console.write_decimal(device.bus as u64); console.write(":");
+        console.write_decimal(device.device as u64); console.write("."); console.write_decimal(device.function as u64); console.write("] ");
+        console.write_hex(((device.vendor_id as u64) << 16) | device.device_id as u64);
+        console.write(" CLASS "); console.write(pci::class_name(device));
+        console.write(" IRQ "); console.write_decimal(device.interrupt_line as u64);
+        console.write_line("");
+    });
+    console.write_line("PCI CONFIGURATION METHOD: MECHANISM #1 (CF8/CFC), READ-ONLY ENUMERATION.");
+}
+
+fn show_driver_status(console: &mut Console) {
+    console.write_line("XAVIEROS DEVICE DRIVERS");
+    console.write("PCI ENUMERATOR: "); console.write_line(if pci::is_initialized() { "READY" } else { "UNAVAILABLE" });
+    console.write("VIRTIO-BLK: "); console.write_line(virtio_blk::status_text());
+    console.write("STORAGE BACKEND: "); console.write_line(ata::backend_name());
+    console.write("E1000: "); console.write_line(net::status_text());
+    if pci::find_class(0x0C, 0x03, Some(0x30)).is_some() {
+        console.write_line("XHCI: DETECTED; DRIVER NOT IMPLEMENTED");
+    } else {
+        console.write_line("XHCI: NOT DETECTED");
+    }
+    if pci::find(0x1AF4, 0x1041).is_some() {
+        console.write_line("VIRTIO-NET: DETECTED; DRIVER NOT IMPLEMENTED");
+    } else {
+        console.write_line("VIRTIO-NET: NOT DETECTED");
+    }
+    console.write_line("VIRTIO-GPU / USB INPUT: NOT IMPLEMENTED");
+}
+
+fn show_graphics_info(console: &mut Console) {
+    let stats = graphics::stats();
+    console.write_line("XAVIEROS RENDERER V2");
+    console.write_line(if stats.active { "MODE: SOFTWARE BACKBUFFER + DIRTY-TILE PRESENT" } else { "MODE: DIRECT FRAMEBUFFER FALLBACK" });
+    console.write("DISPLAY: "); console.write_decimal(stats.width as u64); console.write(" X ");
+    console.write_decimal(stats.height as u64); console.write_line("");
+    console.write("TILE SIZE: "); console.write_decimal(graphics::TILE_SIZE as u64); console.write_line(" X 32 PIXELS");
+    console.write("PRESENTED FRAMES: "); console.write_decimal(stats.frames); console.write_line("");
+    console.write("PRESENTED TILES: "); console.write_decimal(stats.tiles_presented); console.write_line("");
+    console.write("PRESENTED PIXELS: "); console.write_decimal(stats.pixels_presented); console.write_line("");
+    console.write_line("COMPOSITION ORDER: WALLPAPER / DESKTOP / WINDOWS / OVERLAYS / CURSOR");
+    console.write_line("NO GPU ACCELERATION OR VBLANK PAGE FLIP.");
 }
 
 fn show_irq(console: &mut Console) {
@@ -2963,9 +3086,9 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
 
     console.write_line("");
     if console.max_cols >= 74 {
-        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.4");
+        sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.5");
         sysinfo_row(console, " XX            XX ", "----------------");
-        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.4");
+        sysinfo_row(console, "  XX          XX  ", "OS: XAVIEROS 0.2.5");
         sysinfo_row(console, "   XX        XX   ", "KERNEL: RUST NO_STD");
         sysinfo_row(console, "    XX      XX    ", "ARCH: X86_64");
         sysinfo_row(console, "     XX    XX     ", "BOOTLOADER: LIMINE");
@@ -3021,7 +3144,7 @@ fn show_sysinfo(console: &mut Console, memory_summary: Option<(MemoryStats, bool
         console.write_line("    XX      XX"); console.write_line("   XX        XX");
         console.write_line("  XX          XX"); console.write_line(" XX            XX");
         console.write_line("XX              XX");
-        console.write_line("XAVIEROS 0.2.4"); console.write_line("---------------");
+        console.write_line("XAVIEROS 0.2.5"); console.write_line("---------------");
         console.write_line("KERNEL: RUST NO_STD"); console.write_line("ARCH: X86_64");
         console.write_line("BOOTLOADER: LIMINE");
         console.write("USER: "); console.write_line(username);
@@ -3158,33 +3281,46 @@ fn channel(value: u8, size: u8, shift: u8) -> u32 {
     (((value as u32 * max + 127) / 255) << shift) & (max << shift)
 }
 
-fn fill_rect(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, color: u32) {
-    if x >= fb.width as usize || y >= fb.height as usize || w == 0 || h == 0 {
-        return;
-    }
+fn fill_rect_pixels(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, color: u32, backbuffer: bool) {
+    if x >= fb.width as usize || y >= fb.height as usize || w == 0 || h == 0 { return; }
     let end_x = x.saturating_add(w).min(fb.width as usize);
     let end_y = y.saturating_add(h).min(fb.height as usize);
     for py in y..end_y {
         let row = unsafe { fb.address.add(py * fb.pitch as usize) as *mut u32 };
         for px in x..end_x {
-            unsafe { write_volatile(row.add(px), color); }
+            unsafe {
+                if backbuffer { row.add(px).write(color); }
+                else { write_volatile(row.add(px), color); }
+            }
         }
     }
 }
 
+fn fill_rect(fb: &Framebuffer, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    fill_rect_pixels(fb, x, y, w, h, color, graphics::is_backbuffer_view(fb));
+    graphics::mark_rect(fb, x, y, w, h);
+}
+
 fn draw_text(fb: &Framebuffer, x: usize, y: usize, text: &str, scale: usize, color: u32) {
-    if scale == 0 { return; }
+    if scale == 0 || text.is_empty() { return; }
+    // A glyph consists of 5 pixels plus one spacing column. Paint glyph pixels
+    // without repeatedly touching the dirty-tile map, then mark the text bounds once.
+    let backbuffer = graphics::is_backbuffer_view(fb);
     for (char_index, byte) in text.bytes().enumerate() {
         let rows = glyph(byte.to_ascii_uppercase());
         for (row_index, bits) in rows.iter().enumerate() {
             for col in 0..5 {
                 if bits & (1 << (4 - col)) == 0 { continue; }
-                let px = x.saturating_add((char_index * 6 + col) * scale);
-                let py = y.saturating_add(row_index * scale);
-                fill_rect(fb, px, py, scale, scale, color);
+                let character_column = char_index.saturating_mul(6).saturating_add(col);
+                let px = x.saturating_add(character_column.saturating_mul(scale));
+                let py = y.saturating_add(row_index.saturating_mul(scale));
+                fill_rect_pixels(fb, px, py, scale, scale, color, backbuffer);
             }
         }
     }
+    let text_width = text.len().saturating_mul(6).saturating_mul(scale);
+    let text_height = 7usize.saturating_mul(scale);
+    graphics::mark_rect(fb, x, y, text_width, text_height);
 }
 
 // Compact 5x7 bitmap font for the ASCII characters used by the framebuffer console.

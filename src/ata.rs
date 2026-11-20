@@ -36,6 +36,16 @@ pub fn initialize() -> Result<DriveInfo, &'static str> {
     READY.store(false, Ordering::Release);
     SECTORS.store(0, Ordering::Release);
 
+    // Prefer the modern VirtIO PCI block backend when the PCI driver initialized.
+    // Keep this ATA module as the filesystem's storage facade and retain PIO fallback.
+    if crate::virtio_blk::is_ready() {
+        let sectors = crate::virtio_blk::sector_count().min(u32::MAX as u64) as u32;
+        if sectors == 0 { return Err("VIRTIO-BLK REPORTED ZERO ADDRESSABLE SECTORS"); }
+        SECTORS.store(sectors, Ordering::Release);
+        READY.store(true, Ordering::Release);
+        return Ok(DriveInfo { sectors });
+    }
+
     unsafe {
         outb(DRIVE_HEAD, 0xA0); // Primary master, legacy ATA device.
         delay_400ns();
@@ -76,15 +86,26 @@ pub fn initialize() -> Result<DriveInfo, &'static str> {
 }
 
 pub fn is_ready() -> bool {
-    READY.load(Ordering::Acquire)
+    crate::virtio_blk::is_ready() || READY.load(Ordering::Acquire)
 }
 
 pub fn sector_count() -> u32 {
-    SECTORS.load(Ordering::Acquire)
+    if crate::virtio_blk::is_ready() {
+        crate::virtio_blk::sector_count().min(u32::MAX as u64) as u32
+    } else {
+        SECTORS.load(Ordering::Acquire)
+    }
+}
+
+pub fn backend_name() -> &'static str {
+    if crate::virtio_blk::is_ready() { "VIRTIO-BLK (MODERN PCI)" }
+    else if READY.load(Ordering::Acquire) { "ATA PIO PRIMARY MASTER" }
+    else { "UNAVAILABLE" }
 }
 
 pub fn read_sector(lba: u32, out: &mut [u8; SECTOR_SIZE]) -> Result<(), &'static str> {
     check_lba(lba)?;
+    if crate::virtio_blk::is_ready() { return crate::virtio_blk::read_sector(lba as u64, out); }
     unsafe {
         select_lba(lba);
         outb(SECTOR_COUNT, 1);
@@ -110,6 +131,7 @@ pub fn read_sector(lba: u32, out: &mut [u8; SECTOR_SIZE]) -> Result<(), &'static
 
 pub fn write_sector(lba: u32, data: &[u8; SECTOR_SIZE]) -> Result<(), &'static str> {
     check_lba(lba)?;
+    if crate::virtio_blk::is_ready() { return crate::virtio_blk::write_sector(lba as u64, data); }
     unsafe {
         select_lba(lba);
         outb(SECTOR_COUNT, 1);

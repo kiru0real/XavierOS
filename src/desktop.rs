@@ -1,4 +1,4 @@
-//! XavierOS in-kernel desktop and login manager for v0.2.4.
+//! XavierOS in-kernel desktop and login manager for v0.2.5.
 //!
 //! This module provides the framebuffer compositor, desktop windows, file manager,
 //! system actions, and application panels. Applications still run in kernel space;
@@ -7,7 +7,7 @@
 
 use crate::{clock, config, interrupts, net, users, Framebuffer, KeyboardKey, MemoryStats};
 
-const APP_COUNT: usize = 6;
+const APP_COUNT: usize = 7;
 const CURSOR_WIDTH: usize = 24;
 const CURSOR_HEIGHT: usize = 24;
 const CURSOR_SAVE_WIDTH: usize = CURSOR_WIDTH;
@@ -23,13 +23,14 @@ const APP_NETWORK: usize = 2;
 const APP_CLOCK: usize = 3;
 const APP_SETTINGS: usize = 4;
 const APP_ABOUT: usize = 5;
-const BUILD_LABEL: &str = "XAVIEROS 0.2.4";
+const APP_DEVICES: usize = 6;
+const BUILD_LABEL: &str = "XAVIEROS 0.2.5";
 const WALLPAPER_WIDTH: usize = 1470;
 const WALLPAPER_HEIGHT: usize = 904;
 // RGB24 pixels generated from the user-supplied wallpaper. Keeping the image as
 // raw RGB avoids needing a JPEG decoder inside this no_std kernel.
 const WALLPAPER_RGB: &[u8] = include_bytes!("../assets/wallpaper.rgb");
-const APP_NAMES: [&str; APP_COUNT] = ["FILES", "TERMINAL", "NETWORK", "CLOCK", "SETTINGS", "ABOUT"];
+const APP_NAMES: [&str; APP_COUNT] = ["FILES", "TERMINAL", "NETWORK", "CLOCK", "SETTINGS", "ABOUT", "DEVICES"];
 
 const FILE_PATH_CAPACITY: usize = 192;
 const FILE_NAME_CAPACITY: usize = 64;
@@ -252,6 +253,7 @@ struct DesktopState {
     app_notice: [u8; 96],
     app_notice_len: usize,
     about_tab: usize,
+    devices_page: usize,
 }
 
 // Save only the pixels underneath the small pointer. Redrawing the full desktop
@@ -317,6 +319,12 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
     } else {
         crate::serial_write("Login Manager skipped: local user database is unavailable.\r\n");
     }
+    if let Some(backbuffer) = crate::graphics::initialize(&active_framebuffer) {
+        active_framebuffer = backbuffer;
+        crate::serial_write("Renderer V2 initialized: RAM backbuffer with 32x32 dirty tiles.\r\n");
+    } else {
+        crate::serial_write("Renderer V2 unavailable for this framebuffer; using direct rendering.\r\n");
+    }
     let mut state = DesktopState {
         selected: APP_TERMINAL,
         open_window: None,
@@ -332,6 +340,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
         app_notice: [0; 96],
         app_notice_len: 0,
         about_tab: 0,
+        devices_page: 0,
     };
     let mut cursor_background = CursorBackground::new();
     let mut dock_label_background = DockLabelBackground::new();
@@ -341,6 +350,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
     if state.mouse_ready {
         draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
     }
+    crate::graphics::present();
 
     // The UI clock is displayed to minute precision. Refreshing every second
     // used to repaint the whole Clock/Network panel and caused visible flashing.
@@ -465,6 +475,11 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                         state.about_tab = tab;
                         repaint = true;
                     }
+                } else if state.open_window == Some(APP_DEVICES) {
+                    if close_button_hit(&active_framebuffer, state.mouse_x, state.mouse_y) {
+                        state.open_window = None;
+                        repaint = true;
+                    }
                 } else if state.open_window == Some(APP_SETTINGS) {
                     match settings_hit_test(&active_framebuffer, state.mouse_x, state.mouse_y) {
                         Some(SettingsHit::SelectMode(index)) => {
@@ -572,6 +587,17 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     KeyboardKey::Escape => { state.open_window = None; repaint = true; }
                     _ => {}
                 }
+            } else if state.open_window == Some(APP_DEVICES) {
+                match key {
+                    KeyboardKey::HistoryUp => { state.devices_page = state.devices_page.saturating_sub(1); repaint = true; }
+                    KeyboardKey::HistoryDown | KeyboardKey::Tab => {
+                        let last_page = crate::pci::stats().devices.div_ceil(7).saturating_sub(1);
+                        state.devices_page = state.devices_page.saturating_add(1).min(last_page);
+                        repaint = true;
+                    }
+                    KeyboardKey::Escape => { state.open_window = None; repaint = true; }
+                    _ => {}
+                }
             } else { match key {
                 KeyboardKey::CursorLeft | KeyboardKey::HistoryUp => {
                     if state.open_window == Some(APP_SETTINGS) {
@@ -626,6 +652,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
                     b'C' => { state.selected = APP_CLOCK; state.open_window = Some(APP_CLOCK); repaint = true; dock_repaint = true; }
                     b'S' => { state.selected = APP_SETTINGS; state.open_window = Some(APP_SETTINGS); repaint = true; dock_repaint = true; }
                     b'A' => { state.selected = APP_ABOUT; state.open_window = Some(APP_ABOUT); repaint = true; dock_repaint = true; }
+                    b'D' => { state.selected = APP_DEVICES; state.open_window = Some(APP_DEVICES); state.devices_page = 0; repaint = true; dock_repaint = true; }
                     b'X' => { state.system_menu_open = true; state.system_menu_selected = 0; repaint = true; }
                     _ => {}
                 },
@@ -649,6 +676,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
             if state.mouse_ready {
                 draw_mouse_cursor_saved(&active_framebuffer, state.mouse_x, state.mouse_y, &mut cursor_background);
             }
+            crate::graphics::present();
             let (window_x, window_y, window_w, window_h) = app_window_geometry(&active_framebuffer);
             let content_x = window_x + 8;
             let content_y = window_y + 40;
@@ -763,6 +791,7 @@ pub(super) fn run(framebuffer: &Framebuffer, memory_summary: Option<(MemoryStats
             }
         }
 
+        crate::graphics::present();
         interrupts::wait_for_interrupt();
     }
 }
@@ -1238,6 +1267,7 @@ fn restore_window_backdrop(fb: &Framebuffer) {
             }
         }
         WINDOW_BACKDROP_VALID = false;
+        crate::graphics::mark_absolute(x, y, width, height, fb.width as usize, fb.height as usize);
     }
 }
 
@@ -1275,6 +1305,7 @@ fn restore_system_menu_backdrop(fb: &Framebuffer) {
             }
         }
         MENU_BACKDROP_VALID = false;
+        crate::graphics::mark_absolute(MENU_BACKDROP_X, MENU_BACKDROP_Y, width, height, fb.width as usize, fb.height as usize);
     }
 }
 
@@ -1345,6 +1376,7 @@ fn draw_wallpaper(fb: &Framebuffer) {
         let source_y1 = (source_y0 + 1).min(WALLPAPER_HEIGHT - 1);
         let fy = (source_y_fp & (FP_ONE - 1)) as u32;
         let row = unsafe { fb.address.add(y * fb.pitch as usize) as *mut u32 };
+        let backbuffer = crate::graphics::is_backbuffer_view(fb);
         let mut source_x_fp = start_x_fp;
         for x in 0..width {
             let source_x0 = ((source_x_fp >> FP_SHIFT) as usize).min(WALLPAPER_WIDTH - 1);
@@ -1367,10 +1399,14 @@ fn draw_wallpaper(fb: &Framebuffer) {
                 WALLPAPER_RGB[bottom_left + 2], WALLPAPER_RGB[bottom_right + 2], fx, fy,
             );
             let pixel = red_lut[red as usize] | green_lut[green as usize] | blue_lut[blue as usize];
-            unsafe { core::ptr::write_volatile(row.add(x), pixel); }
+            unsafe {
+                if backbuffer { row.add(x).write(pixel); }
+                else { core::ptr::write_volatile(row.add(x), pixel); }
+            }
             source_x_fp = source_x_fp.saturating_add(step_fp);
         }
     }
+    crate::graphics::mark_full();
 }
 
 fn refresh_clock_live_text(fb: &Framebuffer) {
@@ -1556,6 +1592,7 @@ fn restore_dock_label_background(fb: &Framebuffer, background: &mut DockLabelBac
             }
         }
     }
+    crate::graphics::mark_rect(fb, background.x, background.y, background.width, background.height);
     background.valid = false;
 }
 
@@ -1665,6 +1702,15 @@ fn draw_app_icon(fb: &Framebuffer, app: usize, x: usize, y: usize, size: usize) 
             }
             fill_circle(fb, cx, cy, (size * 3 / 10) as i32, color(fb, 207, 226, 243));
             fill_circle(fb, cx, cy, (size / 8).max(2) as i32, color(fb, 46, 66, 95));
+        }
+        APP_DEVICES => {
+            rounded_rect(fb, x, y, size, size, r, color(fb, 25, 53, 83));
+            rounded_rect(fb, x + size / 6, y + size / 6, size * 2 / 3, size * 2 / 3, r / 2, color(fb, 77, 174, 206));
+            for offset in [size / 4, size / 2, size * 3 / 4] {
+                crate::fill_rect(fb, x + size / 10, y + offset, size / 10, 2.max(size / 14), color(fb, 171, 239, 255));
+                crate::fill_rect(fb, x + size * 4 / 5, y + offset, size / 10, 2.max(size / 14), color(fb, 171, 239, 255));
+            }
+            crate::draw_text(fb, x + size / 3, y + size / 2 - 3, "PCI", 1, color(fb, 248, 254, 255));
         }
         _ => {
             rounded_rect(fb, x, y, size, size, r, color(fb, 12, 52, 89));
@@ -1786,6 +1832,9 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
         APP_SETTINGS => {
             draw_settings_panel(fb, state);
         }
+        APP_DEVICES => {
+            draw_devices_panel(fb, state);
+        }
         APP_ABOUT => {
             let items = &["OVERVIEW", "KERNEL", "LICENSE"];
             draw_app_sidebar(fb, x + 12, y + 48, 132, win_h.saturating_sub(60), "SYSTEM", items, state.about_tab.min(2));
@@ -1836,11 +1885,104 @@ fn draw_app_window(fb: &Framebuffer, app: usize, memory_summary: Option<(MemoryS
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), "ESC TO CLOSE TERMINAL  /  SHELL INPUT ACTIVE", 1, color(fb, 123, 150, 190));
     } else if app == APP_FILES {
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), "BACK/BACKSPACE  UP/ESC=PARENT  PIN=P  FAVORITE=V", 1, color(fb, 123, 150, 190));
+    } else if app == APP_DEVICES {
+        crate::draw_text(fb, left, y + win_h.saturating_sub(18), "UP/DOWN OR TAB TO PAGE  /  ESC TO CLOSE", 1, color(fb, 123, 150, 190));
     } else {
         let hint = "ESC TO CLOSE  /  CLICK DOCK TO SWITCH APPS";
         crate::draw_text(fb, left, y + win_h.saturating_sub(18), hint, 1, color(fb, 123, 150, 190));
     }
     let _ = memory_summary;
+}
+
+fn draw_devices_panel(fb: &Framebuffer, state: &DesktopState) {
+    let (x, y, win_w, _win_h) = app_window_geometry(fb);
+    let content_x = x + 24;
+    let content_w = win_w.saturating_sub(48);
+    draw_page_heading(fb, content_x, y + 56, "DEVICE MANAGER", "PCI inventory and active kernel drivers.");
+
+    let stats = crate::pci::stats();
+    let card_gap = 8;
+    let card_w = content_w.saturating_sub(card_gap * 2) / 3;
+    let mut pci_count_buffer = [0u8; 24];
+    let pci_count_text = if crate::pci::is_initialized() {
+        push_decimal_text(&mut pci_count_buffer, stats.devices as u64)
+    } else { "OFFLINE" };
+    draw_stat_card(fb, content_x, y + 101, card_w, 55, "PCI DEVICES", pci_count_text, color(fb, 98, 215, 255));
+    draw_stat_card(fb, content_x + card_w + card_gap, y + 101, card_w, 55, "STORAGE", if crate::virtio_blk::is_ready() {
+        "VIRTIO-BLK"
+    } else if crate::ata::is_ready() { "ATA PIO" } else { "NOT READY" }, color(fb, 103, 230, 183));
+    draw_stat_card(fb, content_x + (card_w + card_gap) * 2, y + 101, card_w, 55, "NETWORK", if crate::net::is_ready() { "E1000 READY" } else { "NOT READY" }, color(fb, 255, 201, 112));
+
+    let list_y = y + 169;
+    crate::draw_text(fb, content_x, list_y, "BUS:DEVICE.FN   VENDOR:DEVICE   CLASS", 1, color(fb, 125, 158, 194));
+    if !crate::pci::is_initialized() || stats.devices == 0 {
+        rounded_rect(fb, content_x, list_y + 20, content_w, 62, 8, color(fb, 37, 28, 40));
+        crate::draw_text(fb, content_x + 12, list_y + 39, "NO PCI DEVICES AVAILABLE", 1, color(fb, 255, 174, 160));
+    } else {
+        const PAGE_SIZE: usize = 7;
+        let page_count = stats.devices.div_ceil(PAGE_SIZE).max(1);
+        let page = state.devices_page.min(page_count - 1);
+        let first = page * PAGE_SIZE;
+        let end = (first + PAGE_SIZE).min(stats.devices);
+        for index in first..end {
+            if let Some(device) = crate::pci::get(index) {
+                let row = index - first;
+                let row_y = list_y + 20 + row * 24;
+                let fill = if row & 1 == 0 { color(fb, 18, 31, 49) } else { color(fb, 22, 37, 57) };
+                rounded_rect(fb, content_x, row_y, content_w, 21, 5, fill);
+
+                let mut bdf = [0u8; 24];
+                let mut used = 0usize;
+                push_hex_byte(&mut bdf, &mut used, device.bus);
+                push_byte(&mut bdf, &mut used, b':');
+                push_hex_byte(&mut bdf, &mut used, device.device);
+                push_byte(&mut bdf, &mut used, b'.');
+                push_hex_nibble(&mut bdf, &mut used, device.function);
+                let bdf_text = core::str::from_utf8(&bdf[..used]).unwrap_or("??:??.?");
+
+                let mut ids = [0u8; 24];
+                let mut ids_used = 0usize;
+                push_hex_word(&mut ids, &mut ids_used, device.vendor_id);
+                push_byte(&mut ids, &mut ids_used, b':');
+                push_hex_word(&mut ids, &mut ids_used, device.device_id);
+                let ids_text = core::str::from_utf8(&ids[..ids_used]).unwrap_or("????:????");
+                crate::draw_text(fb, content_x + 8, row_y + 7, bdf_text, 1, color(fb, 125, 220, 255));
+                crate::draw_text(fb, content_x + 86, row_y + 7, ids_text, 1, color(fb, 190, 211, 239));
+                crate::draw_text(fb, content_x + 164, row_y + 7, crate::pci::class_name(device), 1, color(fb, 230, 239, 250));
+            }
+        }
+        let mut page_text = [0u8; 24];
+        let mut used = 0usize;
+        push_num(&mut page_text, &mut used, (page + 1) as u64, 1);
+        push_byte(&mut page_text, &mut used, b'/');
+        push_num(&mut page_text, &mut used, page_count as u64, 1);
+        let page_text = core::str::from_utf8(&page_text[..used]).unwrap_or("1/1");
+        crate::draw_text(fb, content_x, y + 367, "UP/DOWN OR TAB TO PAGE DEVICES", 1, color(fb, 122, 153, 190));
+        crate::draw_text(fb, content_x + content_w.saturating_sub(30), y + 367, page_text, 1, color(fb, 112, 230, 203));
+        if stats.table_overflow {
+            crate::draw_text(fb, content_x + content_w.saturating_sub(150), y + 347, "TABLE LIMIT: 128", 1, color(fb, 255, 190, 137));
+        }
+    }
+    crate::draw_text(fb, content_x, y + 347, if crate::virtio_blk::is_ready() {
+        "VIRTIO BLOCK DRIVER ACTIVE; ATA FALLBACK AVAILABLE."
+    } else {
+        "VIRTIO BLOCK NOT ACTIVE; ATA FALLBACK IS USED WHEN AVAILABLE."
+    }, 1, color(fb, 150, 184, 216));
+}
+
+fn push_hex_nibble(buffer: &mut [u8], used: &mut usize, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    push_byte(buffer, used, HEX[(value & 0x0F) as usize]);
+}
+
+fn push_hex_byte(buffer: &mut [u8], used: &mut usize, value: u8) {
+    push_hex_nibble(buffer, used, value >> 4);
+    push_hex_nibble(buffer, used, value);
+}
+
+fn push_hex_word(buffer: &mut [u8], used: &mut usize, value: u16) {
+    push_hex_byte(buffer, used, (value >> 8) as u8);
+    push_hex_byte(buffer, used, value as u8);
 }
 
 fn draw_page_heading(fb: &Framebuffer, x: usize, y: usize, title: &str, subtitle: &str) {
@@ -2677,14 +2819,27 @@ fn apply_selected_resolution(
         mode,
         *current_width,
         *current_height,
-        framebuffer.address,
+        crate::graphics::frontbuffer_address().unwrap_or(framebuffer.address),
         hhdm_offset,
     ) {
         Ok(mapped_framebuffer) => {
-            framebuffer.address = mapped_framebuffer;
-            framebuffer.width = mode.width as u64;
-            framebuffer.height = mode.height as u64;
-            framebuffer.pitch = (mode.width * 4) as u64;
+            if crate::graphics::is_active() {
+                if let Some(shadow) = crate::graphics::reconfigure_frontbuffer(
+                    mapped_framebuffer, mode.width, mode.height, mode.width * 4,
+                ) {
+                    *framebuffer = shadow;
+                } else {
+                    framebuffer.address = mapped_framebuffer;
+                    framebuffer.width = mode.width as u64;
+                    framebuffer.height = mode.height as u64;
+                    framebuffer.pitch = (mode.width * 4) as u64;
+                }
+            } else {
+                framebuffer.address = mapped_framebuffer;
+                framebuffer.width = mode.width as u64;
+                framebuffer.height = mode.height as u64;
+                framebuffer.pitch = (mode.width * 4) as u64;
+            }
             *current_width = mode.width;
             *current_height = mode.height;
             state.mouse_x = state.mouse_x.clamp(1, (*current_width).saturating_sub(2) as i32);
@@ -2880,6 +3035,7 @@ pub(super) fn restore_cursor_background(fb: &Framebuffer, background: &mut Curso
             }
         }
     }
+    crate::graphics::mark_rect(fb, background.x, background.y, background.width, background.height);
     background.valid = false;
 }
 
@@ -2917,6 +3073,13 @@ fn draw_mouse_cursor(fb: &Framebuffer, x: i32, y: i32) {
                 );
             }
         }
+    }
+    let left = origin_x.max(0) as usize;
+    let top = origin_y.max(0) as usize;
+    let right = (origin_x + CURSOR_WIDTH as i32).min(fb_width).max(0) as usize;
+    let bottom = (origin_y + CURSOR_HEIGHT as i32).min(fb_height).max(0) as usize;
+    if left < right && top < bottom {
+        crate::graphics::mark_rect(fb, left, top, right - left, bottom - top);
     }
 }
 

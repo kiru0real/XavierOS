@@ -160,14 +160,14 @@ class ReleasePackagingTests(unittest.TestCase):
             source = root / "source.iso"
             source.write_bytes(b"test ISO bytes")
             iso, sums = package_release.package_release(source, root / "dist")
-            self.assertEqual(iso.name, "xavieros-0.2.4.iso")
+            self.assertEqual(iso.name, "xavieros-0.2.5.iso")
             self.assertEqual(iso.read_bytes(), source.read_bytes())
             digest = package_release.sha256_file(iso)
             self.assertEqual(sums.read_text(encoding="ascii"), f"{digest}  {iso.name}\n")
 
 
 class RepositoryShapeTests(unittest.TestCase):
-    def test_desktop_is_wired_for_release_024(self) -> None:
+    def test_desktop_is_wired_for_release_025(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
         interrupts = (ROOT / "src" / "interrupts.rs").read_text(encoding="utf-8")
@@ -185,9 +185,9 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn('APP_CLOCK', desktop)
         self.assertIn('APP_SETTINGS', desktop)
         self.assertIn('APP_ABOUT', desktop)
-        self.assertIn('version = "0.2.4"', cargo)
-        self.assertIn('VERSION = "0.2.4"', release)
-        self.assertIn('Current version: `0.2.4`', (ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.5"', cargo)
+        self.assertIn('VERSION = "0.2.5"', release)
+        self.assertIn('Current version: `0.2.5`', (ROOT / "README.md").read_text(encoding="utf-8"))
 
     def test_beta4_wallpaper_uses_optimized_bilinear_interpolation(self) -> None:
         desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
@@ -420,13 +420,13 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("+HHMM|-HHMM", main)
         self.assertIn("TIMEZONE +0300", readme)
 
-    def test_version_metadata_is_consistent_for_release_024(self) -> None:
+    def test_version_metadata_is_consistent_for_release_025(self) -> None:
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         package = (ROOT / "package_release.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('version = "0.2.4"', cargo)
-        self.assertIn('VERSION = "0.2.4"', package)
-        self.assertIn("Current version: `0.2.4`", readme)
+        self.assertIn('version = "0.2.5"', cargo)
+        self.assertIn('VERSION = "0.2.5"', package)
+        self.assertIn("Current version: `0.2.5`", readme)
 
     def test_only_core_markdown_docs_remain_in_source_tree(self) -> None:
         docs = {path.relative_to(ROOT).as_posix() for path in ROOT.rglob("*.md")}
@@ -520,7 +520,7 @@ class RepositoryShapeTests(unittest.TestCase):
     def test_sysinfo_keeps_neofetch_style_and_health_dashboard(self) -> None:
         main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.4")', main)
+        self.assertIn('sysinfo_row(console, "XX              XX", "XAVIEROS 0.2.5")', main)
         show_start = main.index("fn show_sysinfo(")
         show_end = main.index("fn ", show_start + 3)
         show = main[show_start:show_end]
@@ -562,7 +562,7 @@ class RepositoryShapeTests(unittest.TestCase):
         uptime = show.index('write_uptime(console); console.write_line("");')
         display = show.index('console.write("DISPLAY: ")')
         self.assertLess(uptime, display)
-        self.assertIn('VERSION: 0.2.4', main)
+        self.assertIn('VERSION: 0.2.5', main)
 
     def test_fsck_scans_without_writing(self) -> None:
         diskfs = (ROOT / "src" / "diskfs.rs").read_text(encoding="utf-8")
@@ -640,8 +640,8 @@ class RepositoryShapeTests(unittest.TestCase):
         run = (ROOT / "run.py").read_text(encoding="utf-8")
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn('"-rtc", "base=utc"', run)
-        self.assertIn('version = "0.2.4"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-        self.assertIn('VERSION = "0.2.4"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
+        self.assertIn('version = "0.2.5"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+        self.assertIn('VERSION = "0.2.5"', (ROOT / "package_release.py").read_text(encoding="utf-8"))
         self.assertIn("DHCP client", readme)
         self.assertIn("UDP NTP client", readme)
 
@@ -694,9 +694,9 @@ class RepositoryShapeTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn("HTTPGET", readme)
         self.assertIn("NETSTAT", readme)
-        self.assertIn("Current version: `0.2.4`", readme)
-        self.assertIn('VERSION = "0.2.4"', release)
-        self.assertIn('version = "0.2.4"', cargo)
+        self.assertIn("Current version: `0.2.5`", readme)
+        self.assertIn('VERSION = "0.2.5"', release)
+        self.assertIn('version = "0.2.5"', cargo)
 
 
     def test_relative_redirect_path_uses_byte_slice_for_request_buffer(self) -> None:
@@ -977,14 +977,113 @@ class RepositoryShapeTests(unittest.TestCase):
         self.assertIn("buffer.next = (next + 1) % CAPACITY;", klog)
         self.assertNotIn("buffer.entries[buffer.next] =", klog)
 
-    def test_v024_documentation_states_kernel_limitations(self) -> None:
+    def test_v025_documentation_states_kernel_limitations(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        self.assertIn("Current version: `0.2.4`", readme)
+        self.assertIn("Current version: `0.2.5`", readme)
         self.assertIn("Kernel threads", readme)
-        self.assertIn("do not preempt", readme)
+        self.assertIn("CPU-bound thread that never yields can stall other threads", readme)
         self.assertIn("## 0.2.4 — Kernel Foundations", changelog)
         self.assertIn("SMP TLB shootdowns are not implemented", changelog)
+
+
+    def test_renderer_v2_uses_backbuffer_dirty_tiles_and_volatile_front_writes(self) -> None:
+        graphics = (ROOT / "src" / "graphics.rs").read_text(encoding="utf-8")
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("static mut BACKBUFFER: [u32; PIXELS]", graphics)
+        self.assertIn("pub const TILE_SIZE: usize = 32", graphics)
+        self.assertIn("pub fn mark_rect(", graphics)
+        self.assertIn("pub fn present()", graphics)
+        self.assertIn("let pixel = *source.add(x);", graphics)
+        self.assertIn("write_volatile(destination.add(x), pixel)", graphics)
+        self.assertIn("crate::graphics::mark_rect(fb, left, top, right - left, bottom - top)", desktop)
+        self.assertIn("graphics::present();", main)
+
+    def test_renderer_clips_dirty_regions_to_subframebuffer_bounds(self) -> None:
+        graphics = (ROOT / "src" / "graphics.rs").read_text(encoding="utf-8")
+        self.assertIn("let local_right = x.saturating_add(width).min(fb.width as usize);", graphics)
+        self.assertIn("let local_bottom = y.saturating_add(height).min(fb.height as usize);", graphics)
+        self.assertIn("Clip against the view before translating it into desktop coordinates.", graphics)
+
+    def test_renderer_batches_text_dirty_marking(self) -> None:
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        start = main.index("fn draw_text(")
+        end = main.index("// Compact 5x7 bitmap font", start)
+        draw_text = main[start:end]
+        self.assertIn("fill_rect_pixels(fb, px, py, scale, scale, color, backbuffer);", draw_text)
+        self.assertIn("graphics::mark_rect(fb, x, y, text_width, text_height);", draw_text)
+        self.assertNotIn("fill_rect(fb, px, py", draw_text)
+
+    def test_pci_bus_manager_is_shared_by_nic_and_shell(self) -> None:
+        pci = (ROOT / "src" / "pci.rs").read_text(encoding="utf-8")
+        net = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+        main = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("const CONFIG_ADDRESS: u16 = 0x0CF8", pci)
+        self.assertIn("const CONFIG_DATA: u16 = 0x0CFC", pci)
+        self.assertIn("const MAX_DEVICES: usize = 128", pci)
+        self.assertIn("pub fn bar_info(", pci)
+        self.assertIn("pub fn find(vendor_id: u16, device_id: u16)", pci)
+        self.assertIn("pci::get(index)", net)
+        self.assertIn("pci::stats().devices", net)
+        self.assertIn('"PCI" | "DEVICES" => show_pci_devices(console)', main)
+        self.assertIn('"DRIVERS" => show_driver_status(console)', main)
+
+    def test_modern_virtio_block_is_default_and_ata_remains_selectable(self) -> None:
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        virtio = (ROOT / "src" / "virtio_blk.rs").read_text(encoding="utf-8")
+        ata = (ROOT / "src" / "ata.rs").read_text(encoding="utf-8")
+        self.assertIn('"virtio-blk-pci,drive=xvblk0,disable-legacy=on,disable-modern=off"', run)
+        self.assertIn('parser.add_argument("--ata-disk"', run)
+        self.assertIn("VIRTIO_BLK_MODERN: u16 = 0x1042", virtio)
+        self.assertIn("FEATURE_VERSION_1", virtio)
+        self.assertIn("VirtqDescriptor", virtio)
+        self.assertIn("pub fn read_sector", virtio)
+        self.assertIn("pub fn write_sector", virtio)
+        self.assertIn("if crate::virtio_blk::is_ready()", ata)
+        self.assertIn("ATA PIO PRIMARY MASTER", ata)
+
+    def test_virtio_capability_parser_rejects_malformed_lists(self) -> None:
+        virtio = (ROOT / "src" / "virtio_blk.rs").read_text(encoding="utf-8")
+        self.assertIn("PCI CAPABILITY POINTER IS NOT DWORD-ALIGNED", virtio)
+        self.assertIn("PCI CAPABILITY NEXT POINTER IS NOT DWORD-ALIGNED", virtio)
+        self.assertIn("PCI CAPABILITY LIST CONTAINS A LOOP", virtio)
+        self.assertIn("VENDOR PCI CAPABILITY HAS AN INVALID LENGTH", virtio)
+        self.assertIn("PCI CAPABILITY LIST DID NOT TERMINATE WITHIN 48 ENTRIES", virtio)
+        self.assertIn("NOTIFY CAPABILITY OFFSET IS NOT 2-BYTE-ALIGNED", virtio)
+        self.assertIn("NOTIFY MULTIPLIER IS NOT ZERO OR AN EVEN POWER OF TWO", virtio)
+        self.assertIn("DEVICE CONFIG OFFSET IS NOT 4-BYTE-ALIGNED", virtio)
+        self.assertIn("!notify_multiplier.is_power_of_two()", virtio)
+
+    def test_virtio_notify_multiplier_is_bound_before_validation_and_use(self) -> None:
+        virtio = (ROOT / "src" / "virtio_blk.rs").read_text(encoding="utf-8")
+        declaration = virtio.index("let notify_multiplier = caps.notify_multiplier;")
+        validation = virtio.index("if notify_multiplier != 0")
+        notification_use = virtio.index("checked_mul(notify_multiplier)")
+        self.assertLess(declaration, validation)
+        self.assertLess(validation, notification_use)
+        self.assertEqual(virtio.count("let notify_multiplier = caps.notify_multiplier;"), 1)
+
+    def test_device_manager_is_a_desktop_app_with_paged_hex_bdf_inventory(self) -> None:
+        desktop = (ROOT / "src" / "desktop.rs").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme_ru = (ROOT / "README.ru.md").read_text(encoding="utf-8")
+        self.assertIn("const APP_DEVICES: usize = 6", desktop)
+        self.assertIn('"DEVICES"', desktop)
+        self.assertIn("fn draw_devices_panel(", desktop)
+        self.assertIn("push_hex_byte(&mut bdf", desktop)
+        self.assertIn("state.devices_page.saturating_add(1).min(last_page)", desktop)
+        self.assertIn("Device Manager", readme)
+        self.assertIn("`D` Device Manager", readme)
+        self.assertIn("Device Manager", readme_ru)
+
+    def test_v025_release_notes_are_current_release_only_and_changelog_is_cumulative(self) -> None:
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertTrue(changelog.startswith("# Changelog\n\n## 0.2.5 — Graphics & Hardware Update"))
+        self.assertIn("## 0.2.4 — Kernel Foundations", changelog)
+        self.assertIn("Release Notes describe only the current release", readme)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

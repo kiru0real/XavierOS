@@ -74,6 +74,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reset-disk", action="store_true", help="erase and recreate the persistent 16 MiB virtual disk")
     parser.add_argument("--no-disk", action="store_true", help="run without attaching the persistent writable disk")
+    parser.add_argument("--ata-disk", action="store_true", help="attach the persistent disk through legacy IDE/ATA instead of modern VirtIO Block")
     args = parser.parse_args()
     if needs_rebuild():
         print("A missing or out-of-date ISO was detected; building XavierOS first.", flush=True)
@@ -91,7 +92,8 @@ def main() -> int:
         print(f"error: QEMU was not found. {hint}", file=sys.stderr)
         return 1
     print("Starting XavierOS in QEMU; close the emulator window to stop it.", flush=True)
-    # Legacy PC/PIIX exposes ATA PIO; explicit standard VGA enables the QEMU Bochs VBE display-mode controls; user-mode NAT adds E1000 networking.
+    # Standard VGA keeps the existing Bochs VBE display controls. E1000 stays
+    # available for the current network stack; storage defaults to modern VirtIO.
     command = [qemu, "-machine", "pc", "-vga", "std", "-cpu", "max", "-rtc", "base=utc", "-m", "256M", "-cdrom", "build/xavieros.iso", "-boot", "d",
                "-netdev", "user,id=xvnet0", "-device", "e1000,netdev=xvnet0"]
     if not args.no_disk:
@@ -100,8 +102,14 @@ def main() -> int:
         except (OSError, RuntimeError) as exc:
             print(f"error: could not prepare disk image: {exc}", file=sys.stderr)
             return 1
-        command.extend(["-drive", f"file={disk.relative_to(ROOT).as_posix()},format=raw,if=ide,index=0,media=disk"])
-        print(f"Persistent disk attached: {disk.relative_to(ROOT)} ({disk.stat().st_size // (1024 * 1024)} MiB)", flush=True)
+        disk_path = disk.relative_to(ROOT).as_posix()
+        if args.ata_disk:
+            command.extend(["-drive", f"file={disk_path},format=raw,if=ide,index=0,media=disk"])
+            backend = "legacy IDE/ATA PIO"
+        else:
+            command.extend(["-drive", f"file={disk_path},format=raw,if=none,id=xvblk0", "-device", "virtio-blk-pci,drive=xvblk0,disable-legacy=on,disable-modern=off"])
+            backend = "modern VirtIO Block PCI"
+        print(f"Persistent disk attached through {backend}: {disk.relative_to(ROOT)} ({disk.stat().st_size // (1024 * 1024)} MiB)", flush=True)
     # Do not pass -no-shutdown: QEMU must be allowed to exit when the guest
     # sends the ACPI poweroff request from the XavierOS system menu.
     command.extend(["-serial", "stdio", "-monitor", "none"])

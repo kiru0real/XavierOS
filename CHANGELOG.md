@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.5 — Graphics & Hardware Update
+
+- Fixed a Rust compile error in VirtIO Block initialization by binding the parsed notification multiplier before validating and using it.
+### Added
+- Added Renderer V2 with a statically allocated 32-bit RAM backbuffer (up to 1366×768), 32×32 dirty tiles, dirty-region presentation to the Limine framebuffer, and `GFXINFO` / `GFXTEST` diagnostics.
+- Added a shared PCI configuration-mechanism #1 enumerator with a 128-device inventory, hexadecimal BDF/vendor/device IDs, class/IRQ details, read-only assigned-BAR inspection, and `PCI` / `DEVICES` / `DRIVERS` commands.
+- Added a pageable desktop Device Manager app (Dock entry and `D` shortcut) showing PCI inventory plus active storage and network driver state.
+- Refactored the E1000 probe to use the shared PCI inventory instead of performing its own enumeration.
+- Added a modern VirtIO 1.x PCI Block driver using one polled split virtqueue for synchronous 512-byte sector reads and writes. The storage facade prefers VirtIO Block and keeps ATA PIO as a fallback.
+- Updated the QEMU launcher to attach the persistent disk through modern `virtio-blk-pci` by default; `--ata-disk` selects the legacy IDE/ATA fallback without changing the disk image.
+
+### Improved
+- Backbuffer drawing uses ordinary RAM loads/stores for cacheable pixel memory; only dirty tiles are copied to the physical framebuffer using volatile writes. Text rendering batches dirty-tile marking once per string, and dirty rectangles are clipped to sub-framebuffer bounds.
+- PCI capability parsing validates DWORD alignment, range, lengths, loops, and list termination before reading VirtIO MMIO descriptors. VirtIO Block also validates the notification offset alignment, the zero-or-even-power-of-two multiplier, and the device-config alignment before mapping registers.
+- Cursor and saved-overlay restoration now mark their affected regions, ensuring they are presented by Renderer V2 rather than remaining only in RAM.
+- `SELFTEST` now includes PCI inventory, Renderer V2, and the active storage backend checks.
+
+### Limitations
+- Renderer V2 is a CPU software backbuffer with tile presentation. It has logical painter-order layers, but no independent retained layer surfaces, GPU acceleration, hardware page flipping, or vblank synchronization.
+- PCI discovery uses legacy configuration mechanism #1 and stores at most 128 devices. Bridge setup, PCIe extended capabilities, MSI/MSI-X, and hotplug are not implemented.
+- VirtIO Block supports only modern PCI transport, one polled split virtqueue, synchronous 512-byte requests, and DMA memory below 4 GiB. Interrupt-driven I/O, multiqueue, packed rings, flush/discard, and recovery after a queue timeout are not implemented.
+- VirtIO Network, APIC/IOAPIC operation, USB xHCI, and VirtIO-GPU are not implemented in this release. A detected device is not the same as an active driver.
+- Rust compilation and QEMU runtime still require local validation; host-side tests do not prove boot or hardware behavior.
+
 ## 0.2.4 — Kernel Foundations
 
 ### Added

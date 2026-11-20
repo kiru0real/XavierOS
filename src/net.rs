@@ -10,10 +10,8 @@ use core::mem::MaybeUninit;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::{interrupts, memory};
+use crate::{interrupts, memory, pci};
 
-const PCI_CONFIG_ADDRESS: u16 = 0x0CF8;
-const PCI_CONFIG_DATA: u16 = 0x0CFC;
 const PCI_VENDOR_INTEL: u16 = 0x8086;
 
 const PAGE_SIZE: usize = 4096;
@@ -196,36 +194,22 @@ pub struct PingReply {
 
 /// Read-only PCI scan for a supported Intel E1000 Ethernet controller.
 pub fn probe_e1000() -> ProbeResult {
-    for bus in 0u16..=255 {
-        for device in 0u8..32 {
-            let first_id = pci_read(bus as u8, device, 0, 0x00);
-            let first_vendor = first_id as u16;
-            if first_vendor == 0xFFFF || first_vendor == 0 { continue; }
-            let header = pci_read(bus as u8, device, 0, 0x0C);
-            let function_count = if ((header >> 16) as u8) & 0x80 != 0 { 8 } else { 1 };
-            for function in 0u8..function_count {
-                let id = if function == 0 { first_id } else { pci_read(bus as u8, device, function, 0x00) };
-                let vendor = id as u16;
-                let device_id = (id >> 16) as u16;
-                if vendor != PCI_VENDOR_INTEL || !is_supported_e1000(device_id) { continue; }
-                let class_reg = pci_read(bus as u8, device, function, 0x08);
-                let class_code = (class_reg >> 24) as u8;
-                let subclass = ((class_reg >> 16) & 0xFF) as u8;
-                if class_code == 0x02 && subclass == 0x00 {
-                    let bar0 = pci_read(bus as u8, device, function, 0x10);
-                    let interrupt = pci_read(bus as u8, device, function, 0x3C);
-                    return ProbeResult::Found(E1000Device {
-                        bus: bus as u8,
-                        device,
-                        function,
-                        device_id,
-                        revision: (class_reg & 0xFF) as u8,
-                        bar0,
-                        interrupt_line: (interrupt & 0xFF) as u8,
-                        interrupt_pin: ((interrupt >> 8) & 0xFF) as u8,
-                    });
-                }
-            }
+    if !pci::is_initialized() { return ProbeResult::NotFound; }
+    for index in 0..pci::stats().devices {
+        let Some(device) = pci::get(index) else { continue; };
+        if device.vendor_id != PCI_VENDOR_INTEL || !is_supported_e1000(device.device_id) { continue; }
+        if device.class_code == 0x02 && device.subclass == 0x00 {
+            let bar0 = pci::read_config_u32(device, 0x10);
+            return ProbeResult::Found(E1000Device {
+                bus: device.bus,
+                device: device.device,
+                function: device.function,
+                device_id: device.device_id,
+                revision: device.revision,
+                bar0,
+                interrupt_line: device.interrupt_line,
+                interrupt_pin: device.interrupt_pin,
+            });
         }
     }
     ProbeResult::NotFound
@@ -975,7 +959,7 @@ fn http_get_once(url: &str, output: &mut [u8]) -> Result<HttpResponseInfo, &'sta
     append_bytes(&mut request, &mut request_len, parsed.path.as_bytes())?;
     append_bytes(&mut request, &mut request_len, b" HTTP/1.0\r\nHost: ")?;
     append_bytes(&mut request, &mut request_len, parsed.host_header.as_bytes())?;
-    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.2.4\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
+    append_bytes(&mut request, &mut request_len, b"\r\nUser-Agent: XavierOS/0.2.5\r\nConnection: close\r\nAccept: */*\r\n\r\n")?;
     if request_len > TCP_MAX_PAYLOAD { return Err("HTTP request exceeds supported TCP payload size"); }
 
     let request_sequence = initial_sequence.wrapping_add(1);
@@ -1609,22 +1593,24 @@ fn put_be16(bytes: &mut [u8], offset: usize, value: u16) {
 }
 
 fn pci_read(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
-    let address = 0x8000_0000u32 | ((bus as u32) << 16) | ((device as u32) << 11)
-        | ((function as u32) << 8) | ((offset as u32) & 0xFC);
-    unsafe { outl(PCI_CONFIG_ADDRESS, address); inl(PCI_CONFIG_DATA) }
+    let entry = pci::get((0..pci::stats().devices).find(|index| {
+        pci::get(*index).map(|value| value.bus == bus && value.device == device && value.function == function).unwrap_or(false)
+    }).unwrap_or(usize::MAX));
+    entry.map(|value| pci::read_config_u32(value, offset)).unwrap_or(u32::MAX)
 }
 
 fn pci_read_word(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
-    let value = pci_read(bus, device, function, offset & 0xFC);
-    (value >> ((offset & 2) * 8)) as u16
+    let entry = (0..pci::stats().devices).find_map(|index| pci::get(index).filter(|value| {
+        value.bus == bus && value.device == device && value.function == function
+    }));
+    entry.map(|value| pci::read_config_u16(value, offset)).unwrap_or(0xFFFF)
 }
 
 fn pci_write_word(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
-    let address = 0x8000_0000u32 | ((bus as u32) << 16) | ((device as u32) << 11)
-        | ((function as u32) << 8) | ((offset as u32) & 0xFC);
-    unsafe {
-        outl(PCI_CONFIG_ADDRESS, address);
-        outw(PCI_CONFIG_DATA + ((offset & 2) as u16), value);
+    if let Some(entry) = (0..pci::stats().devices).find_map(|index| pci::get(index).filter(|item| {
+        item.bus == bus && item.device == device && item.function == function
+    })) {
+        pci::write_config_u16(entry, offset, value);
     }
 }
 
@@ -1645,17 +1631,9 @@ fn state_ptr() -> Option<*mut DriverState> {
     Some(addr_of_mut!(DRIVER_STATE).cast::<DriverState>())
 }
 
-unsafe fn outl(port: u16, value: u32) {
-    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)); }
-}
-unsafe fn inl(port: u16) -> u32 {
-    let value: u32;
-    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags)); }
-    value
-}
-unsafe fn outw(port: u16, value: u16) {
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)); }
-}
+
+
+
 
 #[cfg(test)]
 mod tests {
